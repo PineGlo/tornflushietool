@@ -170,6 +170,11 @@
       #tmh-exit { border:0; background:#444; color:#fff; border-radius:4px; width:20px; height:20px; line-height:20px; padding:0; cursor:pointer; font-weight:700; }
       #tmh-body { padding: 8px 10px; }
       #tmh-body .row { display:flex; justify-content:space-between; margin: 3px 0; gap:8px; }
+      #tmh-body .section-title { margin: 8px 0 4px; font-weight: 700; color: #dcdcdc; }
+      #tmh-body .item-list { margin-top: 4px; max-height: 180px; overflow: auto; border: 1px solid #2f2f2f; border-radius: 8px; padding: 6px; background: rgba(0,0,0,0.18); }
+      #tmh-body .item-entry { margin: 0; padding: 4px 0; border-bottom: 1px solid #2d2d2d; }
+      #tmh-body .item-entry:last-child { border-bottom: 0; }
+      #tmh-body .item-meta { color: #cfcfcf; font-size: 11px; }
       #tmh-body .good { color: #75f587; font-weight: 700; }
       #tmh-body .warn { color: #ffd76c; font-weight: 700; }
       #tmh-body .bad { color: #ff8e8e; font-weight: 700; }
@@ -301,6 +306,7 @@
     const pointsNet = pointsGross * (1 - state.settings.muggerBufferPct / 100);
 
     const out = {};
+    const inParameterItems = [];
     for (const [cat, arr] of Object.entries(grouped)) {
       const needed = arr.map((item) => {
         const localOwned = Number(state.holdings[item.id] || 0);
@@ -345,6 +351,8 @@
         bestNext,
         buyable: missingOnlyCost > 0 && discounted.length > 0 && roiPct >= state.settings.roiThresholdPct && netProfitIncremental >= state.settings.minProfitDollars,
       };
+
+      inParameterItems.push(...discounted.map(item => ({ ...item, cat })));
     }
 
     const buyable = Object.values(out).filter(x => x.buyable).sort((a, b) => b.netProfitIncremental - a.netProfitIncremental);
@@ -355,6 +363,10 @@
     return {
       byCategory: out,
       winner,
+      inParameterItems: inParameterItems.sort((a, b) => {
+        if (a.ratioToMarket !== b.ratioToMarket) return a.ratioToMarket - b.ratioToMarket;
+        return b.refValue - a.refValue;
+      }),
       pointsNet,
       confidence: confidenceLabel(coverage, now() - state.lastApiRefresh),
       coverage,
@@ -401,6 +413,7 @@
     const flower = m.byCategory.Flower;
     const plushie = m.byCategory.Plushie;
     const winner = m.winner;
+    const inParameterItems = m.inParameterItems || [];
 
     state.body.innerHTML = `
       <div class="row"><span>Points net (10x)</span><strong>${fmtMoney(m.pointsNet)}</strong></div>
@@ -415,10 +428,22 @@
       <hr />
       <div class="row"><span>Best now</span><strong>${winner?.cat || '-'} ${winner?.buyable ? '✅' : '⚠️'}</strong></div>
       <div class="row"><span>Best next item</span><strong>${winner?.bestNext ? `${winner.bestNext.name} (${fmtMoney(winner.bestNext.price)}, ${winner.bestNext.discountPct.toFixed(1)}% off, ROI ${winner.bestNext.itemRoiPct.toFixed(1)}%, stbl ${winner.bestNext.stableScans})` : 'No stable below-market listing'}</strong></div>
+      <hr />
+      <div class="section-title">Items in parameters (${inParameterItems.length})</div>
+      ${inParameterItems.length ? `
+        <div class="item-list">
+          ${inParameterItems.map((item) => `
+            <div class="item-entry">
+              <div><strong>${item.name}</strong></div>
+              <div class="item-meta">${item.cat} • ${fmtMoney(item.price)} • ${(item.ratioToMarket * 100).toFixed(1)}% MV • ${item.discountPct.toFixed(1)}% off • ROI ${item.itemRoiPct.toFixed(1)}%</div>
+            </div>
+          `).join('')}
+        </div>
+      ` : '<div class="item-meta">No missing items currently meet your discount/stability parameters.</div>'}
     `;
 
     renderPageBadge(winner);
-    highlightBestItem(winner);
+    highlightItemsInParameter(inParameterItems);
     maybeAlert(winner);
   }
 
@@ -433,18 +458,25 @@
     document.body.appendChild(badge);
   }
 
-  function highlightBestItem(winner) {
+  function highlightItemsInParameter(items) {
     document.querySelectorAll('.tmh-highlight').forEach(el => el.classList.remove('tmh-highlight'));
-    if (!winner || !winner.bestNext) return;
-    const name = winner.bestNext.name;
+    if (!Array.isArray(items) || !items.length) return;
+    const names = new Set(items.map(item => (item.name || '').toLowerCase()).filter(Boolean));
+    if (!names.size) return;
     const candidates = Array.from(document.querySelectorAll('li,div,tr,a,span'));
-    const match = candidates.find(el => {
-      const t = (el.textContent || '').trim();
-      return t && t.toLowerCase().includes(name.toLowerCase()) && t.length < 200;
-    });
-    if (match) {
-      match.classList.add('tmh-highlight');
-      match.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    let firstMatch = null;
+    for (const el of candidates) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (!t || t.length >= 200) continue;
+      for (const name of names) {
+        if (!t.includes(name)) continue;
+        el.classList.add('tmh-highlight');
+        if (!firstMatch) firstMatch = el;
+        break;
+      }
+    }
+    if (firstMatch) {
+      firstMatch.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
   }
 
