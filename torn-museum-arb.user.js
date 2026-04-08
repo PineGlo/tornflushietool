@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Torn Museum Arbitrage Helper (Read-Only)
+// @name         Torn Museum Arbitrage Helper (API Truth + Tab Coordination)
 // @namespace    https://torn.com/
-// @version      0.1.0
-// @description  Read-only plushie/flower set profitability helper with alerts, ROI, bottleneck, confidence, and page highlighting.
-// @author       GPT-5.3-Codex
+// @version      0.4.0
+// @description  Read-only plushie/flower set helper. API prices drive all math; page is only used for highlighting. One tab acts as leader and performs API calls for all tabs.
+// @author       GPT-5.4 Thinking
 // @match        https://www.torn.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -14,30 +14,29 @@
   'use strict';
 
   const STORE_KEYS = {
-    settings: 'tmh_settings_v1',
-    holdings: 'tmh_holdings_v1',
-    alertState: 'tmh_alert_state_v1',
-    hiddenPaths: 'tmh_hidden_paths_v1',
+    settings: 'tmh_settings_v4',
+    holdings: 'tmh_holdings_v4',
+    alertState: 'tmh_alert_state_v4',
+    hiddenPaths: 'tmh_hidden_paths_v4',
+    watchlist: 'tmh_watchlist_v4',
+    leader: 'tmh_leader_v4',
+    sharedCache: 'tmh_shared_cache_v4',
   };
+
+  const CHANNEL_NAME = 'tmh_channel_v4';
 
   const DEFAULTS = {
     apiKey: '',
-    scanSeconds: 3,
+    scanSeconds: 1,
+    apiRefreshSeconds: 1,
     roiThresholdPct: 2,
-    muggerBufferPct: 1,
-    minProfitDollars: 0,
-    apiRefreshSeconds: 60,
-    fadeSeconds: 8,
-    moveablePanel: true,
-    alertsEnabled: true,
     alertCooldownSeconds: 90,
-    strictReadOnly: true,
+    minMarketValuePct: 70,
+    maxMarketValuePct: 99.5,
+    fadeSeconds: 8,
+    alertsEnabled: true,
+    moveablePanel: true,
     useApiInventory: true,
-    minAlertRoiDeltaPct: 0.5,
-    minAlertProfitDelta: 50000,
-    alertStabilityTicks: 2,
-    minItemDiscountPct: 30,
-    minItemStableScans: 3,
   };
 
   const CATEGORY_URLS = {
@@ -77,42 +76,67 @@
   };
 
   const state = {
+    tabId: `tmh_${Math.random().toString(36).slice(2)}_${Date.now()}`,
+    isLeader: false,
+    bc: null,
+
     settings: { ...DEFAULTS },
     holdings: {},
     items: [],
     pointsPrice: null,
-    pricesById: new Map(),
+    marketValueById: new Map(),
+    apiPricesById: new Map(),
     apiHoldings: {},
     metrics: null,
     lastApiRefresh: 0,
+    lastLeaderSeenAt: 0,
     panel: null,
     body: null,
     lastInteraction: Date.now(),
     dragging: null,
-    cheapestTracking: new Map(),
+    paused: false,
+    watchlist: [],
   };
 
   function now() {
     return Date.now();
   }
 
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+
   function loadState() {
     state.settings = { ...DEFAULTS, ...(GM_getValue(STORE_KEYS.settings, {}) || {}) };
-    state.settings.minItemDiscountPct = clamp(Number(state.settings.minItemDiscountPct) || 30, 30, 100);
-    state.settings.minItemStableScans = clamp(Number(state.settings.minItemStableScans) || 3, 1, 20);
+    state.settings.scanSeconds = clamp(Number(state.settings.scanSeconds) || 1, 1, 60);
+    state.settings.apiRefreshSeconds = clamp(Number(state.settings.apiRefreshSeconds) || 1, 1, 600);
+    state.settings.roiThresholdPct = clamp(Number(state.settings.roiThresholdPct) || 2, 0, 1000);
+    state.settings.alertCooldownSeconds = clamp(Number(state.settings.alertCooldownSeconds) || 90, 5, 3600);
+    state.settings.minMarketValuePct = clamp(Number(state.settings.minMarketValuePct) || 70, 1, 200);
+    state.settings.maxMarketValuePct = clamp(Number(state.settings.maxMarketValuePct) || 99.5, 1, 200);
     state.holdings = GM_getValue(STORE_KEYS.holdings, {}) || {};
+    state.watchlist = GM_getValue(STORE_KEYS.watchlist, []) || [];
   }
 
   function saveSettings() {
     GM_setValue(STORE_KEYS.settings, state.settings);
+    broadcast({ type: 'settings-updated', settings: state.settings });
   }
 
   function saveHoldings() {
     GM_setValue(STORE_KEYS.holdings, state.holdings);
   }
 
-  function clamp(n, min, max) {
-    return Math.max(min, Math.min(max, n));
+  function saveWatchlist() {
+    GM_setValue(STORE_KEYS.watchlist, state.watchlist);
+  }
+
+  function fmtMoney(v) {
+    return '$' + Math.round(v || 0).toLocaleString();
+  }
+
+  function fmtPct(v, digits = 1) {
+    return `${Number(v || 0).toFixed(digits)}%`;
   }
 
   function markInteraction() {
@@ -127,141 +151,142 @@
     state.panel.style.opacity = idleMs > threshold ? '0.45' : '1';
   }
 
-  function createPanel() {
-    const panel = document.createElement('div');
-    panel.id = 'tmh-panel';
-    const pathKey = `${location.pathname}${location.hash || ''}`;
-    panel.innerHTML = `
-      <div id="tmh-head">
-        <span>Museum Arb</span>
-        <span id="tmh-head-right">
-          <span id="tmh-status">idle</span>
-          <button id="tmh-exit" title="Hide on this page">✕</button>
-        </span>
-      </div>
-      <div id="tmh-body"></div>
-      <details id="tmh-settings-wrap">
-        <summary>Settings</summary>
-        <label>API Key <input id="tmh-api-key" type="password" placeholder="Torn API key" /></label>
-        <label>Scan seconds <input id="tmh-scan" type="number" min="3" step="1" /></label>
-        <label>API refresh seconds <input id="tmh-refresh" type="number" min="20" step="5" /></label>
-        <label>ROI threshold % <input id="tmh-roi" type="number" min="0" step="0.1" /></label>
-        <label>Mugger buffer % <input id="tmh-mug" type="number" min="0" step="0.1" /></label>
-        <label>Min profit $ <input id="tmh-minp" type="number" min="0" step="1000" /></label>
-        <label>Alert cooldown sec <input id="tmh-cool" type="number" min="10" step="5" /></label>
-        <label>Min alert ROI delta % <input id="tmh-alert-roi-delta" type="number" min="0" step="0.1" /></label>
-        <label>Min alert profit delta $ <input id="tmh-alert-profit-delta" type="number" min="0" step="1000" /></label>
-        <label>Alert stability ticks <input id="tmh-alert-stability" type="number" min="1" step="1" /></label>
-        <label>Min item discount % <input id="tmh-min-discount" type="number" min="30" step="0.1" /></label>
-        <label>Min stable scans/item <input id="tmh-min-stable" type="number" min="1" step="1" /></label>
-        <button id="tmh-save">Save</button>
-      </details>
-      <details id="tmh-holdings-wrap">
-        <summary>Holdings</summary>
-        <div id="tmh-holdings"></div>
-      </details>
-    `;
+  function mvBand() {
+    return {
+      min: Math.min(state.settings.minMarketValuePct, state.settings.maxMarketValuePct),
+      max: Math.max(state.settings.minMarketValuePct, state.settings.maxMarketValuePct),
+    };
+  }
 
-    const style = document.createElement('style');
-    style.textContent = `
-      #tmh-panel { position: fixed; top: 16px; right: 16px; z-index: 99999; width: 320px; max-height: 85vh; overflow: auto; background: rgba(17,17,17,.95); color: #f4f4f4; border: 1px solid #3b3b3b; border-radius: 10px; font: 12px/1.4 Arial, sans-serif; box-shadow: 0 8px 20px rgba(0,0,0,.35); transition: opacity .2s ease; }
-      #tmh-head { padding: 8px 10px; cursor: move; font-weight: 700; border-bottom: 1px solid #2e2e2e; display:flex; justify-content:space-between; }
-      #tmh-head-right { display:flex; gap:8px; align-items:center; }
-      #tmh-exit { border:0; background:#444; color:#fff; border-radius:4px; width:20px; height:20px; line-height:20px; padding:0; cursor:pointer; font-weight:700; }
-      #tmh-body { padding: 8px 10px; }
-      #tmh-body .row { display:flex; justify-content:space-between; margin: 3px 0; gap:8px; }
-      #tmh-body .section-title { margin: 8px 0 4px; font-weight: 700; color: #dcdcdc; }
-      #tmh-body .item-list { margin-top: 4px; max-height: 180px; overflow: auto; border: 1px solid #2f2f2f; border-radius: 8px; padding: 6px; background: rgba(0,0,0,0.18); }
-      #tmh-body .item-entry { margin: 0; padding: 4px 0; border-bottom: 1px solid #2d2d2d; }
-      #tmh-body .item-entry:last-child { border-bottom: 0; }
-      #tmh-body .item-meta { color: #cfcfcf; font-size: 11px; }
-      #tmh-body .good { color: #75f587; font-weight: 700; }
-      #tmh-body .warn { color: #ffd76c; font-weight: 700; }
-      #tmh-body .bad { color: #ff8e8e; font-weight: 700; }
-      #tmh-panel details { padding: 6px 10px; border-top:1px solid #2e2e2e; }
-      #tmh-panel label { display:block; margin: 5px 0; }
-      #tmh-panel input { width: 100%; box-sizing:border-box; background:#242424; color:#fff; border:1px solid #444; border-radius:6px; padding:4px 6px; }
-      #tmh-panel button { width:100%; margin-top: 6px; border:0; background:#4f79ff; color:#fff; border-radius:6px; padding:6px; cursor:pointer; }
-      .tmh-highlight { outline: 2px solid #75f587 !important; box-shadow: 0 0 0 2px rgba(117,245,135,.2) inset !important; }
-      .tmh-page-badge { position: fixed; right: 16px; top: 0; transform: translateY(-100%); background:#75f587; color:#111; font-weight:700; padding: 4px 8px; border-radius: 0 0 8px 8px; z-index:99999; }
-      #tmh-reopen { position: fixed; right: 16px; top: 16px; z-index: 99999; border: 1px solid #3b3b3b; background:#1b1b1b; color:#fff; padding: 6px 8px; border-radius: 8px; cursor:pointer; }
-    `;
+  function confidenceLabel(coverage, apiAgeMs) {
+    if (coverage > 0.9 && apiAgeMs < 90_000) return 'High';
+    if (coverage > 0.6 && apiAgeMs < 300_000) return 'Medium';
+    return 'Low';
+  }
 
-    document.head.appendChild(style);
-    document.body.appendChild(panel);
-    state.panel = panel;
-    state.body = panel.querySelector('#tmh-body');
+  function marketValuePercent(price, refValue) {
+    return refValue > 0 ? (price / refValue) * 100 : 999999;
+  }
 
-    panel.addEventListener('mouseenter', markInteraction);
-    panel.addEventListener('mousemove', markInteraction);
+  function itemBandStatus(mvPct) {
+    const band = mvBand();
+    if (mvPct >= band.min && mvPct <= band.max) return 'in';
+    if (mvPct < band.min) return 'too-cheap';
+    return 'too-expensive';
+  }
 
-    const saveBtn = panel.querySelector('#tmh-save');
-    saveBtn.addEventListener('click', () => {
-      state.settings.apiKey = panel.querySelector('#tmh-api-key').value.trim();
-      state.settings.scanSeconds = clamp(Number(panel.querySelector('#tmh-scan').value) || 3, 3, 60);
-      state.settings.apiRefreshSeconds = clamp(Number(panel.querySelector('#tmh-refresh').value) || 60, 20, 600);
-      state.settings.roiThresholdPct = clamp(Number(panel.querySelector('#tmh-roi').value) || 2, 0, 100);
-      state.settings.muggerBufferPct = clamp(Number(panel.querySelector('#tmh-mug').value) || 1, 0, 25);
-      state.settings.minProfitDollars = clamp(Number(panel.querySelector('#tmh-minp').value) || 0, 0, 1e9);
-      state.settings.alertCooldownSeconds = clamp(Number(panel.querySelector('#tmh-cool').value) || 90, 10, 3600);
-      state.settings.minAlertRoiDeltaPct = clamp(Number(panel.querySelector('#tmh-alert-roi-delta').value) || 0.5, 0, 100);
-      state.settings.minAlertProfitDelta = clamp(Number(panel.querySelector('#tmh-alert-profit-delta').value) || 50000, 0, 1e9);
-      state.settings.alertStabilityTicks = clamp(Number(panel.querySelector('#tmh-alert-stability').value) || 2, 1, 20);
-      state.settings.minItemDiscountPct = clamp(Number(panel.querySelector('#tmh-min-discount').value) || 30, 30, 100);
-      state.settings.minItemStableScans = clamp(Number(panel.querySelector('#tmh-min-stable').value) || 3, 1, 20);
-      saveSettings();
-      render();
-      markInteraction();
-    });
+  function decisionLabel({ inBand, supportsProfitableSet }) {
+    if (inBand && supportsProfitableSet) return 'BUY';
+    if (inBand) return 'MAYBE';
+    return 'IGNORE';
+  }
 
-    panel.querySelector('#tmh-api-key').value = state.settings.apiKey;
-    panel.querySelector('#tmh-scan').value = String(state.settings.scanSeconds);
-    panel.querySelector('#tmh-refresh').value = String(state.settings.apiRefreshSeconds);
-    panel.querySelector('#tmh-roi').value = String(state.settings.roiThresholdPct);
-    panel.querySelector('#tmh-mug').value = String(state.settings.muggerBufferPct);
-    panel.querySelector('#tmh-minp').value = String(state.settings.minProfitDollars);
-    panel.querySelector('#tmh-cool').value = String(state.settings.alertCooldownSeconds);
-    panel.querySelector('#tmh-alert-roi-delta').value = String(state.settings.minAlertRoiDeltaPct);
-    panel.querySelector('#tmh-alert-profit-delta').value = String(state.settings.minAlertProfitDelta);
-    panel.querySelector('#tmh-alert-stability').value = String(state.settings.alertStabilityTicks);
-    panel.querySelector('#tmh-min-discount').value = String(state.settings.minItemDiscountPct);
-    panel.querySelector('#tmh-min-stable').value = String(state.settings.minItemStableScans);
-    const exitBtn = panel.querySelector('#tmh-exit');
-    exitBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const hidden = GM_getValue(STORE_KEYS.hiddenPaths, {});
-      hidden[pathKey] = true;
-      GM_setValue(STORE_KEYS.hiddenPaths, hidden);
-      panel.style.display = 'none';
-      showReopenButton(pathKey);
-    });
+  function reasonText(item, catBuyable) {
+    if (!item) return 'No reason available';
+    if (!item.inBand) {
+      if (item.mvPct > mvBand().max) {
+        return `${item.name} is ${fmtPct(item.mvPct)} of MV, above your max band of ${fmtPct(mvBand().max)}.`;
+      }
+      return `${item.name} is ${fmtPct(item.mvPct)} of MV, below your min band of ${fmtPct(mvBand().min)}.`;
+    }
+    if (catBuyable) {
+      return `${item.name} is ${fmtPct(item.mvPct)} of MV and supports a set currently above your ROI threshold.`;
+    }
+    return `${item.name} is inside your MV band, but the set ROI is below your threshold right now.`;
+  }
 
-    const head = panel.querySelector('#tmh-head');
-    head.addEventListener('mousedown', (e) => {
-      if (!state.settings.moveablePanel) return;
-      state.dragging = {
-        x: e.clientX,
-        y: e.clientY,
-        left: panel.offsetLeft,
-        top: panel.offsetTop,
+  function itemSortScore(item) {
+    if (!item || !item.refValue || !item.price) return -Infinity;
+    const discountValue = item.refValue - item.price;
+    const setSupport = item.supportsProfitableSet ? 1_000_000_000 : 0;
+    return setSupport + discountValue;
+  }
+
+  function broadcast(message) {
+    try {
+      if (state.bc) state.bc.postMessage({ ...message, sender: state.tabId, at: now() });
+    } catch (_) {}
+  }
+
+  function initBroadcastChannel() {
+    try {
+      state.bc = new BroadcastChannel(CHANNEL_NAME);
+      state.bc.onmessage = (event) => {
+        const msg = event.data || {};
+        if (msg.sender === state.tabId) return;
+
+        if (msg.type === 'leader-heartbeat') {
+          state.lastLeaderSeenAt = now();
+          if (msg.leaderId && msg.leaderId !== state.tabId) {
+            state.isLeader = false;
+          }
+          render();
+          return;
+        }
+
+        if (msg.type === 'cache-updated') {
+          applySharedCache(msg.cache);
+          render();
+          return;
+        }
+
+        if (msg.type === 'settings-updated' && msg.settings) {
+          state.settings = { ...state.settings, ...msg.settings };
+          render();
+          return;
+        }
+
+        if (msg.type === 'leader-resigned') {
+          state.lastLeaderSeenAt = 0;
+          return;
+        }
       };
-      markInteraction();
-    });
-    window.addEventListener('mouseup', () => { state.dragging = null; });
-    window.addEventListener('mousemove', (e) => {
-      if (!state.dragging) return;
-      const dx = e.clientX - state.dragging.x;
-      const dy = e.clientY - state.dragging.y;
-      panel.style.left = `${Math.max(0, state.dragging.left + dx)}px`;
-      panel.style.top = `${Math.max(0, state.dragging.top + dy)}px`;
-      panel.style.right = 'auto';
-      markInteraction();
-    });
+    } catch (_) {
+      state.bc = null;
+    }
+  }
 
-    const hidden = GM_getValue(STORE_KEYS.hiddenPaths, {});
-    if (hidden[pathKey]) {
-      panel.style.display = 'none';
-      showReopenButton(pathKey);
+  function readLeaderRecord() {
+    return GM_getValue(STORE_KEYS.leader, null);
+  }
+
+  function writeLeaderRecord() {
+    const record = {
+      leaderId: state.tabId,
+      heartbeatAt: now(),
+    };
+    GM_setValue(STORE_KEYS.leader, record);
+  }
+
+  function clearLeaderRecord() {
+    const record = readLeaderRecord();
+    if (record && record.leaderId === state.tabId) {
+      GM_setValue(STORE_KEYS.leader, null);
+    }
+  }
+
+  function heartbeatLeader() {
+    if (!state.isLeader) return;
+    writeLeaderRecord();
+    broadcast({ type: 'leader-heartbeat', leaderId: state.tabId });
+  }
+
+  function maybeBecomeLeader() {
+    const record = readLeaderRecord();
+    const currentTime = now();
+    const staleMs = 4000;
+
+    if (!record || !record.leaderId || (currentTime - Number(record.heartbeatAt || 0)) > staleMs) {
+      state.isLeader = true;
+      writeLeaderRecord();
+      state.lastLeaderSeenAt = currentTime;
+      broadcast({ type: 'leader-heartbeat', leaderId: state.tabId });
+      return;
+    }
+
+    state.isLeader = record.leaderId === state.tabId;
+    if (!state.isLeader) {
+      state.lastLeaderSeenAt = currentTime;
     }
   }
 
@@ -284,240 +309,312 @@
     };
   }
 
+  function createPanel() {
+    const panel = document.createElement('div');
+    panel.id = 'tmh-panel';
+    const pathKey = `${location.pathname}${location.hash || ''}`;
+
+    panel.innerHTML = `
+      <div id="tmh-head">
+        <span>Museum Arb</span>
+        <span id="tmh-head-right">
+          <span id="tmh-status">idle</span>
+          <button id="tmh-pause" title="Pause scanning">Pause</button>
+          <button id="tmh-exit" title="Hide on this page">✕</button>
+        </span>
+      </div>
+
+      <div id="tmh-toolbar">
+        <button id="tmh-refresh-now">Refresh Now</button>
+      </div>
+
+      <div id="tmh-body"></div>
+
+      <details id="tmh-settings-wrap">
+        <summary>Settings</summary>
+        <label>API Key <input id="tmh-api-key" type="password" placeholder="Torn API key" /></label>
+        <label>Scan seconds <input id="tmh-scan" type="number" min="1" step="1" /></label>
+        <label>API refresh seconds <input id="tmh-refresh" type="number" min="1" step="1" /></label>
+        <label>ROI threshold % <input id="tmh-roi" type="number" min="0" step="0.1" /></label>
+        <label>Alert cooldown sec <input id="tmh-cool" type="number" min="5" step="5" /></label>
+        <label>Min market value % <input id="tmh-min-mv" type="number" min="1" step="0.1" /></label>
+        <label>Max market value % <input id="tmh-max-mv" type="number" min="1" step="0.1" /></label>
+        <button id="tmh-save">Save</button>
+      </details>
+
+      <details id="tmh-holdings-wrap">
+        <summary>Holdings</summary>
+        <div id="tmh-holdings"></div>
+      </details>
+
+      <details id="tmh-history-wrap" open>
+        <summary>Recent opportunities</summary>
+        <div id="tmh-history"></div>
+      </details>
+    `;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #tmh-panel {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 99999;
+        width: 390px;
+        max-height: 88vh;
+        overflow: auto;
+        background: rgba(17,17,17,.96);
+        color: #f4f4f4;
+        border: 1px solid #3b3b3b;
+        border-radius: 12px;
+        font: 12px/1.4 Arial, sans-serif;
+        box-shadow: 0 8px 20px rgba(0,0,0,.35);
+        transition: opacity .2s ease;
+      }
+      #tmh-head {
+        padding: 8px 10px;
+        cursor: move;
+        font-weight: 700;
+        border-bottom: 1px solid #2e2e2e;
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+      }
+      #tmh-head-right {
+        display:flex;
+        gap:6px;
+        align-items:center;
+      }
+      #tmh-head button, #tmh-toolbar button {
+        border:0;
+        background:#444;
+        color:#fff;
+        border-radius:6px;
+        padding:4px 8px;
+        cursor:pointer;
+      }
+      #tmh-exit {
+        width:22px;
+        height:22px;
+        line-height:22px;
+        padding:0;
+        font-weight:700;
+      }
+      #tmh-toolbar {
+        padding:8px 10px;
+        border-bottom: 1px solid #2e2e2e;
+      }
+      #tmh-toolbar button {
+        width:100%;
+        background:#4f79ff;
+      }
+      #tmh-body {
+        padding: 8px 10px;
+      }
+      #tmh-panel details {
+        padding: 6px 10px;
+        border-top:1px solid #2e2e2e;
+      }
+      #tmh-panel label {
+        display:block;
+        margin: 5px 0;
+      }
+      #tmh-panel input {
+        width: 100%;
+        box-sizing:border-box;
+        background:#242424;
+        color:#fff;
+        border:1px solid #444;
+        border-radius:6px;
+        padding:4px 6px;
+      }
+      #tmh-panel details button {
+        width:100%;
+        margin-top: 6px;
+        border:0;
+        background:#4f79ff;
+        color:#fff;
+        border-radius:6px;
+        padding:6px;
+        cursor:pointer;
+      }
+      .tmh-section {
+        margin-bottom:10px;
+        padding:8px;
+        background:#1a1a1a;
+        border:1px solid #2c2c2c;
+        border-radius:10px;
+      }
+      .tmh-title {
+        font-weight:700;
+        margin-bottom:6px;
+      }
+      .tmh-row {
+        display:flex;
+        justify-content:space-between;
+        gap:8px;
+        margin:3px 0;
+      }
+      .tmh-inline {
+        display:flex;
+        gap:6px;
+        align-items:center;
+        flex-wrap:wrap;
+      }
+      .tmh-badge {
+        display:inline-block;
+        padding:2px 6px;
+        border-radius:999px;
+        font-size:11px;
+        font-weight:700;
+      }
+      .tmh-buy { background:#75f587; color:#111; }
+      .tmh-maybe { background:#ffd76c; color:#111; }
+      .tmh-ignore { background:#ff8e8e; color:#111; }
+      .tmh-good { color:#75f587; font-weight:700; }
+      .tmh-warn { color:#ffd76c; font-weight:700; }
+      .tmh-bad { color:#ff8e8e; font-weight:700; }
+      .tmh-small {
+        font-size:11px;
+        color:#cfcfcf;
+      }
+      .tmh-reason {
+        margin-top:4px;
+        color:#ddd;
+      }
+      .tmh-list-entry {
+        padding:6px 0;
+        border-bottom:1px solid #2b2b2b;
+      }
+      .tmh-list-entry:last-child {
+        border-bottom:0;
+      }
+      .tmh-highlight {
+        outline: 2px solid #75f587 !important;
+        box-shadow: 0 0 0 2px rgba(117,245,135,.2) inset !important;
+      }
+      .tmh-page-badge {
+        position: fixed;
+        right: 16px;
+        top: 0;
+        transform: translateY(-100%);
+        background:#75f587;
+        color:#111;
+        font-weight:700;
+        padding: 4px 8px;
+        border-radius: 0 0 8px 8px;
+        z-index:99999;
+      }
+      #tmh-reopen {
+        position: fixed;
+        right: 16px;
+        top: 16px;
+        z-index: 99999;
+        border: 1px solid #3b3b3b;
+        background:#1b1b1b;
+        color:#fff;
+        padding: 6px 8px;
+        border-radius: 8px;
+        cursor:pointer;
+      }
+    `;
+
+    document.head.appendChild(style);
+    document.body.appendChild(panel);
+
+    state.panel = panel;
+    state.body = panel.querySelector('#tmh-body');
+
+    panel.addEventListener('mouseenter', markInteraction);
+    panel.addEventListener('mousemove', markInteraction);
+
+    panel.querySelector('#tmh-save').addEventListener('click', () => {
+      state.settings.apiKey = panel.querySelector('#tmh-api-key').value.trim();
+      state.settings.scanSeconds = clamp(Number(panel.querySelector('#tmh-scan').value) || 1, 1, 60);
+      state.settings.apiRefreshSeconds = clamp(Number(panel.querySelector('#tmh-refresh').value) || 1, 1, 600);
+      state.settings.roiThresholdPct = clamp(Number(panel.querySelector('#tmh-roi').value) || 2, 0, 1000);
+      state.settings.alertCooldownSeconds = clamp(Number(panel.querySelector('#tmh-cool').value) || 90, 5, 3600);
+      state.settings.minMarketValuePct = clamp(Number(panel.querySelector('#tmh-min-mv').value) || 70, 1, 200);
+      state.settings.maxMarketValuePct = clamp(Number(panel.querySelector('#tmh-max-mv').value) || 99.5, 1, 200);
+      saveSettings();
+      state.metrics = state.items.length ? getSetMetrics(state.items) : null;
+      render();
+      markInteraction();
+    });
+
+    panel.querySelector('#tmh-api-key').value = state.settings.apiKey;
+    panel.querySelector('#tmh-scan').value = String(state.settings.scanSeconds);
+    panel.querySelector('#tmh-refresh').value = String(state.settings.apiRefreshSeconds);
+    panel.querySelector('#tmh-roi').value = String(state.settings.roiThresholdPct);
+    panel.querySelector('#tmh-cool').value = String(state.settings.alertCooldownSeconds);
+    panel.querySelector('#tmh-min-mv').value = String(state.settings.minMarketValuePct);
+    panel.querySelector('#tmh-max-mv').value = String(state.settings.maxMarketValuePct);
+
+    panel.querySelector('#tmh-refresh-now').addEventListener('click', async () => {
+      if (!state.isLeader) {
+        const status = panel.querySelector('#tmh-status');
+        status.textContent = 'follower';
+        return;
+      }
+      const status = panel.querySelector('#tmh-status');
+      status.textContent = 'refreshing';
+      markInteraction();
+      await refreshDataIfNeeded(true);
+      state.metrics = state.items.length ? getSetMetrics(state.items) : null;
+      render();
+    });
+
+    panel.querySelector('#tmh-pause').addEventListener('click', () => {
+      state.paused = !state.paused;
+      panel.querySelector('#tmh-pause').textContent = state.paused ? 'Resume' : 'Pause';
+      const status = panel.querySelector('#tmh-status');
+      status.textContent = state.paused ? 'paused' : (state.isLeader ? 'leader' : 'follower');
+      markInteraction();
+    });
+
+    panel.querySelector('#tmh-exit').addEventListener('click', (e) => {
+      e.stopPropagation();
+      const hidden = GM_getValue(STORE_KEYS.hiddenPaths, {});
+      hidden[pathKey] = true;
+      GM_setValue(STORE_KEYS.hiddenPaths, hidden);
+      panel.style.display = 'none';
+      showReopenButton(pathKey);
+    });
+
+    const head = panel.querySelector('#tmh-head');
+    head.addEventListener('mousedown', (e) => {
+      if (!state.settings.moveablePanel) return;
+      state.dragging = {
+        x: e.clientX,
+        y: e.clientY,
+        left: panel.offsetLeft,
+        top: panel.offsetTop,
+      };
+      markInteraction();
+    });
+
+    window.addEventListener('mouseup', () => { state.dragging = null; });
+    window.addEventListener('mousemove', (e) => {
+      if (!state.dragging) return;
+      const dx = e.clientX - state.dragging.x;
+      const dy = e.clientY - state.dragging.y;
+      panel.style.left = `${Math.max(0, state.dragging.left + dx)}px`;
+      panel.style.top = `${Math.max(0, state.dragging.top + dy)}px`;
+      panel.style.right = 'auto';
+      markInteraction();
+    });
+
+    const hidden = GM_getValue(STORE_KEYS.hiddenPaths, {});
+    if (hidden[pathKey]) {
+      panel.style.display = 'none';
+      showReopenButton(pathKey);
+    }
+  }
+
   async function fetchJson(url) {
     const res = await fetch(url, { method: 'GET', credentials: 'omit' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
-  }
-
-  function confidenceLabel(coverage, apiAgeMs) {
-    if (coverage > 0.9 && apiAgeMs < 90_000) return 'High';
-    if (coverage > 0.6 && apiAgeMs < 300_000) return 'Medium';
-    return 'Low';
-  }
-
-  function getSetMetrics(items) {
-    const grouped = {
-      Flower: items.filter((x) => x.type === 'Flower'),
-      Plushie: items.filter((x) => x.type === 'Plushie'),
-    };
-
-    const pointsGross = (state.pointsPrice || 0) * 10;
-    const pointsNet = pointsGross * (1 - state.settings.muggerBufferPct / 100);
-
-    const out = {};
-    const inParameterItems = [];
-    for (const [cat, arr] of Object.entries(grouped)) {
-      const needed = arr.map((item) => {
-        const localOwned = Number(state.holdings[item.id] || 0);
-        const apiOwned = Number(state.apiHoldings[item.id] || 0);
-        const owned = Math.max(localOwned, apiOwned);
-        const missing = owned > 0 ? 0 : 1;
-        const price = state.pricesById.get(item.id) || item.market_value || 0;
-        const refValue = Number(item.market_value || 0);
-        const ratioToMarket = refValue > 0 ? price / refValue : 1;
-        const discountPct = refValue > 0 ? (1 - ratioToMarket) * 100 : 0;
-        const itemRoiPct = price > 0 ? ((refValue - price) / price) * 100 : 0;
-        const stableScans = Number(state.cheapestTracking.get(item.id)?.stable || 0);
-        const actionable = refValue > 0
-          && discountPct >= state.settings.minItemDiscountPct
-          && stableScans >= state.settings.minItemStableScans;
-        return { ...item, owned, missing, price, refValue, ratioToMarket, discountPct, itemRoiPct, stableScans, actionable };
-      });
-      const fullSetCost = needed.reduce((sum, i) => sum + i.price, 0);
-      const missingOnlyCost = needed.reduce((sum, i) => sum + (i.missing ? i.price : 0), 0);
-      const netProfitFull = pointsNet - fullSetCost;
-      const netProfitIncremental = pointsNet - missingOnlyCost;
-      const roiPct = missingOnlyCost > 0 ? (netProfitIncremental / missingOnlyCost) * 100 : -100;
-      const missingItems = needed.filter(i => i.missing);
-      const bottleneck = missingItems.sort((a, b) => b.price - a.price)[0] || null;
-      const discounted = missingItems
-        .filter((i) => i.refValue > 0 && i.actionable)
-        .sort((a, b) => {
-          if (a.ratioToMarket !== b.ratioToMarket) return a.ratioToMarket - b.ratioToMarket;
-          return b.refValue - a.refValue;
-        });
-      const bestNext = discounted[0] || null;
-      out[cat] = {
-        cat,
-        needed,
-        pointsNet,
-        fullSetCost,
-        missingOnlyCost,
-        netProfitFull,
-        netProfitIncremental,
-        roiPct,
-        bottleneck,
-        bestNext,
-        buyable: missingOnlyCost > 0 && discounted.length > 0 && roiPct >= state.settings.roiThresholdPct && netProfitIncremental >= state.settings.minProfitDollars,
-      };
-
-      inParameterItems.push(...discounted.map(item => ({ ...item, cat })));
-    }
-
-    const buyable = Object.values(out).filter(x => x.buyable).sort((a, b) => b.netProfitIncremental - a.netProfitIncremental);
-    const winner = buyable[0] || Object.values(out).sort((a, b) => b.roiPct - a.roiPct)[0];
-    const pricedCount = items.filter(i => (state.pricesById.get(i.id) || i.market_value || 0) > 0).length;
-    const coverage = items.length ? pricedCount / items.length : 0;
-
-    return {
-      byCategory: out,
-      winner,
-      inParameterItems: inParameterItems.sort((a, b) => {
-        if (a.ratioToMarket !== b.ratioToMarket) return a.ratioToMarket - b.ratioToMarket;
-        return b.refValue - a.refValue;
-      }),
-      pointsNet,
-      confidence: confidenceLabel(coverage, now() - state.lastApiRefresh),
-      coverage,
-    };
-  }
-
-  function fmtMoney(v) {
-    return '$' + Math.round(v || 0).toLocaleString();
-  }
-
-  function buildHoldingsEditor(items) {
-    const host = state.panel.querySelector('#tmh-holdings');
-    host.innerHTML = '';
-    for (const item of items) {
-      const row = document.createElement('label');
-      const apiOwned = Number(state.apiHoldings[item.id] || 0);
-      row.textContent = apiOwned > 0 ? `${item.name} (inv:${apiOwned})` : item.name;
-      const input = document.createElement('input');
-      input.type = 'number';
-      input.min = '0';
-      input.step = '1';
-      input.value = String(Number(state.holdings[item.id] || 0));
-      input.addEventListener('change', () => {
-        state.holdings[item.id] = clamp(Number(input.value) || 0, 0, 9999);
-        saveHoldings();
-        state.metrics = getSetMetrics(state.items);
-        render();
-      });
-      row.appendChild(input);
-      host.appendChild(row);
-    }
-  }
-
-  function render() {
-    if (!state.body) return;
-    const m = state.metrics;
-    const status = state.panel.querySelector('#tmh-status');
-    if (!m) {
-      status.textContent = 'waiting';
-      state.body.innerHTML = '<div class="row"><span>Waiting for data...</span></div>';
-      return;
-    }
-    status.textContent = 'live';
-    const flower = m.byCategory.Flower;
-    const plushie = m.byCategory.Plushie;
-    const winner = m.winner;
-    const inParameterItems = m.inParameterItems || [];
-
-    state.body.innerHTML = `
-      <div class="row"><span>Points net (10x)</span><strong>${fmtMoney(m.pointsNet)}</strong></div>
-      <div class="row"><span>Confidence</span><strong class="${m.confidence === 'High' ? 'good' : (m.confidence === 'Medium' ? 'warn' : 'bad')}">${m.confidence}</strong></div>
-      <hr />
-      <div class="row"><span>Flowers ROI</span><strong class="${flower.buyable ? 'good' : 'bad'}">${flower.roiPct.toFixed(2)}%</strong></div>
-      <div class="row"><span>Flowers net</span><strong>${fmtMoney(flower.netProfitIncremental)}</strong></div>
-      <div class="row"><span>Flowers bottleneck</span><strong>${flower.bottleneck ? `${flower.bottleneck.name} (${fmtMoney(flower.bottleneck.price)})` : '-'}</strong></div>
-      <div class="row"><span>Plushies ROI</span><strong class="${plushie.buyable ? 'good' : 'bad'}">${plushie.roiPct.toFixed(2)}%</strong></div>
-      <div class="row"><span>Plushies net</span><strong>${fmtMoney(plushie.netProfitIncremental)}</strong></div>
-      <div class="row"><span>Plushies bottleneck</span><strong>${plushie.bottleneck ? `${plushie.bottleneck.name} (${fmtMoney(plushie.bottleneck.price)})` : '-'}</strong></div>
-      <hr />
-      <div class="row"><span>Best now</span><strong>${winner?.cat || '-'} ${winner?.buyable ? '✅' : '⚠️'}</strong></div>
-      <div class="row"><span>Best next item</span><strong>${winner?.bestNext ? `${winner.bestNext.name} (${fmtMoney(winner.bestNext.price)}, ${winner.bestNext.discountPct.toFixed(1)}% off, ROI ${winner.bestNext.itemRoiPct.toFixed(1)}%, stbl ${winner.bestNext.stableScans})` : 'No stable below-market listing'}</strong></div>
-      <hr />
-      <div class="section-title">Items in parameters (${inParameterItems.length})</div>
-      ${inParameterItems.length ? `
-        <div class="item-list">
-          ${inParameterItems.map((item) => `
-            <div class="item-entry">
-              <div><strong>${item.name}</strong></div>
-              <div class="item-meta">${item.cat} • ${fmtMoney(item.price)} • ${(item.ratioToMarket * 100).toFixed(1)}% MV • ${item.discountPct.toFixed(1)}% off • ROI ${item.itemRoiPct.toFixed(1)}%</div>
-            </div>
-          `).join('')}
-        </div>
-      ` : '<div class="item-meta">No missing items currently meet your discount/stability parameters.</div>'}
-    `;
-
-    renderPageBadge(winner);
-    highlightItemsInParameter(inParameterItems);
-    maybeAlert(winner);
-  }
-
-  function renderPageBadge(winner) {
-    document.querySelectorAll('.tmh-page-badge').forEach(x => x.remove());
-    if (!winner || !winner.buyable) return;
-    const badge = document.createElement('a');
-    badge.className = 'tmh-page-badge';
-    badge.href = CATEGORY_URLS[winner.cat];
-    badge.textContent = `${winner.cat} opportunity`; 
-    badge.title = 'Open profitable category';
-    document.body.appendChild(badge);
-  }
-
-  function highlightItemsInParameter(items) {
-    document.querySelectorAll('.tmh-highlight').forEach(el => el.classList.remove('tmh-highlight'));
-    if (!Array.isArray(items) || !items.length) return;
-    const names = new Set(items.map(item => (item.name || '').toLowerCase()).filter(Boolean));
-    if (!names.size) return;
-    const candidates = Array.from(document.querySelectorAll('li,div,tr,a,span'));
-    let firstMatch = null;
-    for (const el of candidates) {
-      const t = (el.textContent || '').trim().toLowerCase();
-      if (!t || t.length >= 200) continue;
-      for (const name of names) {
-        if (!t.includes(name)) continue;
-        el.classList.add('tmh-highlight');
-        if (!firstMatch) firstMatch = el;
-        break;
-      }
-    }
-    if (firstMatch) {
-      firstMatch.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    }
-  }
-
-  function maybeAlert(winner) {
-    if (!state.settings.alertsEnabled || !winner || !winner.buyable) return;
-    const s = GM_getValue(STORE_KEYS.alertState, { at: 0, cat: '', roi: 0, profit: 0, stable: 0 });
-    const enoughTime = now() - (s.at || 0) > state.settings.alertCooldownSeconds * 1000;
-    const changed = s.cat !== winner.cat;
-    const roiDelta = Math.abs((winner.roiPct || 0) - (s.roi || 0));
-    const profitDelta = Math.abs((winner.netProfitIncremental || 0) - (s.profit || 0));
-    const meaningfulMove = changed || roiDelta >= state.settings.minAlertRoiDeltaPct || profitDelta >= state.settings.minAlertProfitDelta;
-    const stable = changed ? 1 : (s.stable || 0) + 1;
-    if (!meaningfulMove || stable < state.settings.alertStabilityTicks || (!enoughTime && !changed)) {
-      GM_setValue(STORE_KEYS.alertState, {
-        ...s,
-        cat: winner.cat,
-        roi: winner.roiPct,
-        profit: winner.netProfitIncremental,
-        stable,
-      });
-      return;
-    }
-
-    const discountText = winner.bestNext ? `${winner.bestNext.discountPct.toFixed(1)}% vs MV` : 'n/a';
-    const text = `${winner.cat} opportunity: ${winner.roiPct.toFixed(2)}% ROI. Next: ${winner.bestNext?.name || 'n/a'} (${discountText})`;
-    if (typeof GM_notification === 'function') {
-      GM_notification({
-        title: 'Torn Museum Arb',
-        text,
-        timeout: 5000,
-        onclick: () => window.open(CATEGORY_URLS[winner.cat], '_blank'),
-      });
-    }
-
-    GM_setValue(STORE_KEYS.alertState, {
-      at: now(),
-      cat: winner.cat,
-      roi: winner.roiPct,
-      profit: winner.netProfitIncremental,
-      stable: 0,
-    });
   }
 
   function deepFindNumbersWithPriceHeuristic(obj, out = []) {
@@ -529,90 +626,19 @@
     return out;
   }
 
-  function parsePriceFromText(text) {
-    if (!text) return null;
-    const matches = text.match(/\$\s*[\d,]+/g);
-    if (!matches || !matches.length) return null;
-    const nums = matches
-      .map((x) => Number(x.replace(/[^\d]/g, '')))
-      .filter((n) => Number.isFinite(n) && n >= 50);
+  function findLowestViablePriceFromApiPayload(js, reference) {
+    const nums = deepFindNumbersWithPriceHeuristic(js, []);
     if (!nums.length) return null;
-    return Math.min(...nums);
-  }
 
-  function getItemByName(name) {
-    const target = (name || '').trim().toLowerCase();
-    if (!target) return null;
-    return state.items.find((i) => i.name.toLowerCase() === target) || null;
-  }
+    const band = mvBand();
+    const floor = reference > 0 ? reference * (band.min / 100) : 50;
+    const ceiling = reference > 0 ? reference * (band.max / 100) : 10_000_000;
 
-  function findTextInElement(el, selectorList) {
-    for (const sel of selectorList) {
-      const candidate = el.querySelector(sel);
-      if (candidate && candidate.textContent) return candidate.textContent.trim();
-    }
-    return '';
-  }
+    const viable = nums
+      .filter(n => Number.isFinite(n) && n >= floor && n <= ceiling)
+      .sort((a, b) => a - b);
 
-  function refreshCheapestFromCurrentPage() {
-    if (!state.items.length) return;
-
-    // Heuristic parser for Torn market cards/rows. It extracts item name + listing price
-    // and keeps the cheapest seen listing per item from the currently opened page.
-    const rows = Array.from(document.querySelectorAll('li, tr, .itemRow, .market-item, .sellerRow, .item-market-list-item'));
-    const cheapestById = new Map();
-
-    for (const row of rows) {
-      const nameText = findTextInElement(row, [
-        '[class*=\"name\"]',
-        '[class*=\"title\"]',
-        '[data-item-name]',
-        'a',
-        'span',
-      ]);
-      const item = getItemByName(nameText);
-      if (!item) continue;
-      const rowText = row.textContent || '';
-      if (!rowText.toLowerCase().includes(item.name.toLowerCase())) continue;
-
-      const priceText = findTextInElement(row, [
-        '[class*=\"price\"]',
-        '[class*=\"cost\"]',
-        '[data-price]',
-        'span',
-        'div',
-      ]) || rowText;
-      const price = parsePriceFromText(priceText);
-      if (!price) continue;
-      const reference = Number(item.market_value || 0);
-      if (reference <= 0) continue;
-      const saneFloor = reference * 0.35;
-      const saneCeiling = reference * 0.999;
-      if (price < saneFloor || price > saneCeiling) continue;
-
-      const prev = cheapestById.get(item.id);
-      if (!prev || price < prev.price) {
-        cheapestById.set(item.id, { price, at: now() });
-      }
-    }
-
-    // Update working prices with freshest DOM-cheapest data.
-    for (const [itemId, info] of cheapestById.entries()) {
-      const previous = state.cheapestTracking.get(itemId);
-      state.pricesById.set(itemId, info.price);
-      const nearSame = previous && previous.price > 0 && Math.abs(info.price - previous.price) / previous.price <= 0.02;
-      const stable = nearSame ? Number(previous.stable || 1) + 1 : 1;
-      state.cheapestTracking.set(itemId, { ...info, stable });
-
-      // If cheapest increased, likely the previous cheapest listing was bought.
-      if (previous && info.price > previous.price) {
-        const item = state.items.find((x) => x.id === itemId);
-        const status = state.panel?.querySelector('#tmh-status');
-        if (status && item) {
-          status.textContent = `cheapest moved: ${item.name}`;
-        }
-      }
-    }
+    return viable.length ? viable[0] : null;
   }
 
   async function getPointsPrice(apiKey) {
@@ -626,9 +652,7 @@
         const nums = deepFindNumbersWithPriceHeuristic(js, []);
         const viable = nums.filter(n => n > 1000).sort((a, b) => a - b);
         if (viable.length) return viable[0];
-      } catch (_) {
-        // try fallback URL
-      }
+      } catch (_) {}
     }
     return null;
   }
@@ -638,6 +662,7 @@
       `https://api.torn.com/torn/?selections=items&key=${encodeURIComponent(apiKey)}`,
       `https://api.torn.com/v2/torn/?selections=items&key=${encodeURIComponent(apiKey)}`,
     ];
+
     for (const url of urls) {
       try {
         const js = await fetchJson(url);
@@ -648,38 +673,34 @@
           type: String(v.type || '').trim(),
           market_value: Number(v.market_value || v.marketValue || 0),
         }));
+
         const filtered = items.filter((x) => {
           if (x.type !== 'Flower' && x.type !== 'Plushie') return false;
           const allowed = REQUIRED_SET_NAMES[x.type];
           return !!allowed && allowed.has(x.name);
         });
+
         if (filtered.length) return filtered;
-      } catch (_) {
-        // try fallback URL
-      }
+      } catch (_) {}
     }
     return [];
   }
 
-  async function getItemLivePrice(apiKey, itemId, fallbackValue) {
+  async function getItemLivePrice(apiKey, itemId, reference) {
     const urls = [
       `https://api.torn.com/market/${itemId}?selections=itemmarket&key=${encodeURIComponent(apiKey)}`,
       `https://api.torn.com/v2/market/${itemId}/itemmarket?key=${encodeURIComponent(apiKey)}`,
     ];
+
     for (const url of urls) {
       try {
         const js = await fetchJson(url);
-        const nums = deepFindNumbersWithPriceHeuristic(js, []);
-        const reference = Number(fallbackValue || 0);
-        const floor = reference > 0 ? reference * 0.35 : 50;
-        const ceiling = reference > 0 ? reference * 0.999 : 10_000_000;
-        const viable = nums.filter(n => n >= floor && n <= ceiling).sort((a, b) => a - b);
-        if (viable.length) return viable[0];
-      } catch (_) {
-        // fallback next endpoint
-      }
+        const found = findLowestViablePriceFromApiPayload(js, reference);
+        if (found != null) return found;
+      } catch (_) {}
     }
-    return fallbackValue || 0;
+
+    return null;
   }
 
   async function getInventoryHoldings(apiKey) {
@@ -687,33 +708,464 @@
       `https://api.torn.com/user/?selections=inventory&key=${encodeURIComponent(apiKey)}`,
       `https://api.torn.com/v2/user/?selections=inventory&key=${encodeURIComponent(apiKey)}`,
     ];
+
     for (const url of urls) {
       try {
         const js = await fetchJson(url);
         const raw = js.inventory || js.items || [];
         const holdings = {};
         if (!Array.isArray(raw)) continue;
+
         for (const row of raw) {
           const id = Number(row.ID || row.id || row.itemID || row.item_id);
           const qty = Number(row.quantity || row.qty || 0);
           if (id > 0 && qty > 0) holdings[id] = (holdings[id] || 0) + qty;
         }
         return holdings;
-      } catch (_) {
-        // fallback next endpoint
-      }
+      } catch (_) {}
     }
+
     return {};
   }
 
+  function buildHoldingsEditor(items) {
+    const host = state.panel.querySelector('#tmh-holdings');
+    host.innerHTML = '';
+
+    for (const item of items) {
+      const row = document.createElement('label');
+      const apiOwned = Number(state.apiHoldings[item.id] || 0);
+      row.textContent = apiOwned > 0 ? `${item.name} (inv:${apiOwned})` : item.name;
+
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.min = '0';
+      input.step = '1';
+      input.value = String(Number(state.holdings[item.id] || 0));
+
+      input.addEventListener('change', () => {
+        state.holdings[item.id] = clamp(Number(input.value) || 0, 0, 9999);
+        saveHoldings();
+        state.metrics = getSetMetrics(state.items);
+        render();
+      });
+
+      row.appendChild(input);
+      host.appendChild(row);
+    }
+  }
+
+  function recordOpportunity(entry) {
+    if (!entry || !entry.itemName) return;
+
+    const fingerprint = `${entry.itemName}|${entry.price}|${entry.category}`;
+    if (state.watchlist[0]?.fingerprint === fingerprint) return;
+
+    state.watchlist.unshift({
+      ...entry,
+      fingerprint,
+      at: now(),
+    });
+
+    const unique = [];
+    const seen = new Set();
+
+    for (const row of state.watchlist) {
+      if (seen.has(row.fingerprint)) continue;
+      seen.add(row.fingerprint);
+      unique.push(row);
+      if (unique.length >= 5) break;
+    }
+
+    state.watchlist = unique;
+    saveWatchlist();
+  }
+
+  function getSetMetrics(items) {
+    const grouped = {
+      Flower: items.filter((x) => x.type === 'Flower'),
+      Plushie: items.filter((x) => x.type === 'Plushie'),
+    };
+
+    const pointsNet = (state.pointsPrice || 0) * 10;
+    const out = {};
+    const candidateItems = [];
+
+    for (const [cat, arr] of Object.entries(grouped)) {
+      const needed = arr.map((item) => {
+        const localOwned = Number(state.holdings[item.id] || 0);
+        const apiOwned = Number(state.apiHoldings[item.id] || 0);
+        const owned = Math.max(localOwned, apiOwned);
+        const missing = owned > 0 ? 0 : 1;
+
+        const refValue = Number(state.marketValueById.get(item.id) || item.market_value || 0);
+        const price = Number(state.apiPricesById.get(item.id) || refValue || 0);
+
+        const mvPct = marketValuePercent(price, refValue);
+        const inBand = itemBandStatus(mvPct) === 'in';
+        const itemRoiPct = price > 0 ? ((refValue - price) / price) * 100 : 0;
+
+        return {
+          ...item,
+          owned,
+          missing,
+          price,
+          refValue,
+          mvPct,
+          inBand,
+          itemRoiPct,
+          setType: cat,
+        };
+      });
+
+      const fullSetCost = needed.reduce((sum, i) => sum + i.price, 0);
+      const missingItems = needed.filter(i => i.missing);
+      const missingOnlyCost = missingItems.reduce((sum, i) => sum + i.price, 0);
+      const netProfitFull = pointsNet - fullSetCost;
+      const netProfitIncremental = pointsNet - missingOnlyCost;
+      const roiPct = missingOnlyCost > 0 ? (netProfitIncremental / missingOnlyCost) * 100 : -100;
+      const buyable = missingOnlyCost > 0 && roiPct >= state.settings.roiThresholdPct;
+
+      const enrichedMissing = missingItems.map((item) => {
+        const supportsProfitableSet = buyable;
+        const decision = decisionLabel({
+          inBand: item.inBand,
+          supportsProfitableSet,
+        });
+
+        return {
+          ...item,
+          supportsProfitableSet,
+          decision,
+          reason: reasonText(item, buyable),
+        };
+      });
+
+      const bestNext = enrichedMissing
+        .filter(i => i.inBand)
+        .sort((a, b) => itemSortScore(b) - itemSortScore(a))[0] || null;
+
+      const bottleneck = missingItems.sort((a, b) => b.price - a.price)[0] || null;
+
+      out[cat] = {
+        cat,
+        needed,
+        missingItems: enrichedMissing,
+        pointsNet,
+        fullSetCost,
+        missingOnlyCost,
+        netProfitFull,
+        netProfitIncremental,
+        roiPct,
+        bottleneck,
+        bestNext,
+        buyable,
+      };
+
+      candidateItems.push(...enrichedMissing);
+    }
+
+    const bestSet = Object.values(out)
+      .sort((a, b) => {
+        if (Number(b.buyable) !== Number(a.buyable)) return Number(b.buyable) - Number(a.buyable);
+        if (b.netProfitIncremental !== a.netProfitIncremental) return b.netProfitIncremental - a.netProfitIncremental;
+        return b.roiPct - a.roiPct;
+      })[0] || null;
+
+    const bestItem = candidateItems
+      .sort((a, b) => itemSortScore(b) - itemSortScore(a))[0] || null;
+
+    const pricedCount = items.filter(i => {
+      const price = Number(state.apiPricesById.get(i.id) || 0);
+      return price > 0;
+    }).length;
+
+    const coverage = items.length ? pricedCount / items.length : 0;
+
+    return {
+      byCategory: out,
+      bestSet,
+      bestItem,
+      pointsNet,
+      confidence: confidenceLabel(coverage, now() - state.lastApiRefresh),
+      coverage,
+    };
+  }
+
+  function renderHistory() {
+    const host = state.panel.querySelector('#tmh-history');
+    if (!host) return;
+
+    if (!state.watchlist.length) {
+      host.innerHTML = `<div class="tmh-small">No recent opportunities recorded yet.</div>`;
+      return;
+    }
+
+    host.innerHTML = state.watchlist.map((row) => {
+      const dt = new Date(row.at);
+      const timeText = `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}:${String(dt.getSeconds()).padStart(2, '0')}`;
+      return `
+        <div class="tmh-list-entry">
+          <div class="tmh-inline">
+            <span class="tmh-badge ${row.decision === 'BUY' ? 'tmh-buy' : (row.decision === 'MAYBE' ? 'tmh-maybe' : 'tmh-ignore')}">${row.decision}</span>
+            <strong>${row.itemName}</strong>
+          </div>
+          <div class="tmh-small">${row.category} • ${fmtMoney(row.price)} • ${fmtPct(row.mvPct)} of MV • ${timeText}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderPageBadge(bestSet) {
+    document.querySelectorAll('.tmh-page-badge').forEach(x => x.remove());
+    if (!bestSet || !bestSet.buyable) return;
+
+    const badge = document.createElement('a');
+    badge.className = 'tmh-page-badge';
+    badge.href = CATEGORY_URLS[bestSet.cat];
+    badge.textContent = `${bestSet.cat} profitable`;
+    badge.title = 'Open profitable category';
+    document.body.appendChild(badge);
+  }
+
+  function highlightBestItem(bestItem) {
+    document.querySelectorAll('.tmh-highlight').forEach(el => el.classList.remove('tmh-highlight'));
+    if (!bestItem) return;
+
+    const name = bestItem.name.toLowerCase();
+
+    const candidates = Array.from(document.querySelectorAll(
+      '[data-item-name], .itemRow, .market-item, .sellerRow, .item-market-list-item, li, tr, div'
+    ));
+
+    const match = candidates.find(el => {
+      const text = (el.textContent || '').trim().toLowerCase();
+      return text && text.includes(name) && text.length < 600;
+    });
+
+    if (match) {
+      match.classList.add('tmh-highlight');
+      match.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+
+  function maybeAlert(bestSet, bestItem) {
+    if (!state.settings.alertsEnabled || !bestItem) return;
+
+    const s = GM_getValue(STORE_KEYS.alertState, {
+      at: 0,
+      bestItemName: '',
+      bestItemPrice: 0,
+      bestSetCat: '',
+      bestItemDecision: '',
+    });
+
+    const enoughTime = now() - (s.at || 0) > state.settings.alertCooldownSeconds * 1000;
+    const itemChanged = s.bestItemName !== bestItem.name || s.bestItemPrice !== bestItem.price;
+    const setChanged = s.bestSetCat !== (bestSet?.cat || '');
+    const decisionChanged = s.bestItemDecision !== bestItem.decision;
+    const shouldAlert = bestItem.decision === 'BUY' && (itemChanged || setChanged || decisionChanged);
+
+    if (!shouldAlert || !enoughTime) {
+      GM_setValue(STORE_KEYS.alertState, {
+        ...s,
+        bestItemName: bestItem.name,
+        bestItemPrice: bestItem.price,
+        bestSetCat: bestSet?.cat || '',
+        bestItemDecision: bestItem.decision,
+      });
+      return;
+    }
+
+    const text = [
+      `${bestItem.name} looks good.`,
+      `${fmtMoney(bestItem.price)} (${fmtPct(bestItem.mvPct)} of MV).`,
+      `Best set: ${bestSet?.cat || 'Unknown'} at ${fmtPct(bestSet?.roiPct || 0, 2)} ROI.`,
+    ].join(' ');
+
+    if (typeof GM_notification === 'function') {
+      GM_notification({
+        title: 'Torn Museum Arb',
+        text,
+        timeout: 5000,
+        onclick: () => window.open(CATEGORY_URLS[bestItem.setType], '_blank'),
+      });
+    }
+
+    GM_setValue(STORE_KEYS.alertState, {
+      at: now(),
+      bestItemName: bestItem.name,
+      bestItemPrice: bestItem.price,
+      bestSetCat: bestSet?.cat || '',
+      bestItemDecision: bestItem.decision,
+    });
+  }
+
+  function render() {
+    if (!state.body) return;
+
+    const m = state.metrics;
+    const status = state.panel.querySelector('#tmh-status');
+
+    if (state.paused) {
+      status.textContent = 'paused';
+    } else if (!m) {
+      status.textContent = state.isLeader ? 'leader' : 'follower';
+    } else {
+      status.textContent = state.isLeader ? 'leader' : 'follower';
+    }
+
+    if (!m) {
+      state.body.innerHTML = '<div class="tmh-section"><div class="tmh-small">Waiting for data...</div></div>';
+      renderHistory();
+      return;
+    }
+
+    const flower = m.byCategory.Flower;
+    const plushie = m.byCategory.Plushie;
+    const bestSet = m.bestSet;
+    const bestItem = m.bestItem;
+
+    const bestDecisionClass =
+      bestItem?.decision === 'BUY' ? 'tmh-buy' :
+      bestItem?.decision === 'MAYBE' ? 'tmh-maybe' : 'tmh-ignore';
+
+    const confidenceClass =
+      m.confidence === 'High' ? 'tmh-good' :
+      m.confidence === 'Medium' ? 'tmh-warn' : 'tmh-bad';
+
+    const apiAgeSeconds = Math.max(0, (now() - state.lastApiRefresh) / 1000).toFixed(1);
+
+    state.body.innerHTML = `
+      <div class="tmh-section">
+        <div class="tmh-title">Overview</div>
+        <div class="tmh-row"><span>Mode</span><strong>${state.isLeader ? 'Leader' : 'Follower'}</strong></div>
+        <div class="tmh-row"><span>Points value (10x)</span><strong>${fmtMoney(m.pointsNet)}</strong></div>
+        <div class="tmh-row"><span>Confidence</span><strong class="${confidenceClass}">${m.confidence}</strong></div>
+        <div class="tmh-row"><span>MV band</span><strong>${fmtPct(mvBand().min)} to ${fmtPct(mvBand().max)}</strong></div>
+        <div class="tmh-row"><span>Last API update</span><strong>${state.lastApiRefresh ? new Date(state.lastApiRefresh).toLocaleTimeString() : '-'}</strong></div>
+        <div class="tmh-row"><span>API age</span><strong>${apiAgeSeconds}s</strong></div>
+      </div>
+
+      <div class="tmh-section">
+        <div class="tmh-title">Best set right now</div>
+        <div class="tmh-inline">
+          <strong>${bestSet?.cat || '-'}</strong>
+          <span class="tmh-badge ${bestSet?.buyable ? 'tmh-buy' : 'tmh-maybe'}">${bestSet?.buyable ? 'BUY' : 'MAYBE'}</span>
+        </div>
+        <div class="tmh-row"><span>ROI</span><strong class="${bestSet?.buyable ? 'tmh-good' : 'tmh-warn'}">${fmtPct(bestSet?.roiPct || 0, 2)}</strong></div>
+        <div class="tmh-row"><span>Missing cost</span><strong>${fmtMoney(bestSet?.missingOnlyCost || 0)}</strong></div>
+        <div class="tmh-row"><span>Net</span><strong>${fmtMoney(bestSet?.netProfitIncremental || 0)}</strong></div>
+        <div class="tmh-row"><span>Best next</span><strong>${bestSet?.bestNext ? `${bestSet.bestNext.name} (${fmtMoney(bestSet.bestNext.price)})` : 'None in band'}</strong></div>
+      </div>
+
+      <div class="tmh-section">
+        <div class="tmh-title">Best individual item</div>
+        ${
+          bestItem ? `
+          <div class="tmh-inline">
+            <strong>${bestItem.name}</strong>
+            <span class="tmh-badge ${bestDecisionClass}">${bestItem.decision}</span>
+          </div>
+          <div class="tmh-row"><span>Category</span><strong>${bestItem.setType}</strong></div>
+          <div class="tmh-row"><span>API price</span><strong>${fmtMoney(bestItem.price)}</strong></div>
+          <div class="tmh-row"><span>Market value</span><strong>${fmtMoney(bestItem.refValue)}</strong></div>
+          <div class="tmh-row"><span>MV %</span><strong>${fmtPct(bestItem.mvPct)}</strong></div>
+          <div class="tmh-row"><span>Item ROI</span><strong>${fmtPct(bestItem.itemRoiPct, 2)}</strong></div>
+          <div class="tmh-reason">${bestItem.reason}</div>
+          ` : `
+          <div class="tmh-small">No candidate item found yet.</div>
+          `
+        }
+      </div>
+
+      <div class="tmh-section">
+        <div class="tmh-title">Category snapshot</div>
+        <div class="tmh-row"><span>Flowers</span><strong>${fmtPct(flower.roiPct, 2)} • ${flower.bestNext ? flower.bestNext.name : 'No in-band item'}</strong></div>
+        <div class="tmh-row"><span>Plushies</span><strong>${fmtPct(plushie.roiPct, 2)} • ${plushie.bestNext ? plushie.bestNext.name : 'No in-band item'}</strong></div>
+      </div>
+    `;
+
+    renderHistory();
+    renderPageBadge(bestSet);
+    highlightBestItem(bestItem);
+
+    if (bestItem) {
+      recordOpportunity({
+        itemName: bestItem.name,
+        price: bestItem.price,
+        mvPct: bestItem.mvPct,
+        category: bestItem.setType,
+        decision: bestItem.decision,
+      });
+      renderHistory();
+    }
+
+    maybeAlert(bestSet, bestItem);
+  }
+
+  function serializeSharedCache() {
+    return {
+      items: state.items.map(item => ({
+        id: item.id,
+        name: item.name,
+        type: item.type,
+        market_value: item.market_value,
+      })),
+      pointsPrice: state.pointsPrice,
+      apiHoldings: state.apiHoldings,
+      apiPricesById: Array.from(state.apiPricesById.entries()),
+      marketValueById: Array.from(state.marketValueById.entries()),
+      lastApiRefresh: state.lastApiRefresh,
+    };
+  }
+
+  function persistSharedCache() {
+    const cache = serializeSharedCache();
+    GM_setValue(STORE_KEYS.sharedCache, cache);
+    broadcast({ type: 'cache-updated', cache });
+  }
+
+  function applySharedCache(cache) {
+    if (!cache || typeof cache !== 'object') return;
+    if (Array.isArray(cache.items)) {
+      state.items = cache.items.slice();
+    }
+    state.pointsPrice = Number(cache.pointsPrice || 0) || null;
+    state.apiHoldings = cache.apiHoldings || {};
+    state.apiPricesById = new Map(Array.isArray(cache.apiPricesById) ? cache.apiPricesById : []);
+    state.marketValueById = new Map(Array.isArray(cache.marketValueById) ? cache.marketValueById : []);
+    state.lastApiRefresh = Number(cache.lastApiRefresh || 0);
+
+    if (state.panel && state.items.length) {
+      buildHoldingsEditor(state.items);
+    }
+    if (state.items.length) {
+      state.metrics = getSetMetrics(state.items);
+    }
+  }
+
+  function loadSharedCacheFromStorage() {
+    const cache = GM_getValue(STORE_KEYS.sharedCache, null);
+    if (cache) {
+      applySharedCache(cache);
+    }
+  }
+
   async function refreshDataIfNeeded(force = false) {
+    if (!state.isLeader) return;
     if (!state.settings.apiKey) return;
+
     const ageMs = now() - state.lastApiRefresh;
     if (!force && ageMs < state.settings.apiRefreshSeconds * 1000) return;
 
     const items = await getItemsMaster(state.settings.apiKey);
     if (items.length) {
       state.items = items;
+      state.marketValueById.clear();
+      for (const item of items) {
+        state.marketValueById.set(item.id, Number(item.market_value || 0));
+      }
       buildHoldingsEditor(items);
     }
 
@@ -724,20 +1176,46 @@
     const points = await getPointsPrice(state.settings.apiKey);
     if (points) state.pointsPrice = points;
 
-    const jobs = state.items.map(item => getItemLivePrice(state.settings.apiKey, item.id, item.market_value));
-    const prices = await Promise.all(jobs);
-    prices.forEach((p, idx) => state.pricesById.set(state.items[idx].id, p));
+    state.apiPricesById.clear();
+    const jobs = state.items.map(async (item) => {
+      const reference = Number(state.marketValueById.get(item.id) || item.market_value || 0);
+      const live = await getItemLivePrice(state.settings.apiKey, item.id, reference);
+      return { id: item.id, price: live, reference };
+    });
+
+    const results = await Promise.all(jobs);
+    for (const row of results) {
+      if (row.price != null && Number.isFinite(row.price) && row.price > 0) {
+        state.apiPricesById.set(row.id, row.price);
+      } else if (row.reference > 0) {
+        state.apiPricesById.set(row.id, row.reference);
+      }
+    }
 
     state.lastApiRefresh = now();
+    persistSharedCache();
   }
 
   async function tick() {
+    if (state.paused) {
+      applyFade();
+      return;
+    }
+
     try {
-      await refreshDataIfNeeded(false);
-      refreshCheapestFromCurrentPage();
+      maybeBecomeLeader();
+
+      if (state.isLeader) {
+        heartbeatLeader();
+        await refreshDataIfNeeded(false);
+      } else {
+        loadSharedCacheFromStorage();
+      }
+
       if (state.items.length) {
         state.metrics = getSetMetrics(state.items);
       }
+
       render();
       applyFade();
     } catch (err) {
@@ -746,14 +1224,41 @@
     }
   }
 
+  function installUnloadHandler() {
+    window.addEventListener('beforeunload', () => {
+      if (state.isLeader) {
+        broadcast({ type: 'leader-resigned', leaderId: state.tabId });
+        clearLeaderRecord();
+      }
+      try {
+        if (state.bc) state.bc.close();
+      } catch (_) {}
+    });
+  }
+
   async function init() {
     loadState();
+    initBroadcastChannel();
+    loadSharedCacheFromStorage();
+    maybeBecomeLeader();
     createPanel();
-    await refreshDataIfNeeded(true);
+    installUnloadHandler();
+
+    if (state.isLeader) {
+      await refreshDataIfNeeded(true);
+    } else {
+      loadSharedCacheFromStorage();
+    }
+
     state.metrics = state.items.length ? getSetMetrics(state.items) : null;
     render();
-    setInterval(tick, Math.max(3000, state.settings.scanSeconds * 1000));
+
+    setInterval(tick, Math.max(1000, state.settings.scanSeconds * 1000));
     setInterval(applyFade, 1000);
+    setInterval(() => {
+      maybeBecomeLeader();
+      if (state.isLeader) heartbeatLeader();
+    }, 1500);
   }
 
   init();
