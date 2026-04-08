@@ -1,10 +1,12 @@
 // ==UserScript==
-// @name         Torn Museum Arbitrage Helper (API Truth + Tab Coordination)
+// @name         Torn Museum Arbitrage Helper (API Truth + Tab Coordination + TE Market Value Scraper)
 // @namespace    https://torn.com/
-// @version      0.4.0
-// @description  Read-only plushie/flower set helper. API prices drive all math; page is only used for highlighting. One tab acts as leader and performs API calls for all tabs.
+// @version      0.5.0
+// @description  Read-only plushie/flower set helper. API prices drive live pricing; Torn Exchange TE Market Values are scraped from edit price list every 30 minutes and shared across tabs.
 // @author       GPT-5.4 Thinking
 // @match        https://www.torn.com/*
+// @match        https://www.tornexchange.com/editprice*
+// @match        https://tornexchange.com/edit_price_list*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
@@ -14,16 +16,21 @@
   'use strict';
 
   const STORE_KEYS = {
-    settings: 'tmh_settings_v4',
-    holdings: 'tmh_holdings_v4',
-    alertState: 'tmh_alert_state_v4',
-    hiddenPaths: 'tmh_hidden_paths_v4',
-    watchlist: 'tmh_watchlist_v4',
-    leader: 'tmh_leader_v4',
-    sharedCache: 'tmh_shared_cache_v4',
+    settings: 'tmh_settings_v5',
+    holdings: 'tmh_holdings_v5',
+    alertState: 'tmh_alert_state_v5',
+    hiddenPaths: 'tmh_hidden_paths_v5',
+    watchlist: 'tmh_watchlist_v5',
+    leader: 'tmh_leader_v5',
+    sharedCache: 'tmh_shared_cache_v5',
+    teMarketCache: 'tmh_te_market_cache_v1',
+    teScraperLeader: 'tmh_te_scraper_leader_v1',
   };
 
-  const CHANNEL_NAME = 'tmh_channel_v4';
+  const CHANNEL_NAME = 'tmh_channel_v5';
+  const TE_CHANNEL_NAME = 'tmh_te_channel_v1';
+  const TE_REFRESH_MS = 30 * 60 * 1000;
+  const TE_SCRAPER_STALE_MS = 4 * 60 * 1000;
 
   const DEFAULTS = {
     apiKey: '',
@@ -37,6 +44,7 @@
     alertsEnabled: true,
     moveablePanel: true,
     useApiInventory: true,
+    preferTeMarketValue: true,
   };
 
   const CATEGORY_URLS = {
@@ -79,12 +87,18 @@
     tabId: `tmh_${Math.random().toString(36).slice(2)}_${Date.now()}`,
     isLeader: false,
     bc: null,
+    teBc: null,
 
     settings: { ...DEFAULTS },
     holdings: {},
     items: [],
     pointsPrice: null,
-    marketValueById: new Map(),
+    marketValueById: new Map(),      // final resolved market value (TE preferred if available)
+    tornMarketValueById: new Map(),  // API market value from Torn items endpoint
+    teMarketValueById: new Map(),    // scraped from Torn Exchange
+    teMarketByName: new Map(),
+    teLastScrapeAt: 0,
+
     apiPricesById: new Map(),
     apiHoldings: {},
     metrics: null,
@@ -97,6 +111,14 @@
     paused: false,
     watchlist: [],
   };
+
+  function isTornPage() {
+    return /(^|\.)torn\.com$/i.test(location.hostname);
+  }
+
+  function isTornExchangePage() {
+    return /(^|\.)tornexchange\.com$/i.test(location.hostname);
+  }
 
   function now() {
     return Date.now();
@@ -208,6 +230,12 @@
     } catch (_) {}
   }
 
+  function teBroadcast(message) {
+    try {
+      if (state.teBc) state.teBc.postMessage({ ...message, sender: state.tabId, at: now() });
+    } catch (_) {}
+  }
+
   function initBroadcastChannel() {
     try {
       state.bc = new BroadcastChannel(CHANNEL_NAME);
@@ -243,6 +271,28 @@
       };
     } catch (_) {
       state.bc = null;
+    }
+  }
+
+  function initTeBroadcastChannel() {
+    try {
+      state.teBc = new BroadcastChannel(TE_CHANNEL_NAME);
+      state.teBc.onmessage = (event) => {
+        const msg = event.data || {};
+        if (msg.sender === state.tabId) return;
+
+        if (msg.type === 'te-cache-updated') {
+          loadTeMarketCache();
+          if (state.items.length) {
+            rebuildResolvedMarketValues();
+            state.metrics = getSetMetrics(state.items);
+            render();
+          }
+          return;
+        }
+      };
+    } catch (_) {
+      state.teBc = null;
     }
   }
 
@@ -339,6 +389,7 @@
         <label>Alert cooldown sec <input id="tmh-cool" type="number" min="5" step="5" /></label>
         <label>Min market value % <input id="tmh-min-mv" type="number" min="1" step="0.1" /></label>
         <label>Max market value % <input id="tmh-max-mv" type="number" min="1" step="0.1" /></label>
+        <label><input id="tmh-prefer-te" type="checkbox" style="width:auto;margin-right:6px;" /> Prefer TE Market Value when available</label>
         <button id="tmh-save">Save</button>
       </details>
 
@@ -517,6 +568,36 @@
         border-radius: 8px;
         cursor:pointer;
       }
+      #tmh-te-panel {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        z-index: 99999;
+        width: 320px;
+        background: rgba(17,17,17,.96);
+        color: #f4f4f4;
+        border: 1px solid #3b3b3b;
+        border-radius: 12px;
+        font: 12px/1.4 Arial, sans-serif;
+        box-shadow: 0 8px 20px rgba(0,0,0,.35);
+        padding: 10px;
+      }
+      #tmh-te-panel .row {
+        display:flex;
+        justify-content:space-between;
+        gap:8px;
+        margin:4px 0;
+      }
+      #tmh-te-panel button {
+        width:100%;
+        margin-top:8px;
+        border:0;
+        background:#4f79ff;
+        color:#fff;
+        border-radius:6px;
+        padding:6px;
+        cursor:pointer;
+      }
     `;
 
     document.head.appendChild(style);
@@ -536,7 +617,9 @@
       state.settings.alertCooldownSeconds = clamp(Number(panel.querySelector('#tmh-cool').value) || 90, 5, 3600);
       state.settings.minMarketValuePct = clamp(Number(panel.querySelector('#tmh-min-mv').value) || 70, 1, 200);
       state.settings.maxMarketValuePct = clamp(Number(panel.querySelector('#tmh-max-mv').value) || 99.5, 1, 200);
+      state.settings.preferTeMarketValue = !!panel.querySelector('#tmh-prefer-te').checked;
       saveSettings();
+      rebuildResolvedMarketValues();
       state.metrics = state.items.length ? getSetMetrics(state.items) : null;
       render();
       markInteraction();
@@ -549,6 +632,7 @@
     panel.querySelector('#tmh-cool').value = String(state.settings.alertCooldownSeconds);
     panel.querySelector('#tmh-min-mv').value = String(state.settings.minMarketValuePct);
     panel.querySelector('#tmh-max-mv').value = String(state.settings.maxMarketValuePct);
+    panel.querySelector('#tmh-prefer-te').checked = !!state.settings.preferTeMarketValue;
 
     panel.querySelector('#tmh-refresh-now').addEventListener('click', async () => {
       if (!state.isLeader) {
@@ -609,6 +693,47 @@
       panel.style.display = 'none';
       showReopenButton(pathKey);
     }
+  }
+
+  function createTePanel() {
+    let panel = document.querySelector('#tmh-te-panel');
+    if (panel) return panel;
+
+    panel = document.createElement('div');
+    panel.id = 'tmh-te-panel';
+    panel.innerHTML = `
+      <div style="font-weight:700;margin-bottom:6px;">TE Market Scraper</div>
+      <div class="row"><span>Status</span><strong id="tmh-te-status">idle</strong></div>
+      <div class="row"><span>Last scrape</span><strong id="tmh-te-last">-</strong></div>
+      <div class="row"><span>Rows cached</span><strong id="tmh-te-count">0</strong></div>
+      <button id="tmh-te-refresh">Scrape now</button>
+    `;
+    document.body.appendChild(panel);
+
+    panel.querySelector('#tmh-te-refresh').addEventListener('click', async () => {
+      await runTeScrape(true);
+    });
+
+    renderTePanel();
+    return panel;
+  }
+
+  function renderTePanel(extraStatus) {
+    const panel = document.querySelector('#tmh-te-panel');
+    if (!panel) return;
+
+    const cache = GM_getValue(STORE_KEYS.teMarketCache, null);
+    const count = cache?.count || 0;
+    const lastAt = cache?.updatedAt || 0;
+    const status = extraStatus || 'ready';
+
+    const statusEl = panel.querySelector('#tmh-te-status');
+    const lastEl = panel.querySelector('#tmh-te-last');
+    const countEl = panel.querySelector('#tmh-te-count');
+
+    if (statusEl) statusEl.textContent = status;
+    if (lastEl) lastEl.textContent = lastAt ? new Date(lastAt).toLocaleTimeString() : '-';
+    if (countEl) countEl.textContent = String(count);
   }
 
   async function fetchJson(url) {
@@ -777,6 +902,76 @@
     saveWatchlist();
   }
 
+  function normalizeItemName(name) {
+    return String(name || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function parseMoney(text) {
+    if (!text) return null;
+    const cleaned = String(text).replace(/[^0-9.-]/g, '');
+    if (!cleaned) return null;
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function looksLikeTargetName(name) {
+    const n = normalizeItemName(name);
+    for (const setNames of Object.values(REQUIRED_SET_NAMES)) {
+      for (const candidate of setNames) {
+        if (normalizeItemName(candidate) === n) return true;
+      }
+    }
+    return false;
+  }
+
+  function loadTeMarketCache() {
+    const cache = GM_getValue(STORE_KEYS.teMarketCache, null);
+    state.teMarketValueById.clear();
+    state.teMarketByName.clear();
+    state.teLastScrapeAt = 0;
+
+    if (!cache || !cache.rows || !Array.isArray(cache.rows)) return;
+
+    for (const row of cache.rows) {
+      const nameNorm = normalizeItemName(row.itemName);
+      if (!nameNorm) continue;
+      const teValue = Number(row.teMarketValue || 0);
+      if (teValue > 0) {
+        state.teMarketByName.set(nameNorm, teValue);
+      }
+    }
+
+    state.teLastScrapeAt = Number(cache.updatedAt || 0);
+
+    for (const item of state.items) {
+      const nameNorm = normalizeItemName(item.name);
+      const teValue = Number(state.teMarketByName.get(nameNorm) || 0);
+      if (teValue > 0) {
+        state.teMarketValueById.set(item.id, teValue);
+      }
+    }
+  }
+
+  function rebuildResolvedMarketValues() {
+    state.marketValueById.clear();
+
+    for (const item of state.items) {
+      const tornValue = Number(state.tornMarketValueById.get(item.id) || item.market_value || 0);
+      const teValue = Number(state.teMarketValueById.get(item.id) || state.teMarketByName.get(normalizeItemName(item.name)) || 0);
+
+      const resolved = state.settings.preferTeMarketValue
+        ? (teValue > 0 ? teValue : tornValue)
+        : (tornValue > 0 ? tornValue : teValue);
+
+      if (tornValue > 0) state.tornMarketValueById.set(item.id, tornValue);
+      if (teValue > 0) state.teMarketValueById.set(item.id, teValue);
+      if (resolved > 0) state.marketValueById.set(item.id, resolved);
+    }
+  }
+
   function getSetMetrics(items) {
     const grouped = {
       Flower: items.filter((x) => x.type === 'Flower'),
@@ -807,6 +1002,8 @@
           missing,
           price,
           refValue,
+          tornRefValue: Number(state.tornMarketValueById.get(item.id) || item.market_value || 0),
+          teRefValue: Number(state.teMarketValueById.get(item.id) || 0),
           mvPct,
           inBand,
           itemRoiPct,
@@ -1044,6 +1241,7 @@
       m.confidence === 'Medium' ? 'tmh-warn' : 'tmh-bad';
 
     const apiAgeSeconds = Math.max(0, (now() - state.lastApiRefresh) / 1000).toFixed(1);
+    const teAgeSeconds = state.teLastScrapeAt ? Math.max(0, (now() - state.teLastScrapeAt) / 1000).toFixed(0) : '-';
 
     state.body.innerHTML = `
       <div class="tmh-section">
@@ -1052,8 +1250,11 @@
         <div class="tmh-row"><span>Points value (10x)</span><strong>${fmtMoney(m.pointsNet)}</strong></div>
         <div class="tmh-row"><span>Confidence</span><strong class="${confidenceClass}">${m.confidence}</strong></div>
         <div class="tmh-row"><span>MV band</span><strong>${fmtPct(mvBand().min)} to ${fmtPct(mvBand().max)}</strong></div>
+        <div class="tmh-row"><span>Using TE MV</span><strong>${state.settings.preferTeMarketValue ? 'Yes' : 'No'}</strong></div>
         <div class="tmh-row"><span>Last API update</span><strong>${state.lastApiRefresh ? new Date(state.lastApiRefresh).toLocaleTimeString() : '-'}</strong></div>
         <div class="tmh-row"><span>API age</span><strong>${apiAgeSeconds}s</strong></div>
+        <div class="tmh-row"><span>Last TE scrape</span><strong>${state.teLastScrapeAt ? new Date(state.teLastScrapeAt).toLocaleTimeString() : '-'}</strong></div>
+        <div class="tmh-row"><span>TE age</span><strong>${teAgeSeconds === '-' ? '-' : `${teAgeSeconds}s`}</strong></div>
       </div>
 
       <div class="tmh-section">
@@ -1078,7 +1279,9 @@
           </div>
           <div class="tmh-row"><span>Category</span><strong>${bestItem.setType}</strong></div>
           <div class="tmh-row"><span>API price</span><strong>${fmtMoney(bestItem.price)}</strong></div>
-          <div class="tmh-row"><span>Market value</span><strong>${fmtMoney(bestItem.refValue)}</strong></div>
+          <div class="tmh-row"><span>Ref MV used</span><strong>${fmtMoney(bestItem.refValue)}</strong></div>
+          <div class="tmh-row"><span>TE MV</span><strong>${bestItem.teRefValue ? fmtMoney(bestItem.teRefValue) : '-'}</strong></div>
+          <div class="tmh-row"><span>Torn MV</span><strong>${bestItem.tornRefValue ? fmtMoney(bestItem.tornRefValue) : '-'}</strong></div>
           <div class="tmh-row"><span>MV %</span><strong>${fmtPct(bestItem.mvPct)}</strong></div>
           <div class="tmh-row"><span>Item ROI</span><strong>${fmtPct(bestItem.itemRoiPct, 2)}</strong></div>
           <div class="tmh-reason">${bestItem.reason}</div>
@@ -1140,6 +1343,9 @@
       apiHoldings: state.apiHoldings,
       apiPricesById: Array.from(state.apiPricesById.entries()),
       marketValueById: Array.from(state.marketValueById.entries()),
+      tornMarketValueById: Array.from(state.tornMarketValueById.entries()),
+      teMarketValueById: Array.from(state.teMarketValueById.entries()),
+      teLastScrapeAt: state.teLastScrapeAt,
       lastApiRefresh: state.lastApiRefresh,
     };
   }
@@ -1159,7 +1365,13 @@
     state.apiHoldings = cache.apiHoldings || {};
     state.apiPricesById = new Map(Array.isArray(cache.apiPricesById) ? cache.apiPricesById : []);
     state.marketValueById = new Map(Array.isArray(cache.marketValueById) ? cache.marketValueById : []);
+    state.tornMarketValueById = new Map(Array.isArray(cache.tornMarketValueById) ? cache.tornMarketValueById : []);
+    state.teMarketValueById = new Map(Array.isArray(cache.teMarketValueById) ? cache.teMarketValueById : []);
+    state.teLastScrapeAt = Number(cache.teLastScrapeAt || 0);
     state.lastApiRefresh = Number(cache.lastApiRefresh || 0);
+
+    loadTeMarketCache();
+    rebuildResolvedMarketValues();
 
     if (state.panel && state.items.length) {
       buildHoldingsEditor(state.items);
@@ -1186,10 +1398,12 @@
     const items = await getItemsMaster(state.settings.apiKey);
     if (items.length) {
       state.items = items;
-      state.marketValueById.clear();
+      state.tornMarketValueById.clear();
       for (const item of items) {
-        state.marketValueById.set(item.id, Number(item.market_value || 0));
+        state.tornMarketValueById.set(item.id, Number(item.market_value || 0));
       }
+      loadTeMarketCache();
+      rebuildResolvedMarketValues();
       buildHoldingsEditor(items);
     }
 
@@ -1220,6 +1434,144 @@
     persistSharedCache();
   }
 
+  function getTeScraperLeader() {
+    return GM_getValue(STORE_KEYS.teScraperLeader, null);
+  }
+
+  function setTeScraperLeader() {
+    GM_setValue(STORE_KEYS.teScraperLeader, {
+      leaderId: state.tabId,
+      heartbeatAt: now(),
+    });
+  }
+
+  function clearTeScraperLeader() {
+    const current = getTeScraperLeader();
+    if (current && current.leaderId === state.tabId) {
+      GM_setValue(STORE_KEYS.teScraperLeader, null);
+    }
+  }
+
+  function isTeScraperLeader() {
+    const rec = getTeScraperLeader();
+    if (!rec || !rec.leaderId) {
+      setTeScraperLeader();
+      return true;
+    }
+    if (rec.leaderId === state.tabId) {
+      setTeScraperLeader();
+      return true;
+    }
+    if ((now() - Number(rec.heartbeatAt || 0)) > TE_SCRAPER_STALE_MS) {
+      setTeScraperLeader();
+      return true;
+    }
+    return false;
+  }
+
+  function scrapeTeTable() {
+    const tables = Array.from(document.querySelectorAll('table'));
+    let bestRows = [];
+
+    for (const table of tables) {
+      const rows = Array.from(table.querySelectorAll('tr'));
+      if (!rows.length) continue;
+
+      const headerCells = Array.from(rows[0].querySelectorAll('th,td')).map(el => normalizeItemName(el.textContent));
+      const hasItem = headerCells.some(x => x.includes('item'));
+      const hasTe = headerCells.some(x => x.includes('te market value'));
+      const hasTorn = headerCells.some(x => x.includes('torn market value'));
+
+      if (!hasItem || !hasTe || !hasTorn) continue;
+
+      let itemIdx = -1;
+      let tornIdx = -1;
+      let teIdx = -1;
+
+      headerCells.forEach((h, i) => {
+        if (itemIdx === -1 && h.includes('item')) itemIdx = i;
+        if (tornIdx === -1 && h.includes('torn market value')) tornIdx = i;
+        if (teIdx === -1 && h.includes('te market value')) teIdx = i;
+      });
+
+      if (itemIdx < 0 || teIdx < 0) continue;
+
+      const found = [];
+      for (const row of rows.slice(1)) {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (!cells.length) continue;
+        if (!cells[itemIdx] || !cells[teIdx]) continue;
+
+        const itemName = String(cells[itemIdx].innerText || cells[itemIdx].textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        if (!itemName || !looksLikeTargetName(itemName)) continue;
+
+        const tornMarketValue = parseMoney(cells[tornIdx]?.innerText || cells[tornIdx]?.textContent || '');
+        const teMarketValue = parseMoney(cells[teIdx]?.innerText || cells[teIdx]?.textContent || '');
+
+        if (teMarketValue && teMarketValue > 0) {
+          found.push({
+            itemName,
+            tornMarketValue: tornMarketValue || 0,
+            teMarketValue,
+          });
+        }
+      }
+
+      if (found.length > bestRows.length) {
+        bestRows = found;
+      }
+    }
+
+    return bestRows;
+  }
+
+  async function waitForTeRows(maxAttempts = 20, delayMs = 1500) {
+    for (let i = 0; i < maxAttempts; i++) {
+      const rows = scrapeTeTable();
+      if (rows.length) return rows;
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    return [];
+  }
+
+  async function runTeScrape(force = false) {
+    if (!isTornExchangePage()) return;
+    createTePanel();
+
+    if (!isTeScraperLeader()) {
+      renderTePanel('follower');
+      return;
+    }
+
+    const existing = GM_getValue(STORE_KEYS.teMarketCache, null);
+    const ageMs = existing?.updatedAt ? now() - Number(existing.updatedAt) : Infinity;
+    if (!force && ageMs < TE_REFRESH_MS) {
+      renderTePanel('cached');
+      return;
+    }
+
+    renderTePanel('scraping');
+    const rows = await waitForTeRows();
+
+    if (!rows.length) {
+      renderTePanel('no rows');
+      return;
+    }
+
+    const payload = {
+      updatedAt: now(),
+      count: rows.length,
+      rows,
+    };
+
+    GM_setValue(STORE_KEYS.teMarketCache, payload);
+    teBroadcast({ type: 'te-cache-updated' });
+    renderTePanel('updated');
+  }
+
   async function tick() {
     if (state.paused) {
       applyFade();
@@ -1235,6 +1587,9 @@
       } else {
         loadSharedCacheFromStorage();
       }
+
+      loadTeMarketCache();
+      rebuildResolvedMarketValues();
 
       if (state.items.length) {
         state.metrics = getSetMetrics(state.items);
@@ -1254,16 +1609,22 @@
         broadcast({ type: 'leader-resigned', leaderId: state.tabId });
         clearLeaderRecord();
       }
+      clearTeScraperLeader();
       try {
         if (state.bc) state.bc.close();
+      } catch (_) {}
+      try {
+        if (state.teBc) state.teBc.close();
       } catch (_) {}
     });
   }
 
-  async function init() {
+  async function initTornMode() {
     loadState();
     initBroadcastChannel();
+    initTeBroadcastChannel();
     loadSharedCacheFromStorage();
+    loadTeMarketCache();
     maybeBecomeLeader();
     createPanel();
     installUnloadHandler();
@@ -1274,6 +1635,9 @@
       loadSharedCacheFromStorage();
     }
 
+    loadTeMarketCache();
+    rebuildResolvedMarketValues();
+
     state.metrics = state.items.length ? getSetMetrics(state.items) : null;
     render();
 
@@ -1283,6 +1647,43 @@
       maybeBecomeLeader();
       if (state.isLeader) heartbeatLeader();
     }, 1500);
+    setInterval(() => {
+      loadTeMarketCache();
+      rebuildResolvedMarketValues();
+      if (state.items.length) {
+        state.metrics = getSetMetrics(state.items);
+        render();
+      }
+    }, 15_000);
+  }
+
+  async function initTeMode() {
+    loadState();
+    initTeBroadcastChannel();
+    createTePanel();
+    installUnloadHandler();
+
+    await runTeScrape(true);
+
+    setInterval(() => {
+      if (isTeScraperLeader()) {
+        setTeScraperLeader();
+      }
+    }, 60_000);
+
+    setInterval(async () => {
+      await runTeScrape(false);
+    }, 60_000);
+  }
+
+  async function init() {
+    if (isTornExchangePage()) {
+      await initTeMode();
+      return;
+    }
+    if (isTornPage()) {
+      await initTornMode();
+    }
   }
 
   init();
