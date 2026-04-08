@@ -626,16 +626,12 @@
     return out;
   }
 
-  function findLowestViablePriceFromApiPayload(js, reference) {
+  function findLowestViablePriceFromApiPayload(js) {
     const nums = deepFindNumbersWithPriceHeuristic(js, []);
     if (!nums.length) return null;
 
-    const band = mvBand();
-    const floor = reference > 0 ? reference * (band.min / 100) : 50;
-    const ceiling = reference > 0 ? reference * (band.max / 100) : 10_000_000;
-
     const viable = nums
-      .filter(n => Number.isFinite(n) && n >= floor && n <= ceiling)
+      .filter(n => Number.isFinite(n) && n > 0)
       .sort((a, b) => a - b);
 
     return viable.length ? viable[0] : null;
@@ -686,7 +682,7 @@
     return [];
   }
 
-  async function getItemLivePrice(apiKey, itemId, reference) {
+  async function getItemLivePrice(apiKey, itemId) {
     const urls = [
       `https://api.torn.com/market/${itemId}?selections=itemmarket&key=${encodeURIComponent(apiKey)}`,
       `https://api.torn.com/v2/market/${itemId}/itemmarket?key=${encodeURIComponent(apiKey)}`,
@@ -695,7 +691,7 @@
     for (const url of urls) {
       try {
         const js = await fetchJson(url);
-        const found = findLowestViablePriceFromApiPayload(js, reference);
+        const found = findLowestViablePriceFromApiPayload(js);
         if (found != null) return found;
       } catch (_) {}
     }
@@ -1207,7 +1203,7 @@
     state.apiPricesById.clear();
     const jobs = state.items.map(async (item) => {
       const reference = Number(state.marketValueById.get(item.id) || item.market_value || 0);
-      const live = await getItemLivePrice(state.settings.apiKey, item.id, reference);
+      const live = await getItemLivePrice(state.settings.apiKey, item.id);
       return { id: item.id, price: live, reference };
     });
 
