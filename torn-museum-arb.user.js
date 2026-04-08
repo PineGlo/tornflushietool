@@ -626,16 +626,12 @@
     return out;
   }
 
-  function findLowestViablePriceFromApiPayload(js, reference) {
+  function findLowestViablePriceFromApiPayload(js) {
     const nums = deepFindNumbersWithPriceHeuristic(js, []);
     if (!nums.length) return null;
 
-    const band = mvBand();
-    const floor = reference > 0 ? reference * (band.min / 100) : 50;
-    const ceiling = reference > 0 ? reference * (band.max / 100) : 10_000_000;
-
     const viable = nums
-      .filter(n => Number.isFinite(n) && n >= floor && n <= ceiling)
+      .filter(n => Number.isFinite(n) && n > 0)
       .sort((a, b) => a - b);
 
     return viable.length ? viable[0] : null;
@@ -686,7 +682,7 @@
     return [];
   }
 
-  async function getItemLivePrice(apiKey, itemId, reference) {
+  async function getItemLivePrice(apiKey, itemId) {
     const urls = [
       `https://api.torn.com/market/${itemId}?selections=itemmarket&key=${encodeURIComponent(apiKey)}`,
       `https://api.torn.com/v2/market/${itemId}/itemmarket?key=${encodeURIComponent(apiKey)}`,
@@ -695,7 +691,7 @@
     for (const url of urls) {
       try {
         const js = await fetchJson(url);
-        const found = findLowestViablePriceFromApiPayload(js, reference);
+        const found = findLowestViablePriceFromApiPayload(js);
         if (found != null) return found;
       } catch (_) {}
     }
@@ -928,24 +924,36 @@
     document.body.appendChild(badge);
   }
 
-  function highlightBestItem(bestItem) {
+  function getInBandItems(metrics) {
+    if (!metrics?.byCategory) return [];
+    const categories = Object.values(metrics.byCategory);
+    return categories
+      .flatMap(cat => (cat.missingItems || []).filter(item => item.inBand))
+      .sort((a, b) => itemSortScore(b) - itemSortScore(a));
+  }
+
+  function highlightInBandItems(items) {
     document.querySelectorAll('.tmh-highlight').forEach(el => el.classList.remove('tmh-highlight'));
-    if (!bestItem) return;
+    if (!items?.length) return;
 
-    const name = bestItem.name.toLowerCase();
+    const names = new Set(items.map(i => i.name.toLowerCase()));
+    const candidates = Array.from(document.querySelectorAll('[data-item-name], .itemRow, .market-item, .sellerRow, .item-market-list-item, li, tr, div'));
 
-    const candidates = Array.from(document.querySelectorAll(
-      '[data-item-name], .itemRow, .market-item, .sellerRow, .item-market-list-item, li, tr, div'
-    ));
-
-    const match = candidates.find(el => {
+    let firstMatch = null;
+    for (const el of candidates) {
       const text = (el.textContent || '').trim().toLowerCase();
-      return text && text.includes(name) && text.length < 600;
-    });
+      if (!text || text.length >= 600) continue;
+      for (const name of names) {
+        if (text.includes(name)) {
+          el.classList.add('tmh-highlight');
+          if (!firstMatch) firstMatch = el;
+          break;
+        }
+      }
+    }
 
-    if (match) {
-      match.classList.add('tmh-highlight');
-      match.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (firstMatch) {
+      firstMatch.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
   }
 
@@ -1025,6 +1033,7 @@
     const plushie = m.byCategory.Plushie;
     const bestSet = m.bestSet;
     const bestItem = m.bestItem;
+    const inBandItems = getInBandItems(m);
 
     const bestDecisionClass =
       bestItem?.decision === 'BUY' ? 'tmh-buy' :
@@ -1084,11 +1093,26 @@
         <div class="tmh-row"><span>Flowers</span><strong>${fmtPct(flower.roiPct, 2)} • ${flower.bestNext ? flower.bestNext.name : 'No in-band item'}</strong></div>
         <div class="tmh-row"><span>Plushies</span><strong>${fmtPct(plushie.roiPct, 2)} • ${plushie.bestNext ? plushie.bestNext.name : 'No in-band item'}</strong></div>
       </div>
+
+      <div class="tmh-section">
+        <div class="tmh-title">Items currently in MV parameters</div>
+        ${
+          inBandItems.length ? inBandItems.map((item) => `
+            <div class="tmh-list-entry">
+              <div class="tmh-inline">
+                <strong>${item.name}</strong>
+                <span class="tmh-badge ${item.decision === 'BUY' ? 'tmh-buy' : 'tmh-maybe'}">${item.decision}</span>
+              </div>
+              <div class="tmh-small">${item.setType} • ${fmtMoney(item.price)} • ${fmtPct(item.mvPct)} of MV</div>
+            </div>
+          `).join('') : '<div class="tmh-small">No items are inside your MV band right now.</div>'
+        }
+      </div>
     `;
 
     renderHistory();
     renderPageBadge(bestSet);
-    highlightBestItem(bestItem);
+    highlightInBandItems(inBandItems);
 
     if (bestItem) {
       recordOpportunity({
@@ -1179,7 +1203,7 @@
     state.apiPricesById.clear();
     const jobs = state.items.map(async (item) => {
       const reference = Number(state.marketValueById.get(item.id) || item.market_value || 0);
-      const live = await getItemLivePrice(state.settings.apiKey, item.id, reference);
+      const live = await getItemLivePrice(state.settings.apiKey, item.id);
       return { id: item.id, price: live, reference };
     });
 
