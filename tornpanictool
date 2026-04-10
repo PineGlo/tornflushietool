@@ -777,9 +777,15 @@
         try {
             lastHandledRequestId = request.requestId;
 
-            if (!isVaultPage()) {
+            if (!isVaultPage() && !request.forceOverflow) {
                 setFlowState('vault_nav');
                 goToVaultPage();
+                return;
+            }
+
+            if (request.forceOverflow && !isStocksPage()) {
+                setFlowState('stock_nav');
+                goToStocksPage();
                 return;
             }
 
