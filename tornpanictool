@@ -1,0 +1,1273 @@
+// ==UserScript==
+// @name         Torn Cash Router (Vault + Overflow Stock)
+// @namespace    pineglow.torn.cashrouter
+// @version      6.0
+// @description  Routes cash to vault first, then overflow stock, with API-backed vault checks and preferred main-leader control.
+// @match        https://www.torn.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PROPERTY_ID = '5709149';
+    const VAULT_CAP = 1_000_000_000;
+
+    const VAULT_HASH = `#/p=options&ID=${PROPERTY_ID}&tab=vault`;
+    const VAULT_URL = `https://www.torn.com/properties.php${VAULT_HASH}`;
+    const STOCKS_URL = 'https://www.torn.com/page.php?sid=stocks';
+
+    const KEYS = {
+        autoMode: 'pineglow_auto_mode',
+        cashMode: 'pineglow_cash_mode',
+        lastAuto: 'pineglow_last_auto',
+        leaderState: 'pineglow_leader_state_v3',
+        leaderDepositRequest: 'pineglow_leader_request_v3',
+        mainLeaderPreferred: 'pineglow_main_leader_preferred'
+    };
+
+    const UI_KEYS = {
+        posX: 'pineglow_ui_pos_x',
+        posY: 'pineglow_ui_pos_y',
+        collapsed: 'pineglow_ui_collapsed',
+        settingsCollapsed: 'pineglow_ui_settings_collapsed'
+    };
+
+    const SETTINGS_KEYS = {
+        apiKey: 'pineglow_setting_api_key',
+        delayMin: 'pineglow_setting_delay_min',
+        delayMax: 'pineglow_setting_delay_max',
+        autoCooldown: 'pineglow_setting_auto_cooldown',
+        minLifeDrop: 'pineglow_setting_min_life_drop',
+        minCashIncrease: 'pineglow_setting_min_cash_increase',
+        lifePollMs: 'pineglow_setting_life_poll_ms',
+        cashPollMs: 'pineglow_setting_cash_poll_ms',
+        exactCashSelector: 'pineglow_setting_exact_cash_selector',
+        overflowEnabled: 'pineglow_setting_overflow_enabled',
+        overflowThreshold: 'pineglow_setting_overflow_threshold',
+        preferredOverflowStock: 'pineglow_setting_preferred_overflow_stock',
+        dryRun: 'pineglow_setting_dry_run'
+    };
+
+    const DEFAULTS = {
+        delayMin: 25,
+        delayMax: 75,
+        autoCooldown: 10_000,
+        minLifeDrop: 1,
+        minCashIncrease: 7_500_000,
+        lifePollMs: 250,
+        cashPollMs: 500,
+        leaderHeartbeatMs: 1500,
+        leaderStaleMs: 5000,
+        exactCashSelector: '',
+        overflowEnabled: 0,
+        overflowThreshold: 100_000_000,
+        preferredOverflowStock: 'SYM',
+        dryRun: 1
+    };
+
+    const FLOW_STATES = {
+        idle: 'idle',
+        pending: 'pending',
+        deciding: 'deciding',
+        vaultNav: 'vault_nav',
+        vaultDeposit: 'vault_deposit',
+        stockNav: 'stock_nav',
+        stockSelect: 'stock_select',
+        stockBuy: 'stock_buy'
+    };
+
+    const TAB_ID = `cashrouter_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const bc = typeof BroadcastChannel !== 'undefined'
+        ? new BroadcastChannel('pineglow_cashrouter_leader_v3')
+        : null;
+
+    let lastLife = null;
+    let lastCash = null;
+
+    let lifeWatcherStarted = false;
+    let cashWatcherStarted = false;
+    let leaderWatcherStarted = false;
+    let flowWatcherStarted = false;
+
+    let uiStatusEl = null;
+    let uiCashEl = null;
+    let uiFlowEl = null;
+    let uiSettingsBody = null;
+
+    let settingsInputs = {};
+    let depositing = false;
+    let flowState = FLOW_STATES.idle;
+    let flowContext = '';
+    let lastHandledRequestId = null;
+
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    const now = () => Date.now();
+
+    function safeJsonParse(value, fallback = null) {
+        try {
+            return JSON.parse(value);
+        } catch {
+            return fallback;
+        }
+    }
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function rand(min, max) {
+        const s = getSettings();
+        const lo = Number.isFinite(min) ? min : s.delayMin;
+        const hi = Number.isFinite(max) ? max : s.delayMax;
+        return Math.floor(Math.random() * (hi - lo + 1)) + lo;
+    }
+
+    function tap(el) {
+        if (!el) return;
+        ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(type => {
+            try {
+                el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            } catch {}
+        });
+        try { el.click(); } catch {}
+    }
+
+    function getNumberSetting(key, fallback) {
+        const raw = localStorage.getItem(key);
+        const val = Number(raw);
+        return Number.isFinite(val) ? val : fallback;
+    }
+
+    function getTextSetting(key, fallback = '') {
+        const raw = localStorage.getItem(key);
+        return raw == null ? fallback : raw;
+    }
+
+    function getSettings() {
+        let delayMin = getNumberSetting(SETTINGS_KEYS.delayMin, DEFAULTS.delayMin);
+        let delayMax = getNumberSetting(SETTINGS_KEYS.delayMax, DEFAULTS.delayMax);
+        if (delayMin < 0) delayMin = DEFAULTS.delayMin;
+        if (delayMax < delayMin) delayMax = delayMin;
+
+        return {
+            apiKey: getTextSetting(SETTINGS_KEYS.apiKey, ''),
+            delayMin,
+            delayMax,
+            autoCooldown: getNumberSetting(SETTINGS_KEYS.autoCooldown, DEFAULTS.autoCooldown),
+            minLifeDrop: getNumberSetting(SETTINGS_KEYS.minLifeDrop, DEFAULTS.minLifeDrop),
+            minCashIncrease: getNumberSetting(SETTINGS_KEYS.minCashIncrease, DEFAULTS.minCashIncrease),
+            lifePollMs: getNumberSetting(SETTINGS_KEYS.lifePollMs, DEFAULTS.lifePollMs),
+            cashPollMs: getNumberSetting(SETTINGS_KEYS.cashPollMs, DEFAULTS.cashPollMs),
+            exactCashSelector: getTextSetting(SETTINGS_KEYS.exactCashSelector, DEFAULTS.exactCashSelector),
+            overflowEnabled: getNumberSetting(SETTINGS_KEYS.overflowEnabled, DEFAULTS.overflowEnabled) ? 1 : 0,
+            overflowThreshold: getNumberSetting(SETTINGS_KEYS.overflowThreshold, DEFAULTS.overflowThreshold),
+            preferredOverflowStock: getTextSetting(SETTINGS_KEYS.preferredOverflowStock, DEFAULTS.preferredOverflowStock).trim().toUpperCase(),
+            dryRun: getNumberSetting(SETTINGS_KEYS.dryRun, DEFAULTS.dryRun) ? 1 : 0,
+            leaderHeartbeatMs: DEFAULTS.leaderHeartbeatMs,
+            leaderStaleMs: DEFAULTS.leaderStaleMs
+        };
+    }
+
+    function parseMoneyText(text) {
+        if (!text) return null;
+        const cleaned = String(text).replace(/[^\d-]/g, '');
+        if (!cleaned) return null;
+        const num = parseInt(cleaned, 10);
+        return Number.isFinite(num) ? num : null;
+    }
+
+    function formatMoney(num) {
+        if (!Number.isFinite(num)) return 'unknown';
+        return `$${num.toLocaleString()}`;
+    }
+
+    function isAutoModeEnabled() {
+        return localStorage.getItem(KEYS.autoMode) === '1';
+    }
+
+    function isCashModeEnabled() {
+        return localStorage.getItem(KEYS.cashMode) === '1';
+    }
+
+    function isMainLeaderPreferred() {
+        return localStorage.getItem(KEYS.mainLeaderPreferred) === '1';
+    }
+
+    function setMainLeaderPreferred(enabled) {
+        localStorage.setItem(KEYS.mainLeaderPreferred, enabled ? '1' : '0');
+    }
+
+    function isVaultPage() {
+        return location.pathname.includes('/properties.php') &&
+            location.hash.includes('/p=options') &&
+            location.hash.includes(`ID=${PROPERTY_ID}`) &&
+            location.hash.includes('tab=vault');
+    }
+
+    function isStocksPage() {
+        if (document.body?.dataset?.page === 'stocks') return true;
+        const href = location.href.toLowerCase();
+        return href.includes('sid=stocks') || href.includes('/stockexchange.php');
+    }
+
+    function findMoneyLabelCash(scope = document) {
+        const elements = Array.from(scope.querySelectorAll('div, span, p, li, a, strong'));
+        for (const el of elements) {
+            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            const m = txt.match(/\bMoney\b\s*:?\s*\$([\d,]+)/i);
+            if (!m) continue;
+            const val = parseMoneyText(m[1]);
+            if (Number.isFinite(val) && val >= 0) return val;
+        }
+        return null;
+    }
+
+    function findVaultOnHandCash(scope = document) {
+        const elements = Array.from(scope.querySelectorAll('div, span, p, li, form, strong'));
+        for (const el of elements) {
+            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            const m = txt.match(/You have\s+\$([\d,]+)\s+on you/i);
+            if (!m) continue;
+            const val = parseMoneyText(m[1]);
+            if (Number.isFinite(val) && val >= 0) return val;
+        }
+        return null;
+    }
+
+    function getCandidateMoneyNodes(scope) {
+        if (!scope) return [];
+        return Array.from(scope.querySelectorAll('*')).filter(el => {
+            const txt = (el?.textContent || '').trim();
+            if (!txt.includes('$') || !/\$[\d,]+/.test(txt)) return false;
+            if (el.children.length > 6) return false;
+            if (el.closest('.news-ticker-new') || el.closest('#header-swiper-container') || el.closest('.news-ticker-slide')) return false;
+            return true;
+        });
+    }
+
+    function chooseBestCashValue(nodes) {
+        const scored = [];
+        for (const el of nodes) {
+            const txt = (el.textContent || '').trim();
+            const matches = txt.match(/\$[\d,]+/g);
+            if (!matches) continue;
+            for (const raw of matches) {
+                const value = parseMoneyText(raw);
+                if (!Number.isFinite(value) || value < 0) continue;
+                let score = 0;
+                if (value >= 1_000) score += 5;
+                if (value >= 100_000) score += 5;
+                if (value >= 1_000_000) score += 10;
+                if (txt.length <= 30) score += 8;
+                if (el.closest('#header-root') || el.closest('#topHeaderBanner')) score += 8;
+                if (/market|decrease|increase|week|headline|value/i.test(txt)) score -= 20;
+                scored.push({ value, score });
+            }
+        }
+        scored.sort((a, b) => b.score - a.score);
+        return scored.length ? scored[0].value : null;
+    }
+
+    function getCash() {
+        const s = getSettings();
+        if (s.exactCashSelector) {
+            const exact = document.querySelector(s.exactCashSelector);
+            if (exact) {
+                const n = parseMoneyText(exact.textContent || '');
+                if (Number.isFinite(n) && n >= 0) return n;
+            }
+        }
+
+        if (isVaultPage()) {
+            const vaultCash = findVaultOnHandCash(document);
+            if (Number.isFinite(vaultCash)) return vaultCash;
+        }
+
+        const moneyLabelCash = findMoneyLabelCash(document);
+        if (Number.isFinite(moneyLabelCash)) return moneyLabelCash;
+
+        const headerScope = document.querySelector('#topHeaderBanner') || document.querySelector('#header-root') || document.querySelector('header');
+        const headerValue = chooseBestCashValue(getCandidateMoneyNodes(headerScope));
+        if (Number.isFinite(headerValue)) return headerValue;
+
+        const bodyValue = chooseBestCashValue(getCandidateMoneyNodes(document.body));
+        if (Number.isFinite(bodyValue)) return bodyValue;
+
+        return null;
+    }
+
+    function getLife() {
+        const el = document.querySelector('a[class*="life"] p[class*="bar-value"]') || document.querySelector('[class*="life"] p[class*="bar-value"]');
+        if (!el) return null;
+        const m = el.textContent.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+        if (!m) return null;
+        return parseInt(m[1].replace(/,/g, ''), 10);
+    }
+
+    function getMyLeaderPayload() {
+        return {
+            tabId: TAB_ID,
+            href: location.href,
+            isVault: isVaultPage(),
+            isVisible: document.visibilityState === 'visible',
+            isMainPreferred: isMainLeaderPreferred(),
+            updatedAt: now()
+        };
+    }
+
+    function readLeaderState() {
+        return safeJsonParse(localStorage.getItem(KEYS.leaderState), null);
+    }
+
+    function writeLeaderState(payload) {
+        localStorage.setItem(KEYS.leaderState, JSON.stringify(payload));
+        if (bc) {
+            try { bc.postMessage({ type: 'leader-heartbeat', payload }); } catch {}
+        }
+    }
+
+    function isLeaderStale(leader) {
+        if (!leader || !leader.updatedAt) return true;
+        return (now() - leader.updatedAt) > getSettings().leaderStaleMs;
+    }
+
+    function amLeader() {
+        const leader = readLeaderState();
+        return !!leader && leader.tabId === TAB_ID && !isLeaderStale(leader);
+    }
+
+    function shouldTakeLeadership(currentLeader) {
+        const mine = getMyLeaderPayload();
+
+        if (!currentLeader) return true;
+        if (isLeaderStale(currentLeader)) return true;
+        if (currentLeader.tabId === TAB_ID) return true;
+
+        if (mine.isMainPreferred && !currentLeader.isMainPreferred) return true;
+        if (mine.isMainPreferred && currentLeader.isMainPreferred && mine.updatedAt >= currentLeader.updatedAt) return true;
+
+        if (!currentLeader.isMainPreferred && mine.isVault && !currentLeader.isVault) return true;
+
+        return false;
+    }
+
+    function maybeClaimLeadership(force = false) {
+        const currentLeader = readLeaderState();
+        if (force || shouldTakeLeadership(currentLeader)) {
+            writeLeaderState(getMyLeaderPayload());
+            updateUIStatus();
+            return true;
+        }
+        updateUIStatus();
+        return false;
+    }
+
+    function heartbeatLeadership() {
+        if (amLeader()) writeLeaderState(getMyLeaderPayload());
+        else maybeClaimLeadership(false);
+        updateUIStatus();
+    }
+
+    function releaseLeadershipIfOwned() {
+        const leader = readLeaderState();
+        if (leader && leader.tabId === TAB_ID) localStorage.removeItem(KEYS.leaderState);
+    }
+
+    function buildDepositRequest(source = 'manual', forceStock = false) {
+        return {
+            requestId: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            source,
+            forceStock,
+            fromTabId: TAB_ID,
+            createdAt: now()
+        };
+    }
+
+    function setDepositRequest(payload) {
+        localStorage.setItem(KEYS.leaderDepositRequest, JSON.stringify(payload));
+        if (bc) {
+            try { bc.postMessage({ type: 'deposit-request', payload }); } catch {}
+        }
+    }
+
+    function getDepositRequest() {
+        return safeJsonParse(localStorage.getItem(KEYS.leaderDepositRequest), null);
+    }
+
+    function clearDepositRequest() {
+        localStorage.removeItem(KEYS.leaderDepositRequest);
+        if (bc) {
+            try { bc.postMessage({ type: 'deposit-request-cleared', tabId: TAB_ID }); } catch {}
+        }
+    }
+
+    async function getVaultCashFromApi() {
+        const { apiKey } = getSettings();
+        if (!apiKey) return null;
+
+        const endpoints = [
+            `https://api.torn.com/user/?selections=profile,properties&key=${encodeURIComponent(apiKey)}`,
+            `https://api.torn.com/v2/user/?selections=profile,properties&key=${encodeURIComponent(apiKey)}`
+        ];
+
+        for (const url of endpoints) {
+            try {
+                const resp = await fetch(url, { cache: 'no-store' });
+                if (!resp.ok) continue;
+                const data = await resp.json();
+                if (data?.error) continue;
+
+                const direct = Number(data?.property?.vault || data?.property?.vault_amount || data?.property?.vaultCash);
+                if (Number.isFinite(direct)) return direct;
+
+                const props = data?.properties;
+                if (props && typeof props === 'object') {
+                    const values = Array.isArray(props) ? props : Object.values(props);
+                    for (const p of values) {
+                        const id = String(p?.property_id ?? p?.id ?? p?.ID ?? '');
+                        if (id !== PROPERTY_ID) continue;
+                        const n = Number(p?.vault ?? p?.vault_amount ?? p?.vaultCash ?? p?.vault_money);
+                        if (Number.isFinite(n)) return n;
+                    }
+                }
+            } catch {}
+        }
+
+        return null;
+    }
+
+    async function getVaultCash() {
+        const apiCash = await getVaultCashFromApi();
+        if (Number.isFinite(apiCash)) return apiCash;
+
+        if (isVaultPage()) {
+            const text = document.body?.textContent || '';
+            const m = text.match(/Vault\s*:?\s*\$([\d,]+)/i);
+            if (m) {
+                const n = parseMoneyText(m[1]);
+                if (Number.isFinite(n)) return n;
+            }
+        }
+        return 0;
+    }
+
+    function decideStorageAction({ onHandCash, vaultCash, overflowEnabled, overflowThreshold, preferredOverflowStock, forceStock = false }) {
+        const vaultRoom = Math.max(0, VAULT_CAP - (Number(vaultCash) || 0));
+        const amountToStore = Math.max(0, Number(onHandCash) || 0);
+
+        if (forceStock) {
+            return { route: 'stock', vaultRoom, amountToStore, reason: 'forced_test', stock: preferredOverflowStock || DEFAULTS.preferredOverflowStock };
+        }
+        if (!overflowEnabled) {
+            return { route: 'vault', vaultRoom, amountToStore, reason: 'overflow_disabled' };
+        }
+        if (amountToStore < overflowThreshold) {
+            return { route: 'vault', vaultRoom, amountToStore, reason: 'below_threshold' };
+        }
+        if (amountToStore <= vaultRoom) {
+            return { route: 'vault', vaultRoom, amountToStore, reason: 'vault_has_room' };
+        }
+        return { route: 'stock', vaultRoom, amountToStore, reason: 'overflow_to_stock', stock: preferredOverflowStock || DEFAULTS.preferredOverflowStock };
+    }
+
+    function goToVaultPage() {
+        if (isVaultPage()) return true;
+        if (location.pathname.includes('/properties.php')) {
+            if (location.hash !== VAULT_HASH) location.hash = VAULT_HASH;
+            return false;
+        }
+        location.assign(VAULT_URL);
+        return false;
+    }
+
+    function goToStocksPage() {
+        if (isStocksPage()) return true;
+        location.assign(STOCKS_URL);
+        return false;
+    }
+
+    function getDepositForm() {
+        return document.querySelector('form.vault-cont.right.deposit-box');
+    }
+
+    function getMaxBtn() {
+        return getDepositForm()?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+    }
+
+    function getDepositBtn() {
+        const btns = Array.from(getDepositForm()?.querySelectorAll('input.torn-btn[type="submit"]') || []);
+        return btns.find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT') || null;
+    }
+
+    async function waitForVaultUI(timeoutMs = 8000) {
+        const start = now();
+        while (now() - start < timeoutMs) {
+            if (getMaxBtn() && getDepositBtn()) return true;
+            await sleep(200);
+        }
+        return false;
+    }
+
+    async function doVaultDeposit() {
+        if (getSettings().dryRun) {
+            flowContext = 'dry-run: vault deposit skipped';
+            updateUIStatus();
+            return true;
+        }
+
+        const maxBtn = getMaxBtn();
+        const depositBtn = getDepositBtn();
+        if (!maxBtn || !depositBtn) return false;
+        tap(maxBtn);
+        await sleep(rand(40, 90));
+        const fresh = getDepositBtn();
+        if (!fresh || fresh.disabled || fresh.classList.contains('disabled')) return false;
+        tap(fresh);
+        return true;
+    }
+
+    function getStockRows() {
+        const selectors = [
+            '[data-stock-id]',
+            '[class*="stock"][class*="row"]',
+            '[class*="stockRow"]',
+            '[class*="stock-item"]',
+            '[class*="stockItem"]',
+            'tr',
+            'li'
+        ];
+        const rows = [];
+        selectors.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => rows.push(el));
+        });
+        return Array.from(new Set(rows));
+    }
+
+    function findStockCard(stockSymbol) {
+        const upper = (stockSymbol || '').toUpperCase();
+        const rows = getStockRows();
+
+        const bySymbol = rows.find(row => {
+            const txt = (row.textContent || '').toUpperCase();
+            return txt.includes(` ${upper} `) || txt.includes(`(${upper})`) || txt.includes(upper);
+        });
+        if (bySymbol) return bySymbol;
+
+        return rows.find(row => (row.textContent || '').toUpperCase().includes('SYMBIOTIC LTD')) || null;
+    }
+
+    function findStockBuyMaxBtn(scope = document) {
+        const inputs = Array.from(scope.querySelectorAll('input[type="button"], button'));
+        return inputs.find(el => /max/i.test((el.value || el.textContent || '').trim())) || null;
+    }
+
+    function findStockBuySubmitBtn(scope = document) {
+        const inputs = Array.from(scope.querySelectorAll('input[type="submit"], button'));
+        return inputs.find(el => /buy/i.test((el.value || el.textContent || '').trim())) || null;
+    }
+
+    async function doStockOverflowBuy(stockSymbol) {
+        if (getSettings().dryRun) {
+            flowState = FLOW_STATES.stockBuy;
+            flowContext = `dry-run: stock buy skipped (${stockSymbol})`;
+            updateUIStatus();
+            return true;
+        }
+
+        flowState = FLOW_STATES.stockSelect;
+        flowContext = `select ${stockSymbol}`;
+        updateUIStatus();
+
+        const stockCard = findStockCard(stockSymbol);
+        if (!stockCard) return false;
+        tap(stockCard);
+        await sleep(rand(120, 220));
+
+        flowState = FLOW_STATES.stockBuy;
+        flowContext = `buy ${stockSymbol}`;
+        updateUIStatus();
+
+        const maxBtn = findStockBuyMaxBtn();
+        if (maxBtn) {
+            tap(maxBtn);
+            await sleep(rand(80, 140));
+        }
+
+        const buyBtn = findStockBuySubmitBtn();
+        if (!buyBtn || buyBtn.disabled || buyBtn.classList.contains('disabled')) return false;
+
+        tap(buyBtn);
+        return true;
+    }
+
+    async function executeVaultPath() {
+        flowState = FLOW_STATES.vaultNav;
+        flowContext = 'navigate vault';
+        updateUIStatus();
+
+        if (!isVaultPage()) {
+            goToVaultPage();
+            return false;
+        }
+
+        const ready = await waitForVaultUI(8000);
+        if (!ready) return false;
+
+        flowState = FLOW_STATES.vaultDeposit;
+        flowContext = 'deposit';
+        updateUIStatus();
+        await sleep(rand());
+
+        return doVaultDeposit();
+    }
+
+    async function executeStockPath(stockSymbol) {
+        flowState = FLOW_STATES.stockNav;
+        flowContext = `navigate stocks (${stockSymbol})`;
+        updateUIStatus();
+
+        if (!isStocksPage()) {
+            goToStocksPage();
+            return false;
+        }
+
+        await sleep(rand(80, 140));
+        return doStockOverflowBuy(stockSymbol);
+    }
+
+    async function processDepositFlow() {
+        if (depositing) return;
+        if (!amLeader()) return;
+
+        const request = getDepositRequest();
+        if (!request) {
+            flowState = FLOW_STATES.idle;
+            flowContext = '';
+            updateUIStatus();
+            return;
+        }
+
+        if (lastHandledRequestId === request.requestId && !request.forceStock && isVaultPage() === false && isStocksPage() === false) {
+            // allow retry after navigation
+        }
+
+        depositing = true;
+        flowState = FLOW_STATES.pending;
+        flowContext = request.source || 'request';
+        updateUIStatus();
+
+        try {
+            lastHandledRequestId = request.requestId;
+
+            flowState = FLOW_STATES.deciding;
+            updateUIStatus();
+
+            const settings = getSettings();
+            const onHandCash = getCash();
+            if (!Number.isFinite(onHandCash) || onHandCash <= 0) return;
+
+            const vaultCash = await getVaultCash();
+            const decision = decideStorageAction({
+                onHandCash,
+                vaultCash,
+                overflowEnabled: !!settings.overflowEnabled,
+                overflowThreshold: settings.overflowThreshold,
+                preferredOverflowStock: settings.preferredOverflowStock,
+                forceStock: !!request.forceStock
+            });
+
+            flowContext = `${decision.route} | room ${formatMoney(decision.vaultRoom)} | cash ${formatMoney(decision.amountToStore)} | ${decision.reason}`;
+            updateUIStatus();
+
+            let success = false;
+            if (decision.route === 'vault') {
+                success = await executeVaultPath();
+            } else {
+                success = await executeStockPath(decision.stock);
+            }
+
+            if (success) {
+                clearDepositRequest();
+                await sleep(rand(80, 140));
+            }
+        } finally {
+            depositing = false;
+            if (!getDepositRequest()) {
+                flowState = FLOW_STATES.idle;
+                flowContext = '';
+            }
+            updateUIStatus();
+        }
+    }
+
+    async function requestDeposit(source = 'manual', options = {}) {
+        setDepositRequest(buildDepositRequest(source, !!options.forceStock));
+        if (amLeader()) {
+            await sleep(rand());
+            processDepositFlow();
+        }
+    }
+
+    async function maybeAutoDeposit(reason, amount = 0) {
+        if (!amLeader() || !isAutoModeEnabled()) return;
+
+        const s = getSettings();
+        const nowMs = now();
+        const last = Number(localStorage.getItem(KEYS.lastAuto) || 0);
+        if (nowMs - last < s.autoCooldown) return;
+
+        localStorage.setItem(KEYS.lastAuto, String(nowMs));
+        await sleep(rand());
+        requestDeposit(`auto:${reason}:${amount}`);
+    }
+
+    function updateUIStatus() {
+        const leader = readLeaderState();
+        const mine = getMyLeaderPayload();
+        const iAmLeader = amLeader();
+
+        if (uiStatusEl) {
+            const role = mine.isMainPreferred ? 'MAIN' : 'AUTO';
+            uiStatusEl.textContent = iAmLeader
+                ? `Leader: YES | Mode: ${role}`
+                : `Leader: NO | Mode: ${role}`;
+            uiStatusEl.style.color = iAmLeader ? '#7CFF9E' : '#FFC66D';
+            if (leader && !iAmLeader) {
+                uiStatusEl.title = `Current leader tab: ${leader.tabId}${leader.isMainPreferred ? ' (MAIN)' : ''}`;
+            } else {
+                uiStatusEl.title = '';
+            }
+        }
+
+        if (uiCashEl) {
+            const dryRunMode = getSettings().dryRun ? 'DRY-RUN ON' : 'LIVE';
+            uiCashEl.textContent = `Cash trigger: ${isCashModeEnabled() ? 'ON' : 'OFF'} | ${dryRunMode} | on-hand ${formatMoney(getCash())}`;
+            uiCashEl.style.color = isCashModeEnabled() ? '#8DD8FF' : '#AAA';
+        }
+
+        if (uiFlowEl) {
+            const req = getDepositRequest();
+            if (depositing) {
+                uiFlowEl.textContent = `Flow: ${flowState}${flowContext ? ` | ${flowContext}` : ''}`;
+                uiFlowEl.style.color = '#7CFF9E';
+            } else if (req) {
+                uiFlowEl.textContent = `Flow: pending | ${req.source || 'request'}`;
+                uiFlowEl.style.color = '#FFC66D';
+            } else {
+                uiFlowEl.textContent = `Flow: ${FLOW_STATES.idle}`;
+                uiFlowEl.style.color = '#BBB';
+            }
+        }
+    }
+
+    function makeField(labelText, inputEl) {
+        const wrap = document.createElement('div');
+        Object.assign(wrap.style, { display: 'flex', flexDirection: 'column', gap: '4px' });
+
+        const label = document.createElement('label');
+        label.textContent = labelText;
+        Object.assign(label.style, { fontSize: '11px', color: '#cfcfcf' });
+
+        Object.assign(inputEl.style, {
+            background: '#1b1b1b', color: '#fff', border: '1px solid rgba(255,255,255,0.15)',
+            borderRadius: '6px', padding: '6px 8px', fontSize: '12px'
+        });
+
+        wrap.appendChild(label);
+        wrap.appendChild(inputEl);
+        return wrap;
+    }
+
+    function buildSettingsInputs() {
+        settingsInputs.apiKey = document.createElement('input');
+        settingsInputs.apiKey.type = 'password';
+        settingsInputs.apiKey.placeholder = 'API key';
+
+        settingsInputs.delayMin = document.createElement('input');
+        settingsInputs.delayMin.type = 'number';
+        settingsInputs.delayMin.min = '0';
+
+        settingsInputs.delayMax = document.createElement('input');
+        settingsInputs.delayMax.type = 'number';
+        settingsInputs.delayMax.min = '0';
+
+        settingsInputs.autoCooldown = document.createElement('input');
+        settingsInputs.autoCooldown.type = 'number';
+        settingsInputs.autoCooldown.min = '0';
+
+        settingsInputs.minLifeDrop = document.createElement('input');
+        settingsInputs.minLifeDrop.type = 'number';
+        settingsInputs.minLifeDrop.min = '1';
+
+        settingsInputs.minCashIncrease = document.createElement('input');
+        settingsInputs.minCashIncrease.type = 'number';
+        settingsInputs.minCashIncrease.min = '0';
+
+        settingsInputs.lifePollMs = document.createElement('input');
+        settingsInputs.lifePollMs.type = 'number';
+        settingsInputs.lifePollMs.min = '50';
+
+        settingsInputs.cashPollMs = document.createElement('input');
+        settingsInputs.cashPollMs.type = 'number';
+        settingsInputs.cashPollMs.min = '50';
+
+        settingsInputs.exactCashSelector = document.createElement('input');
+        settingsInputs.exactCashSelector.type = 'text';
+
+        settingsInputs.overflowEnabled = document.createElement('input');
+        settingsInputs.overflowEnabled.type = 'checkbox';
+
+        settingsInputs.overflowThreshold = document.createElement('input');
+        settingsInputs.overflowThreshold.type = 'number';
+        settingsInputs.overflowThreshold.min = '0';
+
+        settingsInputs.preferredOverflowStock = document.createElement('input');
+        settingsInputs.preferredOverflowStock.type = 'text';
+        settingsInputs.preferredOverflowStock.placeholder = 'e.g. SYM';
+
+        settingsInputs.dryRun = document.createElement('input');
+        settingsInputs.dryRun.type = 'checkbox';
+    }
+
+    function loadSettingsIntoInputs() {
+        const s = getSettings();
+        settingsInputs.apiKey.value = s.apiKey;
+        settingsInputs.delayMin.value = s.delayMin;
+        settingsInputs.delayMax.value = s.delayMax;
+        settingsInputs.autoCooldown.value = s.autoCooldown;
+        settingsInputs.minLifeDrop.value = s.minLifeDrop;
+        settingsInputs.minCashIncrease.value = s.minCashIncrease;
+        settingsInputs.lifePollMs.value = s.lifePollMs;
+        settingsInputs.cashPollMs.value = s.cashPollMs;
+        settingsInputs.exactCashSelector.value = s.exactCashSelector;
+        settingsInputs.overflowEnabled.checked = !!s.overflowEnabled;
+        settingsInputs.overflowThreshold.value = s.overflowThreshold;
+        settingsInputs.preferredOverflowStock.value = s.preferredOverflowStock;
+        settingsInputs.dryRun.checked = !!s.dryRun;
+    }
+
+    function saveSettingsFromInputs() {
+        const rawDelayMin = Number(settingsInputs.delayMin.value);
+        const rawDelayMax = Number(settingsInputs.delayMax.value);
+        const delayMin = Number.isFinite(rawDelayMin) ? Math.max(0, rawDelayMin) : DEFAULTS.delayMin;
+        const delayMax = Number.isFinite(rawDelayMax) ? Math.max(delayMin, rawDelayMax) : Math.max(delayMin, DEFAULTS.delayMax);
+
+        localStorage.setItem(SETTINGS_KEYS.apiKey, settingsInputs.apiKey.value.trim());
+        localStorage.setItem(SETTINGS_KEYS.delayMin, String(delayMin));
+        localStorage.setItem(SETTINGS_KEYS.delayMax, String(delayMax));
+        localStorage.setItem(SETTINGS_KEYS.autoCooldown, String(Math.max(0, Number(settingsInputs.autoCooldown.value) || DEFAULTS.autoCooldown)));
+        localStorage.setItem(SETTINGS_KEYS.minLifeDrop, String(Math.max(1, Number(settingsInputs.minLifeDrop.value) || DEFAULTS.minLifeDrop)));
+        localStorage.setItem(SETTINGS_KEYS.minCashIncrease, String(Math.max(0, Number(settingsInputs.minCashIncrease.value) || DEFAULTS.minCashIncrease)));
+        localStorage.setItem(SETTINGS_KEYS.lifePollMs, String(Math.max(50, Number(settingsInputs.lifePollMs.value) || DEFAULTS.lifePollMs)));
+        localStorage.setItem(SETTINGS_KEYS.cashPollMs, String(Math.max(50, Number(settingsInputs.cashPollMs.value) || DEFAULTS.cashPollMs)));
+        localStorage.setItem(SETTINGS_KEYS.exactCashSelector, settingsInputs.exactCashSelector.value.trim());
+        localStorage.setItem(SETTINGS_KEYS.overflowEnabled, settingsInputs.overflowEnabled.checked ? '1' : '0');
+        localStorage.setItem(SETTINGS_KEYS.overflowThreshold, String(Math.max(0, Number(settingsInputs.overflowThreshold.value) || DEFAULTS.overflowThreshold)));
+        localStorage.setItem(SETTINGS_KEYS.preferredOverflowStock, (settingsInputs.preferredOverflowStock.value || DEFAULTS.preferredOverflowStock).trim().toUpperCase());
+        localStorage.setItem(SETTINGS_KEYS.dryRun, settingsInputs.dryRun.checked ? '1' : '0');
+
+        loadSettingsIntoInputs();
+        updateUIStatus();
+    }
+
+    function resetSettingsToDefaults() {
+        Object.values(SETTINGS_KEYS).forEach(k => localStorage.removeItem(k));
+        loadSettingsIntoInputs();
+        updateUIStatus();
+    }
+
+    function makePanelDraggable(panel, handle) {
+        let dragging = false;
+        let startX = 0;
+        let startY = 0;
+        let originX = 0;
+        let originY = 0;
+
+        function rect() { return panel.getBoundingClientRect(); }
+
+        function savePos(x, y) {
+            localStorage.setItem(UI_KEYS.posX, String(Math.round(x)));
+            localStorage.setItem(UI_KEYS.posY, String(Math.round(y)));
+        }
+
+        function setPos(x, y) {
+            const r = rect();
+            const maxX = Math.max(0, window.innerWidth - r.width - 4);
+            const maxY = Math.max(0, window.innerHeight - r.height - 4);
+            const cx = clamp(x, 4, maxX);
+            const cy = clamp(y, 4, maxY);
+            panel.style.left = `${cx}px`;
+            panel.style.top = `${cy}px`;
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+            panel.style.transform = 'none';
+            savePos(cx, cy);
+        }
+
+        handle.addEventListener('mousedown', (e) => {
+            if (e.target.closest('button') && e.target !== handle) return;
+            e.preventDefault();
+            dragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const r = rect();
+            originX = r.left;
+            originY = r.top;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            setPos(originX + (e.clientX - startX), originY + (e.clientY - startY));
+        });
+
+        document.addEventListener('mouseup', () => { dragging = false; });
+
+        const savedX = Number(localStorage.getItem(UI_KEYS.posX));
+        const savedY = Number(localStorage.getItem(UI_KEYS.posY));
+        if (Number.isFinite(savedX) && Number.isFinite(savedY)) {
+            requestAnimationFrame(() => setPos(savedX, savedY));
+        } else {
+            requestAnimationFrame(() => {
+                const r = rect();
+                setPos(window.innerWidth - r.width - 12, (window.innerHeight / 2) - (r.height / 2));
+            });
+        }
+    }
+
+    function createUI() {
+        if (document.getElementById('panic-panel')) return;
+
+        if (localStorage.getItem(KEYS.cashMode) === null) localStorage.setItem(KEYS.cashMode, '0');
+        if (localStorage.getItem(KEYS.autoMode) === null) localStorage.setItem(KEYS.autoMode, '0');
+        if (localStorage.getItem(KEYS.mainLeaderPreferred) === null) localStorage.setItem(KEYS.mainLeaderPreferred, '0');
+
+        const panel = document.createElement('div');
+        panel.id = 'panic-panel';
+        Object.assign(panel.style, {
+            position: 'fixed', top: '50%', right: '12px', transform: 'translateY(-50%)', zIndex: '999999',
+            display: 'flex', flexDirection: 'column', gap: '8px', padding: '8px', minWidth: '260px',
+            background: 'rgba(10,10,10,0.92)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '12px'
+        });
+
+        const header = document.createElement('div');
+        Object.assign(header.style, {
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', cursor: 'grab',
+            fontSize: '12px', color: '#ddd', fontWeight: '700', padding: '2px 2px 4px 2px'
+        });
+
+        const title = document.createElement('span');
+        title.textContent = 'Cash Router';
+        const collapseBtn = document.createElement('button');
+        collapseBtn.type = 'button';
+        collapseBtn.textContent = '−';
+        Object.assign(collapseBtn.style, {
+            width: '24px', height: '24px', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.18)',
+            background: '#222', color: '#fff', cursor: 'pointer', fontWeight: '700'
+        });
+        header.appendChild(title);
+        header.appendChild(collapseBtn);
+
+        const body = document.createElement('div');
+        Object.assign(body.style, { display: 'flex', flexDirection: 'column', gap: '8px' });
+
+        const depositBtn = document.createElement('button');
+        depositBtn.textContent = 'Deposit/Route Now';
+
+        const autoToggle = document.createElement('button');
+        const cashToggle = document.createElement('button');
+        const overflowTestBtn = document.createElement('button');
+        const settingsToggle = document.createElement('button');
+
+        [depositBtn, autoToggle, cashToggle, overflowTestBtn, settingsToggle].forEach(btn => {
+            Object.assign(btn.style, {
+                padding: '8px 10px', color: '#fff', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px',
+                cursor: 'pointer', fontWeight: '700', background: '#2a2a2a'
+            });
+        });
+
+        const mainLeaderWrap = document.createElement('label');
+        Object.assign(mainLeaderWrap.style, { display: 'flex', alignItems: 'center', gap: '8px', color: '#ddd', fontSize: '12px' });
+        const mainLeaderCheckbox = document.createElement('input');
+        mainLeaderCheckbox.type = 'checkbox';
+        mainLeaderCheckbox.checked = isMainLeaderPreferred();
+        const mainLeaderText = document.createElement('span');
+        mainLeaderText.textContent = 'Main Leader';
+        mainLeaderWrap.appendChild(mainLeaderCheckbox);
+        mainLeaderWrap.appendChild(mainLeaderText);
+
+        function refreshAutoToggle() {
+            const on = isAutoModeEnabled();
+            autoToggle.textContent = `Auto: ${on ? 'ON' : 'OFF'}`;
+            autoToggle.style.background = on ? '#163a66' : '#2a2a2a';
+        }
+
+        function refreshCashToggle() {
+            const on = isCashModeEnabled();
+            cashToggle.textContent = `Cash Trigger: ${on ? 'ON' : 'OFF'}`;
+            cashToggle.style.background = on ? '#22506A' : '#2a2a2a';
+        }
+
+        function refreshSettingsToggle() {
+            const collapsed = localStorage.getItem(UI_KEYS.settingsCollapsed) !== '0';
+            settingsToggle.textContent = collapsed ? 'Settings +' : 'Settings −';
+        }
+
+        depositBtn.onclick = () => requestDeposit('manual');
+
+        autoToggle.onclick = () => {
+            localStorage.setItem(KEYS.autoMode, isAutoModeEnabled() ? '0' : '1');
+            refreshAutoToggle();
+            updateUIStatus();
+        };
+
+        cashToggle.onclick = () => {
+            const enable = !isCashModeEnabled();
+            localStorage.setItem(KEYS.cashMode, enable ? '1' : '0');
+            if (enable) lastCash = getCash();
+            refreshCashToggle();
+            updateUIStatus();
+        };
+
+        overflowTestBtn.textContent = 'Overflow Test';
+        overflowTestBtn.onclick = () => requestDeposit('overflow-test', { forceStock: true });
+
+        mainLeaderCheckbox.addEventListener('change', () => {
+            setMainLeaderPreferred(mainLeaderCheckbox.checked);
+            maybeClaimLeadership(true);
+            updateUIStatus();
+        });
+
+        settingsToggle.onclick = () => {
+            const collapsed = localStorage.getItem(UI_KEYS.settingsCollapsed) !== '0';
+            localStorage.setItem(UI_KEYS.settingsCollapsed, collapsed ? '0' : '1');
+            uiSettingsBody.style.display = collapsed ? 'flex' : 'none';
+            refreshSettingsToggle();
+        };
+
+        uiStatusEl = document.createElement('div');
+        uiCashEl = document.createElement('div');
+        uiFlowEl = document.createElement('div');
+        [uiStatusEl, uiCashEl, uiFlowEl].forEach(el => {
+            Object.assign(el.style, { fontSize: '11px', lineHeight: '1.25', color: '#bbb', padding: '0 2px' });
+        });
+
+        const settingsWrap = document.createElement('div');
+        Object.assign(settingsWrap.style, {
+            display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '4px', paddingTop: '8px',
+            borderTop: '1px solid rgba(255,255,255,0.10)'
+        });
+
+        uiSettingsBody = document.createElement('div');
+        Object.assign(uiSettingsBody.style, { display: 'flex', flexDirection: 'column', gap: '8px' });
+
+        buildSettingsInputs();
+        loadSettingsIntoInputs();
+
+        uiSettingsBody.appendChild(makeField('API Key', settingsInputs.apiKey));
+        uiSettingsBody.appendChild(makeField('Min Delay (ms)', settingsInputs.delayMin));
+        uiSettingsBody.appendChild(makeField('Max Delay (ms)', settingsInputs.delayMax));
+        uiSettingsBody.appendChild(makeField('Auto Cooldown (ms)', settingsInputs.autoCooldown));
+        uiSettingsBody.appendChild(makeField('Min Life Drop', settingsInputs.minLifeDrop));
+        uiSettingsBody.appendChild(makeField('Min Cash Increase', settingsInputs.minCashIncrease));
+        uiSettingsBody.appendChild(makeField('Life Poll (ms)', settingsInputs.lifePollMs));
+        uiSettingsBody.appendChild(makeField('Cash Poll (ms)', settingsInputs.cashPollMs));
+        uiSettingsBody.appendChild(makeField('Exact Cash Selector', settingsInputs.exactCashSelector));
+        uiSettingsBody.appendChild(makeField('Overflow Enabled (checkbox)', settingsInputs.overflowEnabled));
+        uiSettingsBody.appendChild(makeField('Overflow Threshold', settingsInputs.overflowThreshold));
+        uiSettingsBody.appendChild(makeField('Overflow Stock', settingsInputs.preferredOverflowStock));
+        uiSettingsBody.appendChild(makeField('Dry Run (no clicks)', settingsInputs.dryRun));
+
+        const buttons = document.createElement('div');
+        Object.assign(buttons.style, { display: 'flex', gap: '8px' });
+
+        const saveBtn = document.createElement('button');
+        const resetBtn = document.createElement('button');
+        saveBtn.textContent = 'Save';
+        resetBtn.textContent = 'Reset';
+        [saveBtn, resetBtn].forEach(btn => {
+            Object.assign(btn.style, {
+                flex: '1', padding: '8px 10px', background: '#222', color: '#fff',
+                border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', cursor: 'pointer', fontWeight: '700'
+            });
+        });
+        saveBtn.onclick = () => saveSettingsFromInputs();
+        resetBtn.onclick = () => resetSettingsToDefaults();
+        buttons.appendChild(saveBtn);
+        buttons.appendChild(resetBtn);
+        uiSettingsBody.appendChild(buttons);
+
+        settingsWrap.appendChild(settingsToggle);
+        settingsWrap.appendChild(uiSettingsBody);
+
+        body.appendChild(depositBtn);
+        body.appendChild(autoToggle);
+        body.appendChild(cashToggle);
+        body.appendChild(mainLeaderWrap);
+        body.appendChild(overflowTestBtn);
+        body.appendChild(uiStatusEl);
+        body.appendChild(uiCashEl);
+        body.appendChild(uiFlowEl);
+        body.appendChild(settingsWrap);
+
+        panel.appendChild(header);
+        panel.appendChild(body);
+        document.body.appendChild(panel);
+
+        function setCollapsed(collapsed) {
+            body.style.display = collapsed ? 'none' : 'flex';
+            collapseBtn.textContent = collapsed ? '+' : '−';
+            panel.style.minWidth = collapsed ? '120px' : '260px';
+            localStorage.setItem(UI_KEYS.collapsed, collapsed ? '1' : '0');
+        }
+
+        collapseBtn.onclick = (e) => {
+            e.stopPropagation();
+            setCollapsed(localStorage.getItem(UI_KEYS.collapsed) !== '1');
+        };
+
+        const settingsCollapsed = localStorage.getItem(UI_KEYS.settingsCollapsed) !== '0';
+        uiSettingsBody.style.display = settingsCollapsed ? 'none' : 'flex';
+
+        refreshAutoToggle();
+        refreshCashToggle();
+        refreshSettingsToggle();
+
+        setCollapsed(localStorage.getItem(UI_KEYS.collapsed) === '1');
+        makePanelDraggable(panel, header);
+        updateUIStatus();
+    }
+
+    function watchLife() {
+        if (lifeWatcherStarted) return;
+        lifeWatcherStarted = true;
+
+        setInterval(() => {
+            if (!amLeader()) return;
+            const life = getLife();
+            if (life === null) return;
+
+            if (lastLife === null) {
+                lastLife = life;
+                return;
+            }
+
+            const diff = lastLife - life;
+            if (diff >= getSettings().minLifeDrop) {
+                maybeAutoDeposit('life_drop', diff);
+            }
+
+            lastLife = life;
+        }, Math.max(50, getSettings().lifePollMs));
+    }
+
+    function watchCash() {
+        if (cashWatcherStarted) return;
+        cashWatcherStarted = true;
+
+        setInterval(() => {
+            if (!amLeader()) return;
+
+            const cash = getCash();
+            updateUIStatus();
+            if (cash === null) return;
+
+            if (lastCash === null) {
+                lastCash = cash;
+                return;
+            }
+
+            if (!isCashModeEnabled()) {
+                lastCash = cash;
+                return;
+            }
+
+            const diff = cash - lastCash;
+            if (diff >= getSettings().minCashIncrease) {
+                lastCash = cash;
+                maybeAutoDeposit('cash_spike', diff);
+                return;
+            }
+
+            lastCash = cash;
+        }, Math.max(50, getSettings().cashPollMs));
+    }
+
+    function watchLeadership() {
+        if (leaderWatcherStarted) return;
+        leaderWatcherStarted = true;
+
+        maybeClaimLeadership(true);
+
+        setInterval(() => heartbeatLeadership(), getSettings().leaderHeartbeatMs);
+
+        document.addEventListener('visibilitychange', () => {
+            maybeClaimLeadership(false);
+            updateUIStatus();
+        });
+
+        window.addEventListener('focus', () => {
+            maybeClaimLeadership(false);
+            updateUIStatus();
+        });
+
+        window.addEventListener('hashchange', () => {
+            setTimeout(() => {
+                maybeClaimLeadership(false);
+                processDepositFlow();
+                updateUIStatus();
+            }, 120);
+        });
+
+        window.addEventListener('beforeunload', () => releaseLeadershipIfOwned());
+
+        window.addEventListener('storage', (e) => {
+            if (
+                e.key === KEYS.leaderState ||
+                e.key === KEYS.leaderDepositRequest ||
+                e.key === KEYS.cashMode ||
+                e.key === KEYS.autoMode ||
+                e.key === KEYS.mainLeaderPreferred ||
+                Object.values(SETTINGS_KEYS).includes(e.key)
+            ) {
+                if (settingsInputs.apiKey) loadSettingsIntoInputs();
+                updateUIStatus();
+                if (e.key === KEYS.leaderDepositRequest && amLeader()) {
+                    setTimeout(() => processDepositFlow(), rand(20, 60));
+                }
+            }
+        });
+
+        if (bc) {
+            bc.onmessage = (event) => {
+                const msg = event?.data;
+                if (!msg) return;
+                if (msg.type === 'deposit-request' && amLeader()) setTimeout(() => processDepositFlow(), rand(20, 60));
+                if (msg.type === 'leader-released') maybeClaimLeadership(false);
+                if (msg.type === 'leader-heartbeat') updateUIStatus();
+            };
+        }
+    }
+
+    function watchFlow() {
+        if (flowWatcherStarted) return;
+        flowWatcherStarted = true;
+
+        setInterval(() => {
+            if (!amLeader()) return;
+            processDepositFlow();
+        }, 1000);
+    }
+
+    function init() {
+        createUI();
+        watchLeadership();
+        watchLife();
+        watchCash();
+        watchFlow();
+        updateUIStatus();
+    }
+
+    init();
+})();
