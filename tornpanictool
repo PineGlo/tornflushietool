@@ -451,12 +451,13 @@
         }
     }
 
-    function buildDepositRequest(source = 'manual') {
+    function buildDepositRequest(source = 'manual', options = {}) {
         return {
             requestId: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             source,
             fromTabId: TAB_ID,
-            createdAt: now()
+            createdAt: now(),
+            forceOverflow: !!options.forceOverflow
         };
     }
 
@@ -782,7 +783,9 @@
                 return;
             }
 
-            const decision = getOverflowDecision();
+            const decision = request.forceOverflow
+                ? { route: 'stock' }
+                : getOverflowDecision();
             if (decision.route === 'none') {
                 clearDepositRequest();
                 setFlowState('idle');
@@ -820,14 +823,18 @@
         }
     }
 
-    async function requestDeposit(source = 'manual') {
-        const payload = buildDepositRequest(source);
+    async function requestDeposit(source = 'manual', options = {}) {
+        const payload = buildDepositRequest(source, options);
         setDepositRequest(payload);
 
         if (amLeader()) {
             await sleep(rand());
             processDepositFlow();
         }
+    }
+
+    async function requestOverflowTest() {
+        await requestDeposit('manual_overflow_test', { forceOverflow: true });
     }
 
     async function maybeAutoDeposit(reason, amount = 0) {
@@ -1226,12 +1233,13 @@
         const autoToggle = document.createElement('button');
         const cashToggle = document.createElement('button');
         const testBtn = document.createElement('button');
+        const testOverflowBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, testBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, testBtn, testOverflowBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1314,6 +1322,15 @@
                 maybeClaimLeadership(true);
             }
             await maybeAutoDeposit('test', 999);
+        };
+
+        testOverflowBtn.textContent = 'Test Overflow';
+        testOverflowBtn.style.background = '#3b2f11';
+        testOverflowBtn.onclick = async () => {
+            if (!amLeader()) {
+                maybeClaimLeadership(true);
+            }
+            await requestOverflowTest();
         };
 
         settingsToggle.onclick = () => {
@@ -1423,6 +1440,7 @@
         body.appendChild(autoToggle);
         body.appendChild(cashToggle);
         body.appendChild(testBtn);
+        body.appendChild(testOverflowBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
