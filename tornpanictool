@@ -14,6 +14,8 @@
     const PROPERTY_ID = '5709149';
     const VAULT_HASH = `#/p=options&ID=${PROPERTY_ID}&tab=vault`;
     const VAULT_URL = `https://www.torn.com/properties.php${VAULT_HASH}`;
+    const STOCKS_URL = 'https://www.torn.com/page.php?sid=stocks';
+    const VAULT_CAP = 1_000_000_000;
 
     const KEYS = {
         autoMode: 'pineglow_auto_mode',
@@ -40,7 +42,8 @@
         minCashIncrease: 'pineglow_setting_min_cash_increase',
         lifePollMs: 'pineglow_setting_life_poll_ms',
         cashPollMs: 'pineglow_setting_cash_poll_ms',
-        exactCashSelector: 'pineglow_setting_exact_cash_selector'
+        exactCashSelector: 'pineglow_setting_exact_cash_selector',
+        overflowStockSymbol: 'pineglow_setting_overflow_stock_symbol'
     };
 
     const DEFAULTS = {
@@ -53,7 +56,8 @@
         cashPollMs: 500,
         leaderHeartbeatMs: 1500,
         leaderStaleMs: 5000,
-        exactCashSelector: ''
+        exactCashSelector: '',
+        overflowStockSymbol: 'TSB'
     };
 
     const TAB_ID = `vaultpanic_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -77,6 +81,7 @@
     let settingsInputs = {};
     let depositing = false;
     let lastHandledRequestId = null;
+    let flowState = 'idle';
 
     function safeJsonParse(value, fallback = null) {
         try {
@@ -150,13 +155,19 @@
             cashPollMs: getNumberSetting(SETTINGS_KEYS.cashPollMs, DEFAULTS.cashPollMs),
             leaderHeartbeatMs: DEFAULTS.leaderHeartbeatMs,
             leaderStaleMs: DEFAULTS.leaderStaleMs,
-            exactCashSelector: getTextSetting(SETTINGS_KEYS.exactCashSelector, DEFAULTS.exactCashSelector)
+            exactCashSelector: getTextSetting(SETTINGS_KEYS.exactCashSelector, DEFAULTS.exactCashSelector),
+            overflowStockSymbol: getTextSetting(SETTINGS_KEYS.overflowStockSymbol, DEFAULTS.overflowStockSymbol).trim().toUpperCase()
         };
     }
 
     function formatMoney(num) {
         if (!Number.isFinite(num)) return 'unknown';
         return `$${num.toLocaleString()}`;
+    }
+
+    function setFlowState(next) {
+        flowState = next;
+        updateUIStatus();
     }
 
     function parseMoneyText(text) {
@@ -186,6 +197,11 @@
                location.hash.includes('tab=vault');
     }
 
+    function isStocksPage() {
+        return location.pathname.includes('/page.php') &&
+               (location.search.includes('sid=stocks') || document.body?.dataset?.page === 'stocks');
+    }
+
     function findMoneyLabelCash(scope = document) {
         const elements = Array.from(scope.querySelectorAll('div, span, p, li, a, strong'));
 
@@ -211,6 +227,22 @@
                 const val = parseMoneyText(match[1]);
                 if (Number.isFinite(val) && val >= 0) return val;
             }
+        }
+
+        return null;
+    }
+
+    function findVaultStoredCash(scope = document) {
+        const elements = Array.from(scope.querySelectorAll('div, span, p, li, form, strong'));
+
+        for (const el of elements) {
+            const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!/vault/i.test(txt)) continue;
+            const match = txt.match(/\$([\d,]+)/);
+            if (!match) continue;
+
+            const val = parseMoneyText(match[1]);
+            if (Number.isFinite(val) && val >= 0) return val;
         }
 
         return null;
@@ -486,6 +518,12 @@
         return false;
     }
 
+    function goToStocksPage() {
+        if (isStocksPage()) return true;
+        location.assign(STOCKS_URL);
+        return false;
+    }
+
     function waitForVaultUI(timeoutMs = 8000) {
         return new Promise(resolve => {
             const start = Date.now();
@@ -551,6 +589,176 @@
         return true;
     }
 
+
+    function getOverflowDecision() {
+        const onHandCash = getCash();
+        const vaultCash = findVaultStoredCash(document);
+
+        if (!Number.isFinite(onHandCash) || onHandCash <= 0) {
+            return { route: 'none', onHandCash: Number.isFinite(onHandCash) ? onHandCash : 0, vaultCash };
+        }
+
+        if (!Number.isFinite(vaultCash)) {
+            return { route: 'vault', onHandCash, vaultCash: null };
+        }
+
+        const vaultRoom = Math.max(0, VAULT_CAP - vaultCash);
+        return {
+            route: onHandCash <= vaultRoom ? 'vault' : 'stock',
+            onHandCash,
+            vaultCash,
+            vaultRoom
+        };
+    }
+
+    function findTargetStockRow(stockSymbol) {
+        const symbol = String(stockSymbol || '').trim().toUpperCase();
+        if (!symbol) return null;
+
+        const rows = Array.from(document.querySelectorAll('[data-stock], li, tr, div, a'));
+        return rows.find((el) => {
+            const txt = (el.textContent || '').replace(/\s+/g, ' ').toUpperCase();
+            return txt.includes(symbol);
+        }) || null;
+    }
+
+    async function openTargetStock(stockSymbol) {
+        const row = findTargetStockRow(stockSymbol);
+        if (!row) return false;
+        tap(row);
+        await sleep(250);
+        return true;
+    }
+
+    function getOwnedTab() {
+        return document.querySelector('#ownedTab') ||
+               document.querySelector('li[data-name="ownedTab"]');
+    }
+
+    function ownedTabIsActive() {
+        const tab = getOwnedTab();
+        if (!tab) return false;
+        return tab.classList.contains('active___IUYLC') ||
+               tab.classList.contains('active') ||
+               tab.getAttribute('aria-selected') === 'true';
+    }
+
+    async function ensureOwnedTabOpen() {
+        const tab = getOwnedTab();
+        if (!tab) return false;
+
+        if (!ownedTabIsActive()) {
+            tap(tab);
+            await sleep(220);
+        }
+
+        return ownedTabIsActive();
+    }
+
+    function getStockMaxBtn() {
+        const candidates = Array.from(document.querySelectorAll('button, input[type="button"], span, a'));
+        return candidates.find(el => /^max$/i.test((el.textContent || el.value || '').trim())) || null;
+    }
+
+    function getStockBuyBtn() {
+        const candidates = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
+        return candidates.find(el => /^buy$/i.test((el.textContent || el.value || '').trim())) || null;
+    }
+
+    function getStockAmountInput() {
+        const panel = document.querySelector('#panel-ownedTab') || document;
+        return panel.querySelector('input[name*="amount"], input[name*="share"], input[type="number"], input[type="text"]');
+    }
+
+    async function clickStockMax() {
+        const btn = getStockMaxBtn();
+        if (!btn) return false;
+        tap(btn);
+        await sleep(120);
+        return true;
+    }
+
+    function guardBeforeBuy() {
+        if (!isStocksPage()) return false;
+        if (!ownedTabIsActive()) return false;
+
+        const amountInput = getStockAmountInput();
+        const amountValue = amountInput ? parseMoneyText(amountInput.value) : null;
+        if (!Number.isFinite(amountValue) || amountValue <= 0) return false;
+
+        const buyBtn = getStockBuyBtn();
+        if (!buyBtn) return false;
+        if (buyBtn.disabled || buyBtn.classList.contains('disabled')) return false;
+        return true;
+    }
+
+    function getConfirmModal() {
+        const candidates = Array.from(document.querySelectorAll('[role="dialog"], .modal, .confirm, .confirmation'));
+        return candidates.find(el => /buy/i.test((el.textContent || '').replace(/\s+/g, ' '))) || null;
+    }
+
+    function getConfirmBtn(modal = null) {
+        const scope = modal || document;
+        const candidates = Array.from(scope.querySelectorAll('button, input[type="button"], input[type="submit"], a'));
+        return candidates.find(el => /^(confirm|buy)$/i.test((el.textContent || el.value || '').trim())) || null;
+    }
+
+    function guardBeforeConfirm(stockSymbol) {
+        const modal = getConfirmModal();
+        if (!modal) return false;
+
+        const text = (modal.textContent || '').toUpperCase();
+        if (!text.includes('BUY')) return false;
+        if (stockSymbol && !text.includes(stockSymbol.toUpperCase())) return false;
+
+        const confirmBtn = getConfirmBtn(modal);
+        if (!confirmBtn) return false;
+        if (confirmBtn.disabled || confirmBtn.classList.contains('disabled')) return false;
+        return true;
+    }
+
+    async function doStockOverflowBuy(stockSymbol) {
+        setFlowState('stock_nav');
+        if (!isStocksPage()) {
+            goToStocksPage();
+            return false;
+        }
+
+        setFlowState('stock_open');
+        if (!await openTargetStock(stockSymbol)) return false;
+
+        setFlowState('stock_owned_tab');
+        if (!await ensureOwnedTabOpen()) return false;
+
+        setFlowState('stock_max');
+        if (!await clickStockMax()) return false;
+
+        setFlowState('stock_buy_guard');
+        if (!guardBeforeBuy()) {
+            setFlowState('buy_guard_failed');
+            return false;
+        }
+
+        setFlowState('stock_buy');
+        const buyBtn = getStockBuyBtn();
+        if (!buyBtn) return false;
+        tap(buyBtn);
+        await sleep(180);
+
+        setFlowState('stock_confirm_guard');
+        if (!guardBeforeConfirm(stockSymbol)) {
+            setFlowState('confirm_guard_failed');
+            return false;
+        }
+
+        setFlowState('stock_confirm');
+        const modal = getConfirmModal();
+        const confirmBtn = getConfirmBtn(modal);
+        if (!confirmBtn) return false;
+        tap(confirmBtn);
+        return true;
+    }
+
     async function processDepositFlow() {
         if (depositing) return;
         if (!amLeader()) return;
@@ -563,24 +771,47 @@
         }
 
         depositing = true;
-        updateUIStatus();
+        setFlowState('deciding');
 
         try {
             lastHandledRequestId = request.requestId;
 
             if (!isVaultPage()) {
+                setFlowState('vault_nav');
                 goToVaultPage();
                 return;
             }
 
+            const decision = getOverflowDecision();
+            if (decision.route === 'none') {
+                clearDepositRequest();
+                setFlowState('idle');
+                return;
+            }
+
+            if (decision.route === 'stock') {
+                const stockSymbol = getSettings().overflowStockSymbol;
+                const stockSuccess = await doStockOverflowBuy(stockSymbol);
+                if (stockSuccess) {
+                    clearDepositRequest();
+                    setFlowState('done');
+                } else if (flowState === 'buy_guard_failed' || flowState === 'confirm_guard_failed') {
+                    clearDepositRequest();
+                }
+                return;
+            }
+
+            setFlowState('vault_wait_ui');
             const ready = await waitForVaultUI(8000);
             if (!ready) return;
 
             await sleep(rand(10, 25));
 
+            setFlowState('vault_deposit');
             const success = await doDeposit();
             if (success) {
                 clearDepositRequest();
+                setFlowState('done');
                 await sleep(rand(80, 140));
             }
         } finally {
@@ -651,13 +882,13 @@
         if (uiFlowEl) {
             const request = getDepositRequest();
             if (depositing) {
-                uiFlowEl.textContent = `Flow: DEPOSITING${isVaultPage() ? ' | vault ready' : ' | navigating'}`;
+                uiFlowEl.textContent = `Flow: ${flowState.toUpperCase()}${isVaultPage() ? ' | vault ready' : ''}`;
                 uiFlowEl.style.color = '#7CFF9E';
             } else if (request) {
-                uiFlowEl.textContent = `Flow: PENDING${isVaultPage() ? ' | on vault' : ' | waiting for vault'}`;
+                uiFlowEl.textContent = `Flow: ${flowState.toUpperCase() || 'PENDING'}${isVaultPage() ? ' | on vault' : ' | waiting for vault'}`;
                 uiFlowEl.style.color = '#FFC66D';
             } else {
-                uiFlowEl.textContent = `Flow: IDLE`;
+                uiFlowEl.textContent = `Flow: ${flowState.toUpperCase()}`;
                 uiFlowEl.style.color = '#BBB';
             }
         }
@@ -841,6 +1072,10 @@
         settingsInputs.exactCashSelector = document.createElement('input');
         settingsInputs.exactCashSelector.type = 'text';
         settingsInputs.exactCashSelector.placeholder = 'Optional exact cash selector';
+
+        settingsInputs.overflowStockSymbol = document.createElement('input');
+        settingsInputs.overflowStockSymbol.type = 'text';
+        settingsInputs.overflowStockSymbol.placeholder = 'Overflow stock symbol (e.g. TSB)';
     }
 
     function loadSettingsIntoInputs() {
@@ -854,6 +1089,7 @@
         settingsInputs.lifePollMs.value = s.lifePollMs;
         settingsInputs.cashPollMs.value = s.cashPollMs;
         settingsInputs.exactCashSelector.value = s.exactCashSelector;
+        settingsInputs.overflowStockSymbol.value = s.overflowStockSymbol;
     }
 
     function saveSettingsFromInputs() {
@@ -872,6 +1108,7 @@
         localStorage.setItem(SETTINGS_KEYS.lifePollMs, String(Math.max(50, Number(settingsInputs.lifePollMs.value) || DEFAULTS.lifePollMs)));
         localStorage.setItem(SETTINGS_KEYS.cashPollMs, String(Math.max(50, Number(settingsInputs.cashPollMs.value) || DEFAULTS.cashPollMs)));
         localStorage.setItem(SETTINGS_KEYS.exactCashSelector, settingsInputs.exactCashSelector.value.trim());
+        localStorage.setItem(SETTINGS_KEYS.overflowStockSymbol, (settingsInputs.overflowStockSymbol.value || '').trim().toUpperCase() || DEFAULTS.overflowStockSymbol);
 
         loadSettingsIntoInputs();
         updateUIStatus();
@@ -887,6 +1124,7 @@
         localStorage.removeItem(SETTINGS_KEYS.lifePollMs);
         localStorage.removeItem(SETTINGS_KEYS.cashPollMs);
         localStorage.removeItem(SETTINGS_KEYS.exactCashSelector);
+        localStorage.removeItem(SETTINGS_KEYS.overflowStockSymbol);
 
         loadSettingsIntoInputs();
         updateUIStatus();
@@ -1138,6 +1376,7 @@
         uiSettingsBody.appendChild(makeField('Life Poll (ms)', settingsInputs.lifePollMs));
         uiSettingsBody.appendChild(makeField('Cash Poll (ms)', settingsInputs.cashPollMs));
         uiSettingsBody.appendChild(makeField('Exact Cash Selector', settingsInputs.exactCashSelector));
+        uiSettingsBody.appendChild(makeField('Overflow Stock Symbol', settingsInputs.overflowStockSymbol));
 
         const settingsButtons = document.createElement('div');
         Object.assign(settingsButtons.style, {
