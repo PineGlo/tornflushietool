@@ -535,37 +535,144 @@
             '[class*="stockRow"]',
             '[class*="stock-item"]',
             '[class*="stockItem"]',
-            'tr',
-            'li'
+            '[class*="share"]',
+            'li',
+            'tr'
         ];
+
         const rows = [];
         selectors.forEach(sel => {
-            document.querySelectorAll(sel).forEach(el => rows.push(el));
+            document.querySelectorAll(sel).forEach(el => {
+                const txt = (el.textContent || '').trim();
+                if (!txt) return;
+                if (txt.length < 10) return;
+                rows.push(el);
+            });
         });
+
         return Array.from(new Set(rows));
     }
 
-    function findStockCard(stockSymbol) {
+    function findStockRow(stockSymbol) {
         const upper = (stockSymbol || '').toUpperCase();
         const rows = getStockRows();
 
-        const bySymbol = rows.find(row => {
+        return rows.find(row => {
             const txt = (row.textContent || '').toUpperCase();
-            return txt.includes(` ${upper} `) || txt.includes(`(${upper})`) || txt.includes(upper);
-        });
-        if (bySymbol) return bySymbol;
+            return txt.includes(` ${upper} `) ||
+                txt.includes(`(${upper})`) ||
+                txt.includes(`[${upper}]`) ||
+                txt.includes(upper);
+        }) || null;
+    }
 
-        return rows.find(row => (row.textContent || '').toUpperCase().includes('SYMBIOTIC LTD')) || null;
+    function findOwnedOrTradeClickTarget(stockRow) {
+        if (!stockRow) return null;
+
+        const preferredSelectors = [
+            '[class*="owned"]',
+            '[class*="trade"]',
+            '[class*="action"]',
+            '[class*="holding"]',
+            '[class*="shares"]',
+            'button',
+            'a',
+            '[role="button"]'
+        ];
+
+        for (const sel of preferredSelectors) {
+            const candidates = Array.from(stockRow.querySelectorAll(sel));
+            const hit = candidates.find(el => {
+                const txt = (el.textContent || el.value || '').trim().toLowerCase();
+                return /owned|trade|buy|sell|shares|holding/.test(txt);
+            });
+            if (hit) return hit;
+        }
+
+        const clickableChildren = Array.from(stockRow.querySelectorAll('*')).filter(el => {
+            const txt = (el.textContent || el.value || '').trim().toLowerCase();
+            return /owned|trade|buy|sell|shares|holding/.test(txt);
+        });
+
+        if (clickableChildren.length) return clickableChildren[0];
+
+        return stockRow;
+    }
+
+    function getVisibleTradePanels() {
+        const panels = Array.from(document.querySelectorAll('form, section, div, article')).filter(el => {
+            const txt = (el.textContent || '').toLowerCase();
+            if (!txt) return false;
+            if (!/buy|sell|max|shares/.test(txt)) return false;
+
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (el.offsetParent === null && style.position !== 'fixed') return false;
+
+            return true;
+        });
+
+        panels.sort((a, b) => b.textContent.length - a.textContent.length);
+        return panels;
+    }
+
+    function findTradePanel() {
+        const panels = getVisibleTradePanels();
+
+        return panels.find(panel => {
+            const txt = (panel.textContent || '').toLowerCase();
+            return /buy/.test(txt) && (/max/.test(txt) || /shares/.test(txt));
+        }) || null;
+    }
+
+    function findStockAmountInput(scope = document) {
+        const candidates = Array.from(scope.querySelectorAll('input'));
+
+        return candidates.find(el => {
+            const type = (el.type || '').toLowerCase();
+            const cls = (el.className || '').toLowerCase();
+            const ph = (el.placeholder || '').toLowerCase();
+            return (
+                type === 'text' ||
+                type === 'number' ||
+                cls.includes('money') ||
+                cls.includes('input') ||
+                ph.includes('amount') ||
+                ph.includes('shares')
+            );
+        }) || null;
     }
 
     function findStockBuyMaxBtn(scope = document) {
-        const inputs = Array.from(scope.querySelectorAll('input[type="button"], button'));
-        return inputs.find(el => /max/i.test((el.value || el.textContent || '').trim())) || null;
+        const candidates = Array.from(scope.querySelectorAll('input[type="button"], button, a'));
+        return candidates.find(el => /max/i.test((el.value || el.textContent || '').trim())) || null;
     }
 
     function findStockBuySubmitBtn(scope = document) {
-        const inputs = Array.from(scope.querySelectorAll('input[type="submit"], button'));
-        return inputs.find(el => /buy/i.test((el.value || el.textContent || '').trim())) || null;
+        const candidates = Array.from(scope.querySelectorAll('input[type="submit"], button, a'));
+        return candidates.find(el => {
+            const txt = (el.value || el.textContent || '').trim();
+            return /^buy$/i.test(txt) || /buy shares/i.test(txt);
+        }) || null;
+    }
+
+    async function waitForTradePanel(timeoutMs = 8000) {
+        const start = now();
+
+        while (now() - start < timeoutMs) {
+            const panel = findTradePanel();
+            const amountInput = panel ? findStockAmountInput(panel) : null;
+            const maxBtn = panel ? findStockBuyMaxBtn(panel) : null;
+            const buyBtn = panel ? findStockBuySubmitBtn(panel) : null;
+
+            if (panel && (maxBtn || amountInput) && buyBtn) {
+                return panel;
+            }
+
+            await sleep(200);
+        }
+
+        return null;
     }
 
     async function doStockOverflowBuy(stockSymbol) {
@@ -577,26 +684,59 @@
         }
 
         flowState = FLOW_STATES.stockSelect;
-        flowContext = `select ${stockSymbol}`;
+        flowContext = `find ${stockSymbol}`;
         updateUIStatus();
 
-        const stockCard = findStockCard(stockSymbol);
-        if (!stockCard) return false;
-        tap(stockCard);
-        await sleep(rand(120, 220));
-
-        flowState = FLOW_STATES.stockBuy;
-        flowContext = `buy ${stockSymbol}`;
-        updateUIStatus();
-
-        const maxBtn = findStockBuyMaxBtn();
-        if (maxBtn) {
-            tap(maxBtn);
-            await sleep(rand(80, 140));
+        const stockRow = findStockRow(stockSymbol);
+        if (!stockRow) {
+            flowContext = `stock row not found (${stockSymbol})`;
+            updateUIStatus();
+            return false;
         }
 
-        const buyBtn = findStockBuySubmitBtn();
-        if (!buyBtn || buyBtn.disabled || buyBtn.classList.contains('disabled')) return false;
+        const clickTarget = findOwnedOrTradeClickTarget(stockRow);
+        if (!clickTarget) {
+            flowContext = `owned/trade target not found (${stockSymbol})`;
+            updateUIStatus();
+            return false;
+        }
+
+        flowContext = `open owned/trade (${stockSymbol})`;
+        updateUIStatus();
+
+        tap(clickTarget);
+        await sleep(rand(180, 320));
+
+        const panel = await waitForTradePanel(8000);
+        if (!panel) {
+            flowContext = `trade panel not found (${stockSymbol})`;
+            updateUIStatus();
+            return false;
+        }
+
+        flowState = FLOW_STATES.stockBuy;
+        flowContext = `trade panel ready (${stockSymbol})`;
+        updateUIStatus();
+
+        const maxBtn = findStockBuyMaxBtn(panel);
+        if (maxBtn) {
+            tap(maxBtn);
+            await sleep(rand(80, 160));
+        } else {
+            const amountInput = findStockAmountInput(panel);
+            if (!amountInput) {
+                flowContext = `no max or amount input (${stockSymbol})`;
+                updateUIStatus();
+                return false;
+            }
+        }
+
+        const buyBtn = findStockBuySubmitBtn(panel);
+        if (!buyBtn || buyBtn.disabled || buyBtn.classList.contains('disabled')) {
+            flowContext = `buy button unavailable (${stockSymbol})`;
+            updateUIStatus();
+            return false;
+        }
 
         tap(buyBtn);
         return true;
