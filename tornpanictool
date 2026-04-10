@@ -18,6 +18,7 @@
     const KEYS = {
         autoMode: 'pineglow_auto_mode',
         cashMode: 'pineglow_cash_mode',
+        pauseMode: 'pineglow_pause_mode',
         leaderMode: 'pineglow_leader_mode',
         lastAuto: 'pineglow_last_auto',
         leaderState: 'pineglow_simple_leader_state_v2',
@@ -177,6 +178,10 @@
 
     function isLeaderModeEnabled() {
         return localStorage.getItem(KEYS.leaderMode) !== '0';
+    }
+
+    function isPaused() {
+        return localStorage.getItem(KEYS.pauseMode) === '1';
     }
 
     function isVaultPage() {
@@ -554,6 +559,7 @@
     async function processDepositFlow() {
         if (depositing) return;
         if (!amLeader()) return;
+        if (isPaused()) return;
 
         const request = getDepositRequest();
         if (!request) return;
@@ -590,6 +596,8 @@
     }
 
     async function requestDeposit(source = 'manual') {
+        if (isPaused()) return;
+
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
 
@@ -602,6 +610,7 @@
     async function maybeAutoDeposit(reason, amount = 0) {
         const settings = getSettings();
 
+        if (isPaused()) return;
         if (!amLeader()) return;
         if (!isAutoModeEnabled()) return;
 
@@ -650,7 +659,10 @@
 
         if (uiFlowEl) {
             const request = getDepositRequest();
-            if (depositing) {
+            if (isPaused()) {
+                uiFlowEl.textContent = `Flow: PAUSED`;
+                uiFlowEl.style.color = '#FF8EA1';
+            } else if (depositing) {
                 uiFlowEl.textContent = `Flow: DEPOSITING${isVaultPage() ? ' | vault ready' : ' | navigating'}`;
                 uiFlowEl.style.color = '#7CFF9E';
             } else if (request) {
@@ -903,6 +915,10 @@
             localStorage.setItem(KEYS.autoMode, '0');
         }
 
+        if (localStorage.getItem(KEYS.pauseMode) === null) {
+            localStorage.setItem(KEYS.pauseMode, '0');
+        }
+
         if (localStorage.getItem(KEYS.leaderMode) === null) {
             localStorage.setItem(KEYS.leaderMode, '1');
         }
@@ -987,13 +1003,14 @@
 
         const autoToggle = document.createElement('button');
         const cashToggle = document.createElement('button');
+        const pauseToggle = document.createElement('button');
         const testBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, testBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, pauseToggle, testBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1014,6 +1031,12 @@
             const enabled = isCashModeEnabled();
             cashToggle.textContent = `Cash: ${enabled ? 'ON' : 'OFF'}`;
             cashToggle.style.background = enabled ? '#22506A' : '#2a2a2a';
+        }
+
+        function refreshPauseToggle() {
+            const paused = isPaused();
+            pauseToggle.textContent = `Paused: ${paused ? 'ON' : 'OFF'}`;
+            pauseToggle.style.background = paused ? '#5C1F2A' : '#2a2a2a';
         }
 
         function refreshSettingsToggle() {
@@ -1067,6 +1090,18 @@
             if (!enabled) lastCash = getCash();
             refreshCashToggle();
             updateUIStatus();
+        };
+
+        pauseToggle.onclick = () => {
+            const paused = isPaused();
+            localStorage.setItem(KEYS.pauseMode, paused ? '0' : '1');
+            refreshPauseToggle();
+            updateUIStatus();
+            if (!paused) {
+                clearDepositRequest();
+            } else if (amLeader()) {
+                processDepositFlow();
+            }
         };
 
         testBtn.textContent = 'Test Trigger';
@@ -1178,11 +1213,13 @@
 
         refreshAutoToggle();
         refreshCashToggle();
+        refreshPauseToggle();
         refreshSettingsToggle();
 
         body.appendChild(depositBtn);
         body.appendChild(autoToggle);
         body.appendChild(cashToggle);
+        body.appendChild(pauseToggle);
         body.appendChild(testBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
