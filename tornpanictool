@@ -465,6 +465,13 @@
             .find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT') || null;
     }
 
+    function getDepositAmountInput() {
+        const form = getDepositForm();
+        if (!form) return null;
+
+        return form.querySelector('input[name="money"], input[name="amount"], input[type="text"], input[type="number"]') || null;
+    }
+
     function goToVaultPage() {
         if (isVaultPage()) return true;
 
@@ -508,7 +515,33 @@
         if (!maxBtn || !depositBtn) return false;
 
         tap(maxBtn);
-        await sleep(rand(40, 80));
+
+        const maxApplied = await new Promise(resolve => {
+            const input = getDepositAmountInput();
+            if (!input) {
+                resolve(false);
+                return;
+            }
+
+            const started = Date.now();
+            const timer = setInterval(() => {
+                const value = parseMoneyText(input.value);
+                if (Number.isFinite(value) && value > 0) {
+                    clearInterval(timer);
+                    resolve(true);
+                    return;
+                }
+
+                if (Date.now() - started >= 450) {
+                    clearInterval(timer);
+                    resolve(false);
+                }
+            }, 20);
+        });
+
+        if (!maxApplied) {
+            await sleep(20);
+        }
 
         const freshDepositBtn = getDepositBtn();
         if (!freshDepositBtn) return false;
@@ -543,7 +576,7 @@
             const ready = await waitForVaultUI(8000);
             if (!ready) return;
 
-            await sleep(rand());
+            await sleep(rand(10, 25));
 
             const success = await doDeposit();
             if (success) {
