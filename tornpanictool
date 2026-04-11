@@ -1331,6 +1331,11 @@
             if (life < lastLife) {
                 const diff = lastLife - life;
                 if (diff >= settings.minLifeDrop) {
+                    const cash = getCash();
+                    if (!Number.isFinite(cash) || cash < settings.minCashIncrease) {
+                        lastLife = life;
+                        return;
+                    }
                     maybeAutoDeposit('life_drop', diff);
                 }
             }
