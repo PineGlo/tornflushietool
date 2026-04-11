@@ -14,11 +14,15 @@
     const PROPERTY_ID = '5709149';
     const VAULT_HASH = `#/p=options&ID=${PROPERTY_ID}&tab=vault`;
     const VAULT_URL = `https://www.torn.com/properties.php${VAULT_HASH}`;
+    const FACTION_ARMORY_URL = 'https://www.torn.com/factions.php?step=your&type=1#/tab=armoury';
+    const VAULT_CAP = 1000000000;
 
     const KEYS = {
         autoMode: 'pineglow_auto_mode',
         cashMode: 'pineglow_cash_mode',
+        pauseMode: 'pineglow_pause_mode',
         leaderMode: 'pineglow_leader_mode',
+        leaderLockedTab: 'pineglow_leader_locked_tab_v1',
         lastAuto: 'pineglow_last_auto',
         leaderState: 'pineglow_simple_leader_state_v2',
         leaderDepositRequest: 'pineglow_leader_deposit_request_v2'
@@ -32,7 +36,6 @@
     };
 
     const SETTINGS_KEYS = {
-        apiKey: 'pineglow_setting_api_key',
         delayMin: 'pineglow_setting_delay_min',
         delayMax: 'pineglow_setting_delay_max',
         autoCooldown: 'pineglow_setting_auto_cooldown',
@@ -40,7 +43,8 @@
         minCashIncrease: 'pineglow_setting_min_cash_increase',
         lifePollMs: 'pineglow_setting_life_poll_ms',
         cashPollMs: 'pineglow_setting_cash_poll_ms',
-        exactCashSelector: 'pineglow_setting_exact_cash_selector'
+        exactCashSelector: 'pineglow_setting_exact_cash_selector',
+        pauseHotkey: 'pineglow_setting_pause_hotkey'
     };
 
     const DEFAULTS = {
@@ -53,10 +57,20 @@
         cashPollMs: 500,
         leaderHeartbeatMs: 1500,
         leaderStaleMs: 5000,
-        exactCashSelector: ''
+        exactCashSelector: '',
+        pauseHotkey: ''
     };
 
-    const TAB_ID = `vaultpanic_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    function getOrCreateTabId() {
+        const sessionKey = 'pineglow_vaultpanic_tab_id_v1';
+        const existing = sessionStorage.getItem(sessionKey);
+        if (existing) return existing;
+        const created = `vaultpanic_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        sessionStorage.setItem(sessionKey, created);
+        return created;
+    }
+
+    const TAB_ID = getOrCreateTabId();
     const bc = typeof BroadcastChannel !== 'undefined'
         ? new BroadcastChannel('pineglow_vaultpanic_leader_v2')
         : null;
@@ -73,6 +87,8 @@
     let uiCashEl = null;
     let uiSettingsBody = null;
     let uiFlowEl = null;
+    let uiLeaderCheckbox = null;
+    let uiPauseToggleBtn = null;
 
     let settingsInputs = {};
     let depositing = false;
@@ -132,6 +148,10 @@
         return raw == null ? fallback : raw;
     }
 
+    function normalizeHotkeyValue(value) {
+        return String(value || '').trim().toLowerCase();
+    }
+
     function getSettings() {
         let delayMin = getNumberSetting(SETTINGS_KEYS.delayMin, DEFAULTS.delayMin);
         let delayMax = getNumberSetting(SETTINGS_KEYS.delayMax, DEFAULTS.delayMax);
@@ -140,7 +160,6 @@
         if (delayMax < delayMin) delayMax = delayMin;
 
         return {
-            apiKey: getTextSetting(SETTINGS_KEYS.apiKey, ''),
             delayMin,
             delayMax,
             autoCooldown: getNumberSetting(SETTINGS_KEYS.autoCooldown, DEFAULTS.autoCooldown),
@@ -150,7 +169,8 @@
             cashPollMs: getNumberSetting(SETTINGS_KEYS.cashPollMs, DEFAULTS.cashPollMs),
             leaderHeartbeatMs: DEFAULTS.leaderHeartbeatMs,
             leaderStaleMs: DEFAULTS.leaderStaleMs,
-            exactCashSelector: getTextSetting(SETTINGS_KEYS.exactCashSelector, DEFAULTS.exactCashSelector)
+            exactCashSelector: getTextSetting(SETTINGS_KEYS.exactCashSelector, DEFAULTS.exactCashSelector),
+            pauseHotkey: normalizeHotkeyValue(getTextSetting(SETTINGS_KEYS.pauseHotkey, DEFAULTS.pauseHotkey))
         };
     }
 
@@ -179,11 +199,41 @@
         return localStorage.getItem(KEYS.leaderMode) !== '0';
     }
 
+    function getLockedLeaderTabId() {
+        return localStorage.getItem(KEYS.leaderLockedTab) || '';
+    }
+
+    function isThisTabLockedLeader() {
+        return getLockedLeaderTabId() === TAB_ID;
+    }
+
+    function canThisTabRunLeaderFlow() {
+        if (!isLeaderModeEnabled()) return false;
+        const lockedTabId = getLockedLeaderTabId();
+        if (lockedTabId && lockedTabId !== TAB_ID) return false;
+        return true;
+    }
+
+    function isPaused() {
+        return localStorage.getItem(KEYS.pauseMode) === '1';
+    }
+
+    function doesEventMatchPauseHotkey(event, hotkey) {
+        const normalized = normalizeHotkeyValue(hotkey);
+        if (!normalized) return false;
+        return normalizeHotkeyValue(event.key) === normalized;
+    }
+
     function isVaultPage() {
         return location.pathname.includes('/properties.php') &&
                location.hash.includes('/p=options') &&
                location.hash.includes(`ID=${PROPERTY_ID}`) &&
                location.hash.includes('tab=vault');
+    }
+
+    function isFactionArmoryPage() {
+        return location.pathname.includes('/factions.php') &&
+               location.hash.includes('/tab=armoury');
     }
 
     function findMoneyLabelCash(scope = document) {
@@ -214,6 +264,13 @@
         }
 
         return null;
+    }
+
+    function getVaultTotal() {
+        const el = document.querySelector('#vault-wvalue');
+        if (!el) return null;
+        const value = parseMoneyText(el.textContent || '');
+        return Number.isFinite(value) && value >= 0 ? value : null;
     }
 
     function getCandidateMoneyNodes(scope) {
@@ -363,7 +420,7 @@
     }
 
     function shouldTakeLeadership(currentLeader) {
-        if (!isLeaderModeEnabled()) return false;
+        if (!canThisTabRunLeaderFlow()) return false;
 
         const mine = getMyLeaderPayload();
 
@@ -377,13 +434,13 @@
     }
 
     function maybeClaimLeadership(force = false) {
-        if (!force && !isLeaderModeEnabled()) {
+        if (!force && !canThisTabRunLeaderFlow()) {
             updateUIStatus();
             return false;
         }
 
         const currentLeader = readLeaderState();
-        if (force || shouldTakeLeadership(currentLeader)) {
+        if ((force && canThisTabRunLeaderFlow()) || shouldTakeLeadership(currentLeader)) {
             writeLeaderState(getMyLeaderPayload());
             updateUIStatus();
             return true;
@@ -393,7 +450,7 @@
     }
 
     function heartbeatLeadership() {
-        if (!isLeaderModeEnabled()) {
+        if (!canThisTabRunLeaderFlow()) {
             releaseLeadershipIfOwned();
             updateUIStatus();
             return;
@@ -423,6 +480,7 @@
         return {
             requestId: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             source,
+            target: 'vault',
             fromTabId: TAB_ID,
             createdAt: now()
         };
@@ -472,6 +530,31 @@
         return form.querySelector('input[name="money"], input[name="amount"], input[type="text"], input[type="number"]') || null;
     }
 
+    function getFactionMoneyGroup() {
+        return document.querySelector('div.input-money-group');
+    }
+
+    function getFactionMaxBtn() {
+        const group = getFactionMoneyGroup();
+        return group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+    }
+
+    function getFactionAmountInput() {
+        const group = getFactionMoneyGroup();
+        if (!group) return null;
+        return group.querySelector('input.amount.input-money[type="text"], input.amount.input-money') || null;
+    }
+
+    function getFactionDepositBtn() {
+        return Array.from(document.querySelectorAll('button.torn-btn'))
+            .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY') || null;
+    }
+
+    function getFactionConfirmYesBtn() {
+        return Array.from(document.querySelectorAll('a.yes'))
+            .find(el => (el.textContent || '').trim().toUpperCase() === 'YES') || null;
+    }
+
     function goToVaultPage() {
         if (isVaultPage()) return true;
 
@@ -483,6 +566,12 @@
         }
 
         location.assign(VAULT_URL);
+        return false;
+    }
+
+    function goToFactionArmoryPage() {
+        if (isFactionArmoryPage()) return true;
+        location.assign(FACTION_ARMORY_URL);
         return false;
     }
 
@@ -508,16 +597,35 @@
         });
     }
 
-    async function doDeposit() {
-        const maxBtn = getMaxBtn();
-        const depositBtn = getDepositBtn();
+    function waitForFactionUI(timeoutMs = 8000) {
+        return new Promise(resolve => {
+            const start = Date.now();
 
-        if (!maxBtn || !depositBtn) return false;
+            const timer = setInterval(() => {
+                const maxBtn = getFactionMaxBtn();
+                const depositBtn = getFactionDepositBtn();
+
+                if (maxBtn && depositBtn) {
+                    clearInterval(timer);
+                    resolve(true);
+                    return;
+                }
+
+                if (Date.now() - start >= timeoutMs) {
+                    clearInterval(timer);
+                    resolve(false);
+                }
+            }, 200);
+        });
+    }
+
+    async function readAmountAfterMax(maxBtn, inputGetter) {
+        if (!maxBtn) return 0;
 
         tap(maxBtn);
 
         const maxApplied = await new Promise(resolve => {
-            const input = getDepositAmountInput();
+            const input = inputGetter();
             if (!input) {
                 resolve(false);
                 return;
@@ -543,6 +651,20 @@
             await sleep(20);
         }
 
+        const input = inputGetter();
+        const amount = parseMoneyText(input?.value || '');
+        return Number.isFinite(amount) ? amount : 0;
+    }
+
+    async function doDeposit() {
+        const maxBtn = getMaxBtn();
+        const depositBtn = getDepositBtn();
+
+        if (!maxBtn || !depositBtn) return false;
+
+        const amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+        if (!Number.isFinite(amount) || amount <= 0) return false;
+
         const freshDepositBtn = getDepositBtn();
         if (!freshDepositBtn) return false;
         if (freshDepositBtn.disabled || freshDepositBtn.classList.contains('disabled')) return false;
@@ -551,9 +673,28 @@
         return true;
     }
 
+    async function doFactionDeposit() {
+        const maxBtn = getFactionMaxBtn();
+        const depositBtn = getFactionDepositBtn();
+        if (!maxBtn || !depositBtn) return false;
+
+        const amount = await readAmountAfterMax(maxBtn, getFactionAmountInput);
+        if (!Number.isFinite(amount) || amount <= 0) return false;
+
+        tap(depositBtn);
+        await sleep(rand(60, 120));
+
+        const yesBtn = getFactionConfirmYesBtn();
+        if (yesBtn) {
+            tap(yesBtn);
+        }
+        return true;
+    }
+
     async function processDepositFlow() {
         if (depositing) return;
         if (!amLeader()) return;
+        if (isPaused()) return;
 
         const request = getDepositRequest();
         if (!request) return;
@@ -568,6 +709,24 @@
         try {
             lastHandledRequestId = request.requestId;
 
+            if (request.target === 'faction') {
+                if (!isFactionArmoryPage()) {
+                    goToFactionArmoryPage();
+                    return;
+                }
+
+                const factionReady = await waitForFactionUI(8000);
+                if (!factionReady) return;
+
+                await sleep(rand(10, 25));
+                const factionSuccess = await doFactionDeposit();
+                if (factionSuccess) {
+                    clearDepositRequest();
+                    await sleep(rand(80, 140));
+                }
+                return;
+            }
+
             if (!isVaultPage()) {
                 goToVaultPage();
                 return;
@@ -576,8 +735,21 @@
             const ready = await waitForVaultUI(8000);
             if (!ready) return;
 
-            await sleep(rand(10, 25));
+            const vaultTotal = getVaultTotal();
+            if (!Number.isFinite(vaultTotal)) return;
 
+            const room = Math.max(0, VAULT_CAP - vaultTotal);
+            const maxBtn = getMaxBtn();
+            const amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+            if (!Number.isFinite(amount) || amount <= 0) return;
+
+            if (amount > room) {
+                setDepositRequest({ ...request, target: 'faction' });
+                goToFactionArmoryPage();
+                return;
+            }
+
+            await sleep(rand(10, 25));
             const success = await doDeposit();
             if (success) {
                 clearDepositRequest();
@@ -590,6 +762,8 @@
     }
 
     async function requestDeposit(source = 'manual') {
+        if (isPaused()) return;
+
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
 
@@ -602,6 +776,7 @@
     async function maybeAutoDeposit(reason, amount = 0) {
         const settings = getSettings();
 
+        if (isPaused()) return;
         if (!amLeader()) return;
         if (!isAutoModeEnabled()) return;
 
@@ -614,12 +789,30 @@
         requestDeposit(`auto:${reason}:${amount}`);
     }
 
+    function refreshPauseToggleButton() {
+        if (!uiPauseToggleBtn) return;
+        const paused = isPaused();
+        uiPauseToggleBtn.textContent = `Paused: ${paused ? 'ON' : 'OFF'}`;
+        uiPauseToggleBtn.style.background = paused ? '#5C1F2A' : '#2a2a2a';
+    }
+
+    function setPausedState(paused) {
+        localStorage.setItem(KEYS.pauseMode, paused ? '1' : '0');
+        refreshPauseToggleButton();
+        updateUIStatus();
+        if (paused) {
+            clearDepositRequest();
+        } else if (amLeader()) {
+            processDepositFlow();
+        }
+    }
+
     function updateUIStatus() {
         if (uiStatusEl) {
             const leader = readLeaderState();
             const mine = getMyLeaderPayload();
             const iAmLeader = amLeader();
-            const leaderEnabled = isLeaderModeEnabled();
+            const leaderEnabled = canThisTabRunLeaderFlow();
 
             const role = mine.isVault ? 'Vault Tab' : (mine.isVisible ? 'Active Tab' : 'Background Tab');
 
@@ -650,11 +843,18 @@
 
         if (uiFlowEl) {
             const request = getDepositRequest();
-            if (depositing) {
+            if (isPaused()) {
+                uiFlowEl.textContent = `Flow: PAUSED`;
+                uiFlowEl.style.color = '#FF8EA1';
+            } else if (depositing) {
                 uiFlowEl.textContent = `Flow: DEPOSITING${isVaultPage() ? ' | vault ready' : ' | navigating'}`;
                 uiFlowEl.style.color = '#7CFF9E';
             } else if (request) {
-                uiFlowEl.textContent = `Flow: PENDING${isVaultPage() ? ' | on vault' : ' | waiting for vault'}`;
+                if (request.target === 'faction') {
+                    uiFlowEl.textContent = `Flow: PENDING | ${isFactionArmoryPage() ? 'on faction armory' : 'waiting for faction armory'}`;
+                } else {
+                    uiFlowEl.textContent = `Flow: PENDING${isVaultPage() ? ' | on vault' : ' | waiting for vault'}`;
+                }
                 uiFlowEl.style.color = '#FFC66D';
             } else {
                 uiFlowEl.textContent = `Flow: IDLE`;
@@ -806,10 +1006,6 @@
     }
 
     function buildSettingsInputs() {
-        settingsInputs.apiKey = document.createElement('input');
-        settingsInputs.apiKey.type = 'password';
-        settingsInputs.apiKey.placeholder = 'API key';
-
         settingsInputs.delayMin = document.createElement('input');
         settingsInputs.delayMin.type = 'number';
         settingsInputs.delayMin.min = '0';
@@ -841,11 +1037,15 @@
         settingsInputs.exactCashSelector = document.createElement('input');
         settingsInputs.exactCashSelector.type = 'text';
         settingsInputs.exactCashSelector.placeholder = 'Optional exact cash selector';
+
+        settingsInputs.pauseHotkey = document.createElement('input');
+        settingsInputs.pauseHotkey.type = 'text';
+        settingsInputs.pauseHotkey.placeholder = 'Optional pause hotkey (e.g. p)';
+        settingsInputs.pauseHotkey.maxLength = 32;
     }
 
     function loadSettingsIntoInputs() {
         const s = getSettings();
-        settingsInputs.apiKey.value = s.apiKey;
         settingsInputs.delayMin.value = s.delayMin;
         settingsInputs.delayMax.value = s.delayMax;
         settingsInputs.autoCooldown.value = s.autoCooldown;
@@ -854,6 +1054,7 @@
         settingsInputs.lifePollMs.value = s.lifePollMs;
         settingsInputs.cashPollMs.value = s.cashPollMs;
         settingsInputs.exactCashSelector.value = s.exactCashSelector;
+        settingsInputs.pauseHotkey.value = s.pauseHotkey;
     }
 
     function saveSettingsFromInputs() {
@@ -863,7 +1064,6 @@
         const delayMin = Number.isFinite(rawDelayMin) ? Math.max(0, rawDelayMin) : DEFAULTS.delayMin;
         const delayMax = Number.isFinite(rawDelayMax) ? Math.max(delayMin, rawDelayMax) : Math.max(delayMin, DEFAULTS.delayMax);
 
-        localStorage.setItem(SETTINGS_KEYS.apiKey, settingsInputs.apiKey.value.trim());
         localStorage.setItem(SETTINGS_KEYS.delayMin, String(delayMin));
         localStorage.setItem(SETTINGS_KEYS.delayMax, String(delayMax));
         localStorage.setItem(SETTINGS_KEYS.autoCooldown, String(Math.max(0, Number(settingsInputs.autoCooldown.value) || DEFAULTS.autoCooldown)));
@@ -872,13 +1072,13 @@
         localStorage.setItem(SETTINGS_KEYS.lifePollMs, String(Math.max(50, Number(settingsInputs.lifePollMs.value) || DEFAULTS.lifePollMs)));
         localStorage.setItem(SETTINGS_KEYS.cashPollMs, String(Math.max(50, Number(settingsInputs.cashPollMs.value) || DEFAULTS.cashPollMs)));
         localStorage.setItem(SETTINGS_KEYS.exactCashSelector, settingsInputs.exactCashSelector.value.trim());
+        localStorage.setItem(SETTINGS_KEYS.pauseHotkey, normalizeHotkeyValue(settingsInputs.pauseHotkey.value));
 
         loadSettingsIntoInputs();
         updateUIStatus();
     }
 
     function resetSettingsToDefaults() {
-        localStorage.removeItem(SETTINGS_KEYS.apiKey);
         localStorage.removeItem(SETTINGS_KEYS.delayMin);
         localStorage.removeItem(SETTINGS_KEYS.delayMax);
         localStorage.removeItem(SETTINGS_KEYS.autoCooldown);
@@ -887,6 +1087,7 @@
         localStorage.removeItem(SETTINGS_KEYS.lifePollMs);
         localStorage.removeItem(SETTINGS_KEYS.cashPollMs);
         localStorage.removeItem(SETTINGS_KEYS.exactCashSelector);
+        localStorage.removeItem(SETTINGS_KEYS.pauseHotkey);
 
         loadSettingsIntoInputs();
         updateUIStatus();
@@ -901,6 +1102,10 @@
 
         if (localStorage.getItem(KEYS.autoMode) === null) {
             localStorage.setItem(KEYS.autoMode, '0');
+        }
+
+        if (localStorage.getItem(KEYS.pauseMode) === null) {
+            localStorage.setItem(KEYS.pauseMode, '0');
         }
 
         if (localStorage.getItem(KEYS.leaderMode) === null) {
@@ -987,13 +1192,15 @@
 
         const autoToggle = document.createElement('button');
         const cashToggle = document.createElement('button');
+        const pauseToggle = document.createElement('button');
         const testBtn = document.createElement('button');
+        const testFactionBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, testBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1016,6 +1223,10 @@
             cashToggle.style.background = enabled ? '#22506A' : '#2a2a2a';
         }
 
+        function refreshPauseToggle() {
+            refreshPauseToggleButton();
+        }
+
         function refreshSettingsToggle() {
             const collapsed = localStorage.getItem(UI_KEYS.settingsCollapsed) !== '0';
             settingsToggle.textContent = collapsed ? 'Settings +' : 'Settings −';
@@ -1034,17 +1245,18 @@
         });
 
         leaderCheckbox.type = 'checkbox';
-        leaderCheckbox.checked = isLeaderModeEnabled();
+        leaderCheckbox.checked = isThisTabLockedLeader();
         leaderCheckbox.style.cursor = 'pointer';
-        leaderText.textContent = 'Leader Enabled';
+        leaderText.textContent = 'Only This Tab';
+        uiLeaderCheckbox = leaderCheckbox;
 
         leaderCheckbox.onchange = () => {
-            const enabled = leaderCheckbox.checked;
-            localStorage.setItem(KEYS.leaderMode, enabled ? '1' : '0');
-
-            if (!enabled) {
-                releaseLeadershipIfOwned();
-            } else {
+            if (leaderCheckbox.checked) {
+                localStorage.setItem(KEYS.leaderMode, '1');
+                localStorage.setItem(KEYS.leaderLockedTab, TAB_ID);
+                maybeClaimLeadership(true);
+            } else if (isThisTabLockedLeader()) {
+                localStorage.removeItem(KEYS.leaderLockedTab);
                 maybeClaimLeadership(true);
             }
 
@@ -1069,6 +1281,10 @@
             updateUIStatus();
         };
 
+        pauseToggle.onclick = () => {
+            setPausedState(!isPaused());
+        };
+
         testBtn.textContent = 'Test Trigger';
         testBtn.style.background = '#2a2a2a';
         testBtn.onclick = async () => {
@@ -1076,6 +1292,19 @@
                 maybeClaimLeadership(true);
             }
             await maybeAutoDeposit('test', 999);
+        };
+
+        testFactionBtn.textContent = 'Test Faction Fallback';
+        testFactionBtn.style.background = '#2a2a2a';
+        testFactionBtn.onclick = async () => {
+            if (!amLeader()) {
+                maybeClaimLeadership(true);
+            }
+            const payload = buildDepositRequest('manual:faction-test');
+            payload.target = 'faction';
+            setDepositRequest(payload);
+            await sleep(rand());
+            processDepositFlow();
         };
 
         settingsToggle.onclick = () => {
@@ -1129,7 +1358,6 @@
         buildSettingsInputs();
         loadSettingsIntoInputs();
 
-        uiSettingsBody.appendChild(makeField('API Key', settingsInputs.apiKey));
         uiSettingsBody.appendChild(makeField('Min Delay (ms)', settingsInputs.delayMin));
         uiSettingsBody.appendChild(makeField('Max Delay (ms)', settingsInputs.delayMax));
         uiSettingsBody.appendChild(makeField('Auto Cooldown (ms)', settingsInputs.autoCooldown));
@@ -1138,6 +1366,7 @@
         uiSettingsBody.appendChild(makeField('Life Poll (ms)', settingsInputs.lifePollMs));
         uiSettingsBody.appendChild(makeField('Cash Poll (ms)', settingsInputs.cashPollMs));
         uiSettingsBody.appendChild(makeField('Exact Cash Selector', settingsInputs.exactCashSelector));
+        uiSettingsBody.appendChild(makeField('Pause Hotkey', settingsInputs.pauseHotkey));
 
         const settingsButtons = document.createElement('div');
         Object.assign(settingsButtons.style, {
@@ -1178,12 +1407,16 @@
 
         refreshAutoToggle();
         refreshCashToggle();
+        uiPauseToggleBtn = pauseToggle;
+        refreshPauseToggle();
         refreshSettingsToggle();
 
         body.appendChild(depositBtn);
         body.appendChild(autoToggle);
         body.appendChild(cashToggle);
+        body.appendChild(pauseToggle);
         body.appendChild(testBtn);
+        body.appendChild(testFactionBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
@@ -1235,6 +1468,11 @@
             if (life < lastLife) {
                 const diff = lastLife - life;
                 if (diff >= settings.minLifeDrop) {
+                    const cash = getCash();
+                    if (!Number.isFinite(cash) || cash < settings.minCashIncrease) {
+                        lastLife = life;
+                        return;
+                    }
                     maybeAutoDeposit('life_drop', diff);
                 }
             }
@@ -1316,17 +1554,28 @@
             if (
                 e.key === KEYS.leaderState ||
                 e.key === KEYS.leaderDepositRequest ||
+                e.key === KEYS.leaderLockedTab ||
+                e.key === KEYS.pauseMode ||
                 e.key === KEYS.cashMode ||
                 e.key === KEYS.autoMode ||
                 Object.values(SETTINGS_KEYS).includes(e.key)
             ) {
+                if (e.key === KEYS.leaderLockedTab && !canThisTabRunLeaderFlow()) {
+                    releaseLeadershipIfOwned();
+                }
+
+                if (uiLeaderCheckbox) {
+                    uiLeaderCheckbox.checked = isThisTabLockedLeader();
+                }
+                refreshPauseToggleButton();
+
                 updateUIStatus();
 
                 if (e.key === KEYS.leaderDepositRequest && amLeader()) {
                     setTimeout(() => processDepositFlow(), rand(20, 60));
                 }
 
-                if (settingsInputs.apiKey) {
+                if (settingsInputs.delayMin) {
                     loadSettingsIntoInputs();
                 }
             }
@@ -1362,12 +1611,35 @@
         }, 1000);
     }
 
+    function watchPauseHotkey() {
+        document.addEventListener('keydown', (event) => {
+            if (event.defaultPrevented) return;
+
+            const target = event.target;
+            if (target && (
+                target.tagName === 'INPUT' ||
+                target.tagName === 'TEXTAREA' ||
+                target.tagName === 'SELECT' ||
+                target.isContentEditable
+            )) {
+                return;
+            }
+
+            const { pauseHotkey } = getSettings();
+            if (!doesEventMatchPauseHotkey(event, pauseHotkey)) return;
+
+            event.preventDefault();
+            setPausedState(!isPaused());
+        });
+    }
+
     function init() {
         createUI();
         watchLeadership();
         watchLife();
         watchCash();
         watchFlow();
+        watchPauseHotkey();
         updateUIStatus();
     }
 
