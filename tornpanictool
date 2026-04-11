@@ -36,7 +36,6 @@
     };
 
     const SETTINGS_KEYS = {
-        apiKey: 'pineglow_setting_api_key',
         delayMin: 'pineglow_setting_delay_min',
         delayMax: 'pineglow_setting_delay_max',
         autoCooldown: 'pineglow_setting_auto_cooldown',
@@ -161,7 +160,6 @@
         if (delayMax < delayMin) delayMax = delayMin;
 
         return {
-            apiKey: getTextSetting(SETTINGS_KEYS.apiKey, ''),
             delayMin,
             delayMax,
             autoCooldown: getNumberSetting(SETTINGS_KEYS.autoCooldown, DEFAULTS.autoCooldown),
@@ -1008,10 +1006,6 @@
     }
 
     function buildSettingsInputs() {
-        settingsInputs.apiKey = document.createElement('input');
-        settingsInputs.apiKey.type = 'password';
-        settingsInputs.apiKey.placeholder = 'API key';
-
         settingsInputs.delayMin = document.createElement('input');
         settingsInputs.delayMin.type = 'number';
         settingsInputs.delayMin.min = '0';
@@ -1052,7 +1046,6 @@
 
     function loadSettingsIntoInputs() {
         const s = getSettings();
-        settingsInputs.apiKey.value = s.apiKey;
         settingsInputs.delayMin.value = s.delayMin;
         settingsInputs.delayMax.value = s.delayMax;
         settingsInputs.autoCooldown.value = s.autoCooldown;
@@ -1071,7 +1064,6 @@
         const delayMin = Number.isFinite(rawDelayMin) ? Math.max(0, rawDelayMin) : DEFAULTS.delayMin;
         const delayMax = Number.isFinite(rawDelayMax) ? Math.max(delayMin, rawDelayMax) : Math.max(delayMin, DEFAULTS.delayMax);
 
-        localStorage.setItem(SETTINGS_KEYS.apiKey, settingsInputs.apiKey.value.trim());
         localStorage.setItem(SETTINGS_KEYS.delayMin, String(delayMin));
         localStorage.setItem(SETTINGS_KEYS.delayMax, String(delayMax));
         localStorage.setItem(SETTINGS_KEYS.autoCooldown, String(Math.max(0, Number(settingsInputs.autoCooldown.value) || DEFAULTS.autoCooldown)));
@@ -1087,7 +1079,6 @@
     }
 
     function resetSettingsToDefaults() {
-        localStorage.removeItem(SETTINGS_KEYS.apiKey);
         localStorage.removeItem(SETTINGS_KEYS.delayMin);
         localStorage.removeItem(SETTINGS_KEYS.delayMax);
         localStorage.removeItem(SETTINGS_KEYS.autoCooldown);
@@ -1203,12 +1194,13 @@
         const cashToggle = document.createElement('button');
         const pauseToggle = document.createElement('button');
         const testBtn = document.createElement('button');
+        const testFactionBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, pauseToggle, testBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1302,6 +1294,19 @@
             await maybeAutoDeposit('test', 999);
         };
 
+        testFactionBtn.textContent = 'Test Faction Fallback';
+        testFactionBtn.style.background = '#2a2a2a';
+        testFactionBtn.onclick = async () => {
+            if (!amLeader()) {
+                maybeClaimLeadership(true);
+            }
+            const payload = buildDepositRequest('manual:faction-test');
+            payload.target = 'faction';
+            setDepositRequest(payload);
+            await sleep(rand());
+            processDepositFlow();
+        };
+
         settingsToggle.onclick = () => {
             const currentlyCollapsed = localStorage.getItem(UI_KEYS.settingsCollapsed) !== '0';
             localStorage.setItem(UI_KEYS.settingsCollapsed, currentlyCollapsed ? '0' : '1');
@@ -1353,7 +1358,6 @@
         buildSettingsInputs();
         loadSettingsIntoInputs();
 
-        uiSettingsBody.appendChild(makeField('API Key', settingsInputs.apiKey));
         uiSettingsBody.appendChild(makeField('Min Delay (ms)', settingsInputs.delayMin));
         uiSettingsBody.appendChild(makeField('Max Delay (ms)', settingsInputs.delayMax));
         uiSettingsBody.appendChild(makeField('Auto Cooldown (ms)', settingsInputs.autoCooldown));
@@ -1412,6 +1416,7 @@
         body.appendChild(cashToggle);
         body.appendChild(pauseToggle);
         body.appendChild(testBtn);
+        body.appendChild(testFactionBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
@@ -1570,7 +1575,7 @@
                     setTimeout(() => processDepositFlow(), rand(20, 60));
                 }
 
-                if (settingsInputs.apiKey) {
+                if (settingsInputs.delayMin) {
                     loadSettingsIntoInputs();
                 }
             }
