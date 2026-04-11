@@ -236,6 +236,14 @@
                location.hash.includes('/tab=armoury');
     }
 
+    function isHospitalAreaUnavailable(scope = document) {
+        const notice = Array.from(scope.querySelectorAll('.msg.right-round')).find(el => {
+            const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            return text.includes("this area is unavailable while you're in hospital");
+        });
+        return Boolean(notice);
+    }
+
     function findMoneyLabelCash(scope = document) {
         const elements = Array.from(scope.querySelectorAll('div, span, p, li, a, strong'));
 
@@ -708,6 +716,14 @@
 
         try {
             lastHandledRequestId = request.requestId;
+
+            if (isHospitalAreaUnavailable() && request.target !== 'faction') {
+                setDepositRequest({ ...request, target: 'faction' });
+                if (!isFactionArmoryPage()) {
+                    goToFactionArmoryPage();
+                }
+                return;
+            }
 
             if (request.target === 'faction') {
                 if (!isFactionArmoryPage()) {
