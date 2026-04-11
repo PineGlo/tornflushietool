@@ -14,6 +14,8 @@
     const PROPERTY_ID = '5709149';
     const VAULT_HASH = `#/p=options&ID=${PROPERTY_ID}&tab=vault`;
     const VAULT_URL = `https://www.torn.com/properties.php${VAULT_HASH}`;
+    const FACTION_ARMORY_URL = 'https://www.torn.com/factions.php?step=your&type=1#/tab=armoury';
+    const VAULT_CAP = 1000000000;
 
     const KEYS = {
         autoMode: 'pineglow_auto_mode',
@@ -231,6 +233,11 @@
                location.hash.includes('tab=vault');
     }
 
+    function isFactionArmoryPage() {
+        return location.pathname.includes('/factions.php') &&
+               location.hash.includes('/tab=armoury');
+    }
+
     function findMoneyLabelCash(scope = document) {
         const elements = Array.from(scope.querySelectorAll('div, span, p, li, a, strong'));
 
@@ -259,6 +266,13 @@
         }
 
         return null;
+    }
+
+    function getVaultTotal() {
+        const el = document.querySelector('#vault-wvalue');
+        if (!el) return null;
+        const value = parseMoneyText(el.textContent || '');
+        return Number.isFinite(value) && value >= 0 ? value : null;
     }
 
     function getCandidateMoneyNodes(scope) {
@@ -468,6 +482,7 @@
         return {
             requestId: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             source,
+            target: 'vault',
             fromTabId: TAB_ID,
             createdAt: now()
         };
@@ -517,6 +532,31 @@
         return form.querySelector('input[name="money"], input[name="amount"], input[type="text"], input[type="number"]') || null;
     }
 
+    function getFactionMoneyGroup() {
+        return document.querySelector('div.input-money-group');
+    }
+
+    function getFactionMaxBtn() {
+        const group = getFactionMoneyGroup();
+        return group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+    }
+
+    function getFactionAmountInput() {
+        const group = getFactionMoneyGroup();
+        if (!group) return null;
+        return group.querySelector('input.amount.input-money[type="text"], input.amount.input-money') || null;
+    }
+
+    function getFactionDepositBtn() {
+        return Array.from(document.querySelectorAll('button.torn-btn'))
+            .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY') || null;
+    }
+
+    function getFactionConfirmYesBtn() {
+        return Array.from(document.querySelectorAll('a.yes'))
+            .find(el => (el.textContent || '').trim().toUpperCase() === 'YES') || null;
+    }
+
     function goToVaultPage() {
         if (isVaultPage()) return true;
 
@@ -528,6 +568,12 @@
         }
 
         location.assign(VAULT_URL);
+        return false;
+    }
+
+    function goToFactionArmoryPage() {
+        if (isFactionArmoryPage()) return true;
+        location.assign(FACTION_ARMORY_URL);
         return false;
     }
 
@@ -553,16 +599,35 @@
         });
     }
 
-    async function doDeposit() {
-        const maxBtn = getMaxBtn();
-        const depositBtn = getDepositBtn();
+    function waitForFactionUI(timeoutMs = 8000) {
+        return new Promise(resolve => {
+            const start = Date.now();
 
-        if (!maxBtn || !depositBtn) return false;
+            const timer = setInterval(() => {
+                const maxBtn = getFactionMaxBtn();
+                const depositBtn = getFactionDepositBtn();
+
+                if (maxBtn && depositBtn) {
+                    clearInterval(timer);
+                    resolve(true);
+                    return;
+                }
+
+                if (Date.now() - start >= timeoutMs) {
+                    clearInterval(timer);
+                    resolve(false);
+                }
+            }, 200);
+        });
+    }
+
+    async function readAmountAfterMax(maxBtn, inputGetter) {
+        if (!maxBtn) return 0;
 
         tap(maxBtn);
 
         const maxApplied = await new Promise(resolve => {
-            const input = getDepositAmountInput();
+            const input = inputGetter();
             if (!input) {
                 resolve(false);
                 return;
@@ -588,11 +653,43 @@
             await sleep(20);
         }
 
+        const input = inputGetter();
+        const amount = parseMoneyText(input?.value || '');
+        return Number.isFinite(amount) ? amount : 0;
+    }
+
+    async function doDeposit() {
+        const maxBtn = getMaxBtn();
+        const depositBtn = getDepositBtn();
+
+        if (!maxBtn || !depositBtn) return false;
+
+        const amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+        if (!Number.isFinite(amount) || amount <= 0) return false;
+
         const freshDepositBtn = getDepositBtn();
         if (!freshDepositBtn) return false;
         if (freshDepositBtn.disabled || freshDepositBtn.classList.contains('disabled')) return false;
 
         tap(freshDepositBtn);
+        return true;
+    }
+
+    async function doFactionDeposit() {
+        const maxBtn = getFactionMaxBtn();
+        const depositBtn = getFactionDepositBtn();
+        if (!maxBtn || !depositBtn) return false;
+
+        const amount = await readAmountAfterMax(maxBtn, getFactionAmountInput);
+        if (!Number.isFinite(amount) || amount <= 0) return false;
+
+        tap(depositBtn);
+        await sleep(rand(60, 120));
+
+        const yesBtn = getFactionConfirmYesBtn();
+        if (yesBtn) {
+            tap(yesBtn);
+        }
         return true;
     }
 
@@ -614,6 +711,24 @@
         try {
             lastHandledRequestId = request.requestId;
 
+            if (request.target === 'faction') {
+                if (!isFactionArmoryPage()) {
+                    goToFactionArmoryPage();
+                    return;
+                }
+
+                const factionReady = await waitForFactionUI(8000);
+                if (!factionReady) return;
+
+                await sleep(rand(10, 25));
+                const factionSuccess = await doFactionDeposit();
+                if (factionSuccess) {
+                    clearDepositRequest();
+                    await sleep(rand(80, 140));
+                }
+                return;
+            }
+
             if (!isVaultPage()) {
                 goToVaultPage();
                 return;
@@ -622,8 +737,21 @@
             const ready = await waitForVaultUI(8000);
             if (!ready) return;
 
-            await sleep(rand(10, 25));
+            const vaultTotal = getVaultTotal();
+            if (!Number.isFinite(vaultTotal)) return;
 
+            const room = Math.max(0, VAULT_CAP - vaultTotal);
+            const maxBtn = getMaxBtn();
+            const amount = await readAmountAfterMax(maxBtn, getDepositAmountInput);
+            if (!Number.isFinite(amount) || amount <= 0) return;
+
+            if (amount > room) {
+                setDepositRequest({ ...request, target: 'faction' });
+                goToFactionArmoryPage();
+                return;
+            }
+
+            await sleep(rand(10, 25));
             const success = await doDeposit();
             if (success) {
                 clearDepositRequest();
@@ -724,7 +852,11 @@
                 uiFlowEl.textContent = `Flow: DEPOSITING${isVaultPage() ? ' | vault ready' : ' | navigating'}`;
                 uiFlowEl.style.color = '#7CFF9E';
             } else if (request) {
-                uiFlowEl.textContent = `Flow: PENDING${isVaultPage() ? ' | on vault' : ' | waiting for vault'}`;
+                if (request.target === 'faction') {
+                    uiFlowEl.textContent = `Flow: PENDING | ${isFactionArmoryPage() ? 'on faction armory' : 'waiting for faction armory'}`;
+                } else {
+                    uiFlowEl.textContent = `Flow: PENDING${isVaultPage() ? ' | on vault' : ' | waiting for vault'}`;
+                }
                 uiFlowEl.style.color = '#FFC66D';
             } else {
                 uiFlowEl.textContent = `Flow: IDLE`;
