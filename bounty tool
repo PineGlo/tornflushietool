@@ -92,7 +92,12 @@
         timers: {
             refresh: null,
             queueLoop: null,
-            attackHospital: null
+            attackHospital: null,
+            attackHospitalTick: null
+        },
+
+        attackHospital: {
+            untilMs: null
         }
     };
 
@@ -1092,7 +1097,12 @@
         const titleEl = document.querySelector('.title___fOh2J');
         if (!titleEl) return;
         if (!/currently in hospital/i.test(titleEl.textContent || '')) return;
-        if (!apiRow || !apiRow.ok || !apiRow.untilMs) return;
+        if (!apiRow || !apiRow.ok || !apiRow.untilMs) {
+            if (state.attackHospital.untilMs == null) return;
+            const remainingFallback = Math.max(0, state.attackHospital.untilMs - Date.now());
+            titleEl.textContent = `This person is currently in hospital and cannot be attacked. Release ETA: ${formatRemaining(remainingFallback)}.`;
+            return;
+        }
 
         const remaining = Math.max(0, apiRow.untilMs - Date.now());
         titleEl.textContent = `This person is currently in hospital and cannot be attacked. Release ETA: ${formatRemaining(remaining)}.`;
@@ -1103,15 +1113,20 @@
         if (!playerId || !hasUsableApiKey()) return;
         const result = await requestTornProfile(playerId, true);
         if (!result || !result.ok) return;
+        state.attackHospital.untilMs = result.untilMs || null;
         renderAttackHospitalStatus(result);
     }
 
     function startAttackHospitalLoop() {
         clearInterval(state.timers.attackHospital);
+        clearInterval(state.timers.attackHospitalTick);
         refreshAttackHospitalStatus();
         state.timers.attackHospital = setInterval(() => {
             refreshAttackHospitalStatus();
         }, 3000);
+        state.timers.attackHospitalTick = setInterval(() => {
+            renderAttackHospitalStatus(null);
+        }, 1000);
     }
 
     const scheduleScan = debounce(scanAndRender, CONFIG.pageScanDebounceMs);
