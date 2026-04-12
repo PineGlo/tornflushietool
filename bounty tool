@@ -1,0 +1,1175 @@
+// ==UserScript==
+// @name         Torn Bounty Hunter Assistant + Burst Hospital API
+// @namespace    pineglow-bounty-helper
+// @version      3.0.0
+// @description  Highlights Torn bounty targets using FF Scouter BS estimates and Torn API hospital timers with burst polling.
+// @author       Pineglow
+// @match        https://www.torn.com/bounties.php*
+// @match        https://www.torn.com/page.php?sid=attack*
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /******************************************************************
+     * CONFIG
+     ******************************************************************/
+    const CONFIG = {
+        debug: false,
+        ffDbName: 'ffscouter-cache',
+        ffStoreName: 'cache',
+        storageKey: 'bha-settings-v4',
+
+        pageScanDebounceMs: 250,
+        uiRefreshMs: 2500,
+
+        // API caching
+        apiCacheMs: 30000,
+        apiStaleMs: 45000,
+        maxQueuedPerSweep: 100,
+
+        // Burst behavior: ~10 requests across ~2 seconds, then 8 second cooldown
+        apiBurstSize: 10,
+        apiBurstWindowMs: 2000,
+        apiBurstCooldownMs: 8000,
+        apiLoopTickMs: 100,
+
+        apiBase: 'https://api.torn.com/user'
+    };
+
+    /******************************************************************
+     * STATE
+     ******************************************************************/
+    const state = {
+        settings: {
+            enabled: true,
+            autoRefresh: true,
+            dimNonMatches: true,
+            requireFFData: true,
+            showBSBadge: true,
+
+            minReward: 450000,
+            maxBS: 5000000,
+            statusMode: 'okay_only', // okay_only | hospital_only | okay_or_hospital
+
+            apiEnabled: false,
+            apiKey: '',
+            forceFreshApi: false,
+            hospSoonEnabled: false,
+            hospSoonMaxMinutes: 3
+        },
+
+        ffCache: new Map(),       // playerId -> FF row
+        apiCache: new Map(),      // playerId -> { ok, state, untilMs, fetchedAt, error }
+
+        apiQueue: [],
+        apiQueuedSet: new Set(),
+        apiInFlight: false,
+        rateLimitedUntil: 0,
+
+        burst: {
+            sentInBurst: 0,
+            burstStartedAt: 0,
+            cooldownUntil: 0
+        },
+
+        ui: {
+            panel: null,
+            matched: null,
+            scanned: null,
+            ffCount: null,
+            apiCount: null
+        },
+
+        summary: {
+            scanned: 0,
+            matched: 0
+        },
+
+        timers: {
+            refresh: null,
+            queueLoop: null,
+            attackHospital: null
+        }
+    };
+
+    /******************************************************************
+     * HELPERS
+     ******************************************************************/
+    function log(...args) {
+        if (CONFIG.debug) console.log('[BHA]', ...args);
+    }
+
+    function nowMs() {
+        return Date.now();
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(CONFIG.storageKey, JSON.stringify(state.settings));
+        } catch (err) {
+            log('saveSettings failed', err);
+        }
+    }
+
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(CONFIG.storageKey);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') {
+                state.settings = { ...state.settings, ...parsed };
+            }
+        } catch (err) {
+            log('loadSettings failed', err);
+        }
+    }
+
+    function debounce(fn, delay) {
+        let t = null;
+        return (...args) => {
+            clearTimeout(t);
+            t = setTimeout(() => fn(...args), delay);
+        };
+    }
+
+    function parseMoney(text) {
+        if (!text) return 0;
+        const n = Number(String(text).replace(/[^0-9.-]/g, ''));
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    function parseBS(value) {
+        if (value == null) return null;
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+
+        const text = String(value).trim().toLowerCase().replace(/,/g, '');
+        if (!text) return null;
+
+        const m = text.match(/^([\d.]+)\s*([kmbt])?$/i);
+        if (!m) {
+            const fallback = Number(text.replace(/[^\d.-]/g, ''));
+            return Number.isFinite(fallback) ? fallback : null;
+        }
+
+        let num = Number(m[1]);
+        if (!Number.isFinite(num)) return null;
+
+        const suffix = (m[2] || '').toLowerCase();
+        if (suffix === 'k') num *= 1e3;
+        if (suffix === 'm') num *= 1e6;
+        if (suffix === 'b') num *= 1e9;
+        if (suffix === 't') num *= 1e12;
+
+        return num;
+    }
+
+    function formatBS(n) {
+        if (n == null || !Number.isFinite(n)) return '?';
+        if (n >= 1e12) return (n / 1e12).toFixed(2).replace(/\.00$/, '') + 't';
+        if (n >= 1e9) return (n / 1e9).toFixed(2).replace(/\.00$/, '') + 'b';
+        if (n >= 1e6) return (n / 1e6).toFixed(2).replace(/\.00$/, '') + 'm';
+        if (n >= 1e3) return (n / 1e3).toFixed(2).replace(/\.00$/, '') + 'k';
+        return Math.round(n).toLocaleString();
+    }
+
+    function formatRemaining(ms) {
+        if (!Number.isFinite(ms)) return '?';
+        const totalSec = Math.max(0, Math.floor(ms / 1000));
+        const mins = Math.floor(totalSec / 60);
+        const secs = totalSec % 60;
+        if (mins >= 60) {
+            const hrs = Math.floor(mins / 60);
+            const remMins = mins % 60;
+            return `${hrs}h ${remMins}m`;
+        }
+        return `${mins}m ${secs}s`;
+    }
+
+    function normalizeStatusText(text) {
+        return String(text || '').trim().toLowerCase();
+    }
+
+    function isBountiesPage() {
+        return /\/bounties\.php/i.test(location.pathname);
+    }
+
+    function isAttackPage() {
+        const params = new URLSearchParams(location.search);
+        return /\/page\.php/i.test(location.pathname) && params.get('sid') === 'attack';
+    }
+
+    function createEl(tag, props = {}, children = []) {
+        const el = document.createElement(tag);
+
+        Object.entries(props).forEach(([key, value]) => {
+            if (key === 'className') el.className = value;
+            else if (key === 'text') el.textContent = value;
+            else if (key === 'html') el.innerHTML = value;
+            else if (key === 'style' && value && typeof value === 'object') Object.assign(el.style, value);
+            else el[key] = value;
+        });
+
+        for (const child of children) {
+            if (child) el.appendChild(child);
+        }
+
+        return el;
+    }
+
+    /******************************************************************
+     * CSS
+     ******************************************************************/
+    function injectStyles() {
+        const style = document.createElement('style');
+        style.textContent = `
+            .bha-panel {
+                position: fixed;
+                top: 115px;
+                right: 18px;
+                width: 350px;
+                z-index: 999999;
+                background: rgba(18, 22, 28, 0.96);
+                color: #eef4ff;
+                border: 1px solid rgba(110, 155, 255, 0.24);
+                border-radius: 12px;
+                box-shadow: 0 10px 28px rgba(0,0,0,0.38);
+                overflow: hidden;
+                font: 13px/1.35 Arial, sans-serif;
+                backdrop-filter: blur(6px);
+            }
+
+            .bha-header {
+                padding: 10px 12px;
+                cursor: move;
+                user-select: none;
+                font-weight: 700;
+                background: linear-gradient(180deg, rgba(72,112,190,0.30), rgba(42,64,105,0.22));
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }
+
+            .bha-body {
+                padding: 10px 12px 12px;
+                max-height: 78vh;
+                overflow: auto;
+            }
+
+            .bha-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                margin: 8px 0;
+            }
+
+            .bha-row label {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                width: 100%;
+            }
+
+            .bha-row input[type="number"],
+            .bha-row input[type="password"],
+            .bha-row select {
+                width: 165px;
+                background: rgba(255,255,255,0.06);
+                color: #fff;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 8px;
+                padding: 6px 8px;
+            }
+
+            .bha-row input[type="checkbox"] {
+                transform: scale(1.05);
+            }
+
+            .bha-subhead {
+                margin-top: 12px;
+                margin-bottom: 6px;
+                font-size: 12px;
+                font-weight: 700;
+                color: #b8d4ff;
+                opacity: 0.95;
+            }
+
+            .bha-btn-row {
+                display: flex;
+                gap: 8px;
+                margin-top: 10px;
+                flex-wrap: wrap;
+            }
+
+            .bha-btn {
+                background: rgba(88,150,255,0.16);
+                color: #dfeaff;
+                border: 1px solid rgba(88,150,255,0.32);
+                border-radius: 8px;
+                padding: 7px 10px;
+                cursor: pointer;
+                font-weight: 700;
+            }
+
+            .bha-btn:hover {
+                background: rgba(88,150,255,0.26);
+            }
+
+            .bha-stats {
+                display: grid;
+                grid-template-columns: 1fr 1fr 1fr 1fr;
+                gap: 8px;
+                margin-top: 12px;
+            }
+
+            .bha-stat {
+                background: rgba(255,255,255,0.05);
+                border-radius: 8px;
+                padding: 8px;
+                text-align: center;
+            }
+
+            .bha-stat-k {
+                font-size: 11px;
+                opacity: 0.75;
+            }
+
+            .bha-stat-v {
+                font-size: 15px;
+                font-weight: 700;
+                margin-top: 2px;
+            }
+
+            .bha-help, .bha-disclosure {
+                margin-top: 10px;
+                font-size: 11px;
+                opacity: 0.82;
+            }
+
+            .bha-disclosure {
+                padding: 8px;
+                background: rgba(255,255,255,0.04);
+                border-radius: 8px;
+            }
+
+            li.bha-match {
+                outline: 2px solid rgba(70, 230, 120, 0.95) !important;
+                box-shadow: inset 0 0 0 9999px rgba(50, 180, 95, 0.14);
+                border-radius: 8px;
+            }
+
+            li.bha-no-match {
+                opacity: 0.42;
+            }
+
+            .bha-badge,
+            .bha-note,
+            .bha-timer {
+                display: inline-block;
+                margin-left: 8px;
+                padding: 1px 6px;
+                border-radius: 999px;
+                font-size: 11px;
+                font-weight: 700;
+                vertical-align: middle;
+            }
+
+            .bha-badge {
+                background: rgba(74, 128, 255, 0.18);
+                color: #a9ccff;
+                border: 1px solid rgba(74, 128, 255, 0.28);
+            }
+
+            .bha-note {
+                background: rgba(70, 230, 120, 0.14);
+                color: #aff0bf;
+                border: 1px solid rgba(70, 230, 120, 0.24);
+            }
+
+            .bha-timer {
+                background: rgba(255, 184, 77, 0.14);
+                color: #ffd28a;
+                border: 1px solid rgba(255, 184, 77, 0.24);
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    /******************************************************************
+     * UI
+     ******************************************************************/
+    function buildUI() {
+        if (state.ui.panel) return;
+
+        const panel = createEl('div', { className: 'bha-panel' });
+        const header = createEl('div', { className: 'bha-header', text: 'Bounty Hunter Assistant' });
+        const body = createEl('div', { className: 'bha-body' });
+
+        function checkboxRow(labelText, key) {
+            return createEl('div', { className: 'bha-row' }, [
+                createEl('label', {}, [
+                    document.createTextNode(labelText),
+                    createEl('input', {
+                        type: 'checkbox',
+                        checked: !!state.settings[key],
+                        onchange: (e) => {
+                            state.settings[key] = !!e.target.checked;
+                            saveSettings();
+                            if (key === 'autoRefresh') restartRefreshLoop();
+                            scheduleScan();
+                        }
+                    })
+                ])
+            ]);
+        }
+
+        function numberRow(labelText, key, step = 1, min = 0) {
+            return createEl('div', { className: 'bha-row' }, [
+                createEl('label', {}, [
+                    document.createTextNode(labelText),
+                    createEl('input', {
+                        type: 'number',
+                        value: state.settings[key],
+                        min,
+                        step,
+                        onchange: (e) => {
+                            state.settings[key] = Number(e.target.value) || 0;
+                            saveSettings();
+                            scheduleScan();
+                        }
+                    })
+                ])
+            ]);
+        }
+
+        const statusRow = createEl('div', { className: 'bha-row' }, [
+            createEl('label', {}, [
+                document.createTextNode('Status filter'),
+                (() => {
+                    const select = createEl('select', {
+                        onchange: (e) => {
+                            state.settings.statusMode = e.target.value;
+                            saveSettings();
+                            scheduleScan();
+                        }
+                    });
+                    [
+                        ['okay_only', 'Okay only'],
+                        ['hospital_only', 'Hospital only'],
+                        ['okay_or_hospital', 'Okay + Hospital']
+                    ].forEach(([value, text]) => {
+                        const opt = document.createElement('option');
+                        opt.value = value;
+                        opt.textContent = text;
+                        if (state.settings.statusMode === value) opt.selected = true;
+                        select.appendChild(opt);
+                    });
+                    return select;
+                })()
+            ])
+        ]);
+
+        const apiKeyRow = createEl('div', { className: 'bha-row' }, [
+            createEl('label', {}, [
+                document.createTextNode('Torn API key'),
+                createEl('input', {
+                    type: 'password',
+                    value: state.settings.apiKey || '',
+                    placeholder: 'key',
+                    onchange: (e) => {
+                        state.settings.apiKey = String(e.target.value || '').trim();
+                        saveSettings();
+                        clearApiCache();
+                        queueCurrentPageHospitalTargets(true);
+                        scheduleScan();
+                    }
+                })
+            ])
+        ]);
+
+        const btnRow = createEl('div', { className: 'bha-btn-row' }, [
+            createEl('button', {
+                className: 'bha-btn',
+                textContent: 'Scan now',
+                onclick: () => scanAndRender()
+            }),
+            createEl('button', {
+                className: 'bha-btn',
+                textContent: 'Reload FF',
+                onclick: async () => {
+                    await hydrateFFCache();
+                    scanAndRender();
+                }
+            }),
+            createEl('button', {
+                className: 'bha-btn',
+                textContent: 'Queue hospital API',
+                onclick: () => {
+                    queueCurrentPageHospitalTargets(true);
+                    scanAndRender();
+                }
+            }),
+            createEl('button', {
+                className: 'bha-btn',
+                textContent: 'Clear API cache',
+                onclick: () => {
+                    clearApiCache();
+                    scanAndRender();
+                }
+            })
+        ]);
+
+        const stats = createEl('div', { className: 'bha-stats' }, [
+            createEl('div', { className: 'bha-stat' }, [
+                createEl('div', { className: 'bha-stat-k', text: 'Matched' }),
+                state.ui.matched = createEl('div', { className: 'bha-stat-v', text: '0' })
+            ]),
+            createEl('div', { className: 'bha-stat' }, [
+                createEl('div', { className: 'bha-stat-k', text: 'Scanned' }),
+                state.ui.scanned = createEl('div', { className: 'bha-stat-v', text: '0' })
+            ]),
+            createEl('div', { className: 'bha-stat' }, [
+                createEl('div', { className: 'bha-stat-k', text: 'FF Cache' }),
+                state.ui.ffCount = createEl('div', { className: 'bha-stat-v', text: '0' })
+            ]),
+            createEl('div', { className: 'bha-stat' }, [
+                createEl('div', { className: 'bha-stat-k', text: 'API Cache' }),
+                state.ui.apiCount = createEl('div', { className: 'bha-stat-v', text: '0' })
+            ])
+        ]);
+
+        const disclosure = createEl('div', {
+            className: 'bha-disclosure',
+            text: 'This stores your API key only in your browser for Torn API calls. API polling only targets hospital players visible on the current page.'
+        });
+
+        const help = createEl('div', {
+            className: 'bha-help',
+            text: 'Recommended for near-release bounty hunting: Status = Hospital only, Enable Torn API = on, Hosp soon = on.'
+        });
+
+        body.append(
+            createEl('div', { className: 'bha-subhead', text: 'Filters' }),
+            checkboxRow('Enable highlighting', 'enabled'),
+            checkboxRow('Auto refresh', 'autoRefresh'),
+            checkboxRow('Dim non-matches', 'dimNonMatches'),
+            checkboxRow('Require FF data', 'requireFFData'),
+            checkboxRow('Show BS badge', 'showBSBadge'),
+            numberRow('Min reward', 'minReward', 1000, 0),
+            numberRow('Max BS', 'maxBS', 1000, 0),
+            statusRow,
+
+            createEl('div', { className: 'bha-subhead', text: 'Hospital API timing' }),
+            checkboxRow('Enable Torn API', 'apiEnabled'),
+            apiKeyRow,
+            checkboxRow('Force fresh API', 'forceFreshApi'),
+            checkboxRow('Hosp soon enabled', 'hospSoonEnabled'),
+            numberRow('Hosp soon max minutes', 'hospSoonMaxMinutes', 1, 0),
+
+            btnRow,
+            stats,
+            disclosure,
+            help
+        );
+
+        panel.append(header, body);
+        document.body.appendChild(panel);
+        state.ui.panel = panel;
+
+        makeDraggable(panel, header);
+        updateUISummary();
+    }
+
+    function makeDraggable(root, handle) {
+        let dragging = false;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        handle.addEventListener('mousedown', (e) => {
+            dragging = true;
+            const rect = root.getBoundingClientRect();
+            offsetX = e.clientX - rect.left;
+            offsetY = e.clientY - rect.top;
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            root.style.left = `${e.clientX - offsetX}px`;
+            root.style.top = `${e.clientY - offsetY}px`;
+            root.style.right = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => {
+            dragging = false;
+        });
+    }
+
+    function updateUISummary() {
+        if (state.ui.matched) state.ui.matched.textContent = String(state.summary.matched);
+        if (state.ui.scanned) state.ui.scanned.textContent = String(state.summary.scanned);
+        if (state.ui.ffCount) state.ui.ffCount.textContent = String(state.ffCache.size);
+        if (state.ui.apiCount) state.ui.apiCount.textContent = String(state.apiCache.size);
+    }
+
+    /******************************************************************
+     * FF SCOUTER CACHE
+     ******************************************************************/
+    function openFFDatabase() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(CONFIG.ffDbName);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+        });
+    }
+
+    function readAllFromStore(db, storeName) {
+        return new Promise((resolve, reject) => {
+            try {
+                const tx = db.transaction(storeName, 'readonly');
+                const store = tx.objectStore(storeName);
+                const req = store.getAll();
+                req.onerror = () => reject(req.error);
+                req.onsuccess = () => resolve(req.result || []);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    async function hydrateFFCache() {
+        state.ffCache.clear();
+
+        try {
+            const db = await openFFDatabase();
+            const rows = await readAllFromStore(db, CONFIG.ffStoreName);
+
+            for (const row of rows) {
+                if (!row || !row.player_id) continue;
+                state.ffCache.set(Number(row.player_id), row);
+            }
+
+            db.close();
+        } catch (err) {
+            log('Failed to read FF cache', err);
+        }
+
+        updateUISummary();
+    }
+
+    function getFFRow(playerId) {
+        return state.ffCache.get(Number(playerId)) || null;
+    }
+
+    /******************************************************************
+     * API CACHE + REQUESTS
+     ******************************************************************/
+    function clearApiCache() {
+        state.apiCache.clear();
+        state.apiQueue = [];
+        state.apiQueuedSet.clear();
+        state.apiInFlight = false;
+        state.rateLimitedUntil = 0;
+        state.burst = {
+            sentInBurst: 0,
+            burstStartedAt: 0,
+            cooldownUntil: 0
+        };
+        updateUISummary();
+    }
+
+    function getApiRow(playerId) {
+        return state.apiCache.get(Number(playerId)) || null;
+    }
+
+    function hasUsableApiKey() {
+        return state.settings.apiEnabled && String(state.settings.apiKey || '').trim().length >= 8;
+    }
+
+    function convertUntilToMs(until) {
+        if (until == null) return null;
+        const n = Number(until);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        return n < 1e12 ? n * 1000 : n;
+    }
+
+    function queueApiPlayer(playerId, force = false) {
+        playerId = Number(playerId);
+        if (!playerId || !hasUsableApiKey()) return;
+
+        const cached = getApiRow(playerId);
+        const freshEnough = cached && (nowMs() - cached.fetchedAt) < CONFIG.apiCacheMs;
+
+        if (!force && freshEnough) return;
+        if (state.apiQueuedSet.has(playerId)) return;
+
+        state.apiQueue.push({ playerId, force: !!force });
+        state.apiQueuedSet.add(playerId);
+    }
+
+    function queueCurrentPageHospitalTargets(force = false) {
+        const cards = getBountyCards();
+        const candidates = [];
+
+        for (const card of cards) {
+            const item = parseCard(card);
+            if (!item) continue;
+
+            const flags = getStatusFlags(item.statusText);
+            if (!flags.isHospital) continue;
+
+            const ffRow = getFFRow(item.playerId);
+            const bs = ffRow ? parseBS(ffRow.bs_estimate) : null;
+            const inCap = Number.isFinite(bs) && bs <= state.settings.maxBS ? 1 : 0;
+
+            candidates.push({
+                playerId: item.playerId,
+                reward: item.reward || 0,
+                hasBS: Number.isFinite(bs) ? 1 : 0,
+                inCap,
+                bs: Number.isFinite(bs) ? bs : Infinity
+            });
+        }
+
+        candidates.sort((a, b) => {
+            if (b.inCap !== a.inCap) return b.inCap - a.inCap; // under cap first
+            if (b.hasBS !== a.hasBS) return b.hasBS - a.hasBS; // known BS first
+            if (a.bs !== b.bs) return a.bs - b.bs;             // lower BS first
+            if (b.reward !== a.reward) return b.reward - a.reward;
+            return a.playerId - b.playerId;
+        });
+
+        for (const c of candidates.slice(0, CONFIG.maxQueuedPerSweep)) {
+            queueApiPlayer(c.playerId, force);
+        }
+    }
+
+    function requestTornProfile(playerId, forceFresh = false) {
+        return new Promise((resolve) => {
+            const key = encodeURIComponent(String(state.settings.apiKey || '').trim());
+            let url = `${CONFIG.apiBase}/${playerId}?selections=profile&key=${key}&comment=bha_hosp`;
+            if (forceFresh || state.settings.forceFreshApi) {
+                url += `&timestamp=${Date.now()}`;
+            }
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                onload: (response) => {
+                    try {
+                        const data = JSON.parse(response.responseText || '{}');
+
+                        if (data.error) {
+                            const errCode = Number(data.error.code);
+                            const errMsg = data.error.error || data.error.code || 'API error';
+
+                            if (errCode === 5) {
+                                state.rateLimitedUntil = Date.now() + 15000;
+                            }
+
+                            resolve({
+                                ok: false,
+                                error: errMsg,
+                                errorCode: errCode,
+                                playerId
+                            });
+                            return;
+                        }
+
+                        const statusObj = data.status || {};
+                        const stateText = statusObj.state || statusObj.description || '';
+                        const untilMs = convertUntilToMs(statusObj.until);
+
+                        resolve({
+                            ok: true,
+                            playerId,
+                            state: String(stateText || ''),
+                            untilMs,
+                            fetchedAt: nowMs()
+                        });
+                    } catch (err) {
+                        resolve({
+                            ok: false,
+                            error: 'Parse error',
+                            playerId
+                        });
+                    }
+                },
+                onerror: () => resolve({
+                    ok: false,
+                    error: 'Network error',
+                    playerId
+                }),
+                ontimeout: () => resolve({
+                    ok: false,
+                    error: 'Timeout',
+                    playerId
+                })
+            });
+        });
+    }
+
+    async function processApiQueue() {
+        if (state.apiInFlight) return;
+        if (!hasUsableApiKey()) return;
+        if (!state.apiQueue.length) return;
+
+        const now = Date.now();
+        if (now < state.rateLimitedUntil) return;
+        if (now < state.burst.cooldownUntil) return;
+
+        // Start or restart burst window
+        if (!state.burst.burstStartedAt || (now - state.burst.burstStartedAt) > CONFIG.apiBurstWindowMs) {
+            state.burst.burstStartedAt = now;
+            state.burst.sentInBurst = 0;
+        }
+
+        // If burst quota used up, cool down
+        if (state.burst.sentInBurst >= CONFIG.apiBurstSize) {
+            state.burst.cooldownUntil = now + CONFIG.apiBurstCooldownMs;
+            state.burst.burstStartedAt = 0;
+            state.burst.sentInBurst = 0;
+            return;
+        }
+
+        const next = state.apiQueue.shift();
+        if (!next) return;
+
+        state.apiQueuedSet.delete(next.playerId);
+        state.apiInFlight = true;
+
+        const result = await requestTornProfile(next.playerId, next.force);
+
+        state.apiCache.set(Number(next.playerId), {
+            ok: !!result.ok,
+            state: result.state || '',
+            untilMs: result.untilMs ?? null,
+            fetchedAt: Date.now(),
+            error: result.error || null,
+            errorCode: result.errorCode || null
+        });
+
+        state.apiInFlight = false;
+        state.burst.sentInBurst += 1;
+
+        if (state.burst.sentInBurst >= CONFIG.apiBurstSize) {
+            state.burst.cooldownUntil = Date.now() + CONFIG.apiBurstCooldownMs;
+            state.burst.burstStartedAt = 0;
+            state.burst.sentInBurst = 0;
+        }
+
+        updateUISummary();
+        scheduleScan();
+    }
+
+    /******************************************************************
+     * DOM PARSING
+     ******************************************************************/
+    function getBountyCards() {
+        return Array.from(document.querySelectorAll('li[data-id]')).filter((li) => {
+            return !!li.querySelector('.target a[href*="profiles.php?XID="]');
+        });
+    }
+
+    function extractPlayerIdFromHref(href) {
+        if (!href) return null;
+        const m = href.match(/XID=(\d+)/i);
+        return m ? Number(m[1]) : null;
+    }
+
+    function parseCard(card) {
+        const rewardEl = card.querySelector('.reward');
+        const targetWrap = card.querySelector('.target');
+        const targetLink = card.querySelector('.target a[href*="profiles.php?XID="]');
+        const statusEl = card.querySelector('.status span.user-red-status, .status span.user-green-status, .status span:last-child');
+
+        if (!targetLink || !targetWrap) return null;
+
+        const playerId = extractPlayerIdFromHref(targetLink.getAttribute('href') || targetLink.href);
+        const reward = parseMoney(rewardEl ? rewardEl.textContent : '');
+        const statusText = statusEl ? statusEl.textContent.trim() : '';
+
+        return {
+            card,
+            reward,
+            rewardEl,
+            playerId,
+            targetName: targetLink.textContent.trim(),
+            statusText,
+            targetWrap
+        };
+    }
+
+    function getStatusFlags(statusText) {
+        const s = normalizeStatusText(statusText);
+        return {
+            isOkay: s === 'okay',
+            isHospital: s === 'hospital'
+        };
+    }
+
+    /******************************************************************
+     * MATCH LOGIC
+     ******************************************************************/
+    function statusAllowed(statusText) {
+        const flags = getStatusFlags(statusText);
+        const mode = state.settings.statusMode;
+
+        if (mode === 'okay_only') return flags.isOkay;
+        if (mode === 'hospital_only') return flags.isHospital;
+        if (mode === 'okay_or_hospital') return flags.isOkay || flags.isHospital;
+        return false;
+    }
+
+    function getHospitalRemainingMs(apiRow) {
+        if (!apiRow || !apiRow.ok || !apiRow.untilMs) return null;
+        return Math.max(0, apiRow.untilMs - nowMs());
+    }
+
+    function evaluateCard(item) {
+        if (item.reward < state.settings.minReward) {
+            return { match: false, reason: 'reward low', ffRow: null, apiRow: null };
+        }
+
+        if (!statusAllowed(item.statusText)) {
+            return { match: false, reason: 'status blocked', ffRow: null, apiRow: null };
+        }
+
+        const ffRow = getFFRow(item.playerId);
+        if (!ffRow && state.settings.requireFFData) {
+            return { match: false, reason: 'no ff data', ffRow: null, apiRow: null };
+        }
+
+        if (ffRow) {
+            const bs = parseBS(ffRow.bs_estimate);
+            if (bs != null && bs > state.settings.maxBS) {
+                return { match: false, reason: 'bs high', ffRow, apiRow: null };
+            }
+        }
+
+        const flags = getStatusFlags(item.statusText);
+        let apiRow = null;
+
+        if (flags.isHospital && state.settings.apiEnabled) {
+            apiRow = getApiRow(item.playerId);
+
+            const stale = !apiRow || (nowMs() - apiRow.fetchedAt) > CONFIG.apiStaleMs;
+            if (stale) queueApiPlayer(item.playerId, false);
+
+            if (state.settings.hospSoonEnabled) {
+                if (!apiRow || !apiRow.ok || !apiRow.untilMs) {
+                    return { match: false, reason: 'no hosp timer', ffRow, apiRow };
+                }
+
+                const remaining = getHospitalRemainingMs(apiRow);
+                const thresholdMs = Math.max(0, Number(state.settings.hospSoonMaxMinutes || 0)) * 60 * 1000;
+
+                if (remaining == null) {
+                    return { match: false, reason: 'no until', ffRow, apiRow };
+                }
+
+                if (remaining > thresholdMs) {
+                    return { match: false, reason: 'not soon', ffRow, apiRow };
+                }
+            }
+        }
+
+        return { match: true, reason: 'match', ffRow, apiRow };
+    }
+
+    /******************************************************************
+     * DECORATION
+     ******************************************************************/
+    function clearDecorations(card) {
+        card.classList.remove('bha-match', 'bha-no-match');
+        card.querySelectorAll('.bha-badge, .bha-note, .bha-timer').forEach(el => el.remove());
+    }
+
+    function appendDecorations(targetWrap, ffRow, apiRow, noteText) {
+        if (state.settings.showBSBadge && ffRow && ffRow.bs_estimate_human) {
+            targetWrap.appendChild(createEl('span', {
+                className: 'bha-badge',
+                text: `BS ${ffRow.bs_estimate_human}`
+            }));
+        } else if (state.settings.showBSBadge && ffRow && ffRow.bs_estimate != null) {
+            targetWrap.appendChild(createEl('span', {
+                className: 'bha-badge',
+                text: `BS ${formatBS(parseBS(ffRow.bs_estimate))}`
+            }));
+        }
+
+        if (apiRow && apiRow.ok && apiRow.untilMs) {
+            const remaining = getHospitalRemainingMs(apiRow);
+            if (remaining != null) {
+                targetWrap.appendChild(createEl('span', {
+                    className: 'bha-timer',
+                    text: `HOSP ${formatRemaining(remaining)}`
+                }));
+            }
+        }
+
+        if (noteText) {
+            targetWrap.appendChild(createEl('span', {
+                className: 'bha-note',
+                text: noteText
+            }));
+        }
+    }
+
+    function ensureRewardAttackLink(item) {
+        if (!item || !item.rewardEl || !item.playerId) return;
+
+        const href = `https://www.torn.com/page.php?sid=attack&user2ID=${item.playerId}`;
+        const existing = item.rewardEl.querySelector('a.bha-reward-link');
+        if (existing) {
+            if (existing.href !== href) existing.href = href;
+            return;
+        }
+
+        const text = item.rewardEl.textContent;
+        item.rewardEl.textContent = '';
+        item.rewardEl.appendChild(createEl('a', {
+            className: 'bha-reward-link',
+            href,
+            textContent: text,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+            style: {
+                color: 'inherit',
+                textDecoration: 'underline'
+            }
+        }));
+    }
+
+    /******************************************************************
+     * SCAN + RENDER
+     ******************************************************************/
+    function scanAndRender() {
+        const cards = getBountyCards();
+        const items = cards.map(parseCard).filter(Boolean);
+        let matched = 0;
+
+        if (hasUsableApiKey()) {
+            queueCurrentPageHospitalTargets(false);
+        }
+
+        for (const item of items) {
+            ensureRewardAttackLink(item);
+            clearDecorations(item.card);
+
+            if (!state.settings.enabled) continue;
+
+            const result = evaluateCard(item);
+
+            if (result.match) {
+                matched++;
+                item.card.classList.add('bha-match');
+                const note = result.apiRow && result.apiRow.untilMs ? 'READY SOON' : 'READY';
+                appendDecorations(item.targetWrap, result.ffRow, result.apiRow, note);
+            } else {
+                if (state.settings.dimNonMatches) {
+                    item.card.classList.add('bha-no-match');
+                }
+                appendDecorations(item.targetWrap, result.ffRow, result.apiRow, '');
+            }
+        }
+
+        state.summary.scanned = items.length;
+        state.summary.matched = matched;
+        updateUISummary();
+    }
+
+    function getAttackTargetIdFromUrl() {
+        const params = new URLSearchParams(location.search);
+        const id = Number(params.get('user2ID'));
+        return Number.isFinite(id) && id > 0 ? id : null;
+    }
+
+    function renderAttackHospitalStatus(apiRow) {
+        const titleEl = document.querySelector('.title___fOh2J');
+        if (!titleEl) return;
+        if (!/currently in hospital/i.test(titleEl.textContent || '')) return;
+        if (!apiRow || !apiRow.ok || !apiRow.untilMs) return;
+
+        const remaining = Math.max(0, apiRow.untilMs - Date.now());
+        titleEl.textContent = `This person is currently in hospital and cannot be attacked. Release ETA: ${formatRemaining(remaining)}.`;
+    }
+
+    async function refreshAttackHospitalStatus() {
+        const playerId = getAttackTargetIdFromUrl();
+        if (!playerId || !hasUsableApiKey()) return;
+        const result = await requestTornProfile(playerId, true);
+        if (!result || !result.ok) return;
+        renderAttackHospitalStatus(result);
+    }
+
+    function startAttackHospitalLoop() {
+        clearInterval(state.timers.attackHospital);
+        refreshAttackHospitalStatus();
+        state.timers.attackHospital = setInterval(() => {
+            refreshAttackHospitalStatus();
+        }, 3000);
+    }
+
+    const scheduleScan = debounce(scanAndRender, CONFIG.pageScanDebounceMs);
+
+    /******************************************************************
+     * OBSERVERS / LOOPS
+     ******************************************************************/
+    function observePage() {
+        const observer = new MutationObserver(() => {
+            scheduleScan();
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    function restartRefreshLoop() {
+        clearInterval(state.timers.refresh);
+        if (!state.settings.autoRefresh) return;
+
+        state.timers.refresh = setInterval(async () => {
+            await hydrateFFCache();
+            if (hasUsableApiKey()) {
+                queueCurrentPageHospitalTargets(false);
+            }
+            scanAndRender();
+        }, CONFIG.uiRefreshMs);
+    }
+
+    function startApiQueueLoop() {
+        clearInterval(state.timers.queueLoop);
+        state.timers.queueLoop = setInterval(() => {
+            processApiQueue();
+        }, CONFIG.apiLoopTickMs);
+    }
+
+    /******************************************************************
+     * INIT
+     ******************************************************************/
+    async function init() {
+        loadSettings();
+        injectStyles();
+        if (isBountiesPage()) {
+            buildUI();
+            observePage();
+            startApiQueueLoop();
+            await hydrateFFCache();
+            restartRefreshLoop();
+            scanAndRender();
+        } else if (isAttackPage()) {
+            startAttackHospitalLoop();
+        }
+        log('Bounty Hunter Assistant initialized');
+    }
+
+    init().catch((err) => {
+        console.error('[BHA] Init failed:', err);
+    });
+})();
