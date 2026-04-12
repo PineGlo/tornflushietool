@@ -97,7 +97,8 @@
         },
 
         attackHospital: {
-            untilMs: null
+            untilMs: null,
+            refreshInFlight: false
         }
     };
 
@@ -1101,6 +1102,9 @@
             if (state.attackHospital.untilMs == null) return;
             const remainingFallback = Math.max(0, state.attackHospital.untilMs - Date.now());
             titleEl.textContent = `This person is currently in hospital and cannot be attacked. Release ETA: ${formatRemaining(remainingFallback)}.`;
+            if (remainingFallback === 0) {
+                refreshAttackHospitalStatus();
+            }
             return;
         }
 
@@ -1111,7 +1115,10 @@
     async function refreshAttackHospitalStatus() {
         const playerId = getAttackTargetIdFromUrl();
         if (!playerId || !hasUsableApiKey()) return;
+        if (state.attackHospital.refreshInFlight) return;
+        state.attackHospital.refreshInFlight = true;
         const result = await requestTornProfile(playerId, true);
+        state.attackHospital.refreshInFlight = false;
         if (!result || !result.ok) return;
         state.attackHospital.untilMs = result.untilMs || null;
         renderAttackHospitalStatus(result);
