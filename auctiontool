@@ -340,6 +340,19 @@
         return null;
     }
 
+    function bbDisplayText(bbAmount) {
+        const bbCashValue = Number(settings.get().bbCashValue) || 0;
+        const bbProfitMargin = Math.max(0, Math.min(100, Number(settings.get().bbProfitMargin) || 0));
+        if (bbCashValue > 0) {
+            const netCash = Math.round(bbAmount * bbCashValue * (1 - (bbProfitMargin / 100)));
+            return {
+                text: `${bbAmount} BB • ${fmt$(netCash)}`,
+                title: `BB base: ${fmt$(bbCashValue)} each • margin: ${bbProfitMargin}%`,
+            };
+        }
+        return { text: `${bbAmount} BB`, title: '' };
+    }
+
     function injectBBBage(el, bbAmount) {
         const existing = el.querySelector('.ah-bb-badge');
         if (existing) existing.remove();
@@ -351,16 +364,28 @@
 
         const badge = document.createElement('div');
         badge.className = 'ah-bb-badge';
-        const bbCashValue = Number(settings.get().bbCashValue) || 0;
-        const bbProfitMargin = Math.max(0, Math.min(100, Number(settings.get().bbProfitMargin) || 0));
-        if (bbCashValue > 0) {
-            const netCash = Math.round(bbAmount * bbCashValue * (1 - (bbProfitMargin / 100)));
-            badge.textContent = `${bbAmount} BB • ${fmt$(netCash)}`;
-            badge.title = `BB base: ${fmt$(bbCashValue)} each • margin: ${bbProfitMargin}%`;
-        } else {
-            badge.textContent = `${bbAmount} BB`;
-        }
+        const info = bbDisplayText(bbAmount);
+        badge.textContent = info.text;
+        if (info.title) badge.title = info.title;
         target.appendChild(badge);
+    }
+
+    function injectCollapsedBBInfo(btn, bbAmount) {
+        btn.querySelector('.ah-bb-inline')?.remove();
+        if (bbAmount == null) return;
+
+        const attachments = btn.querySelectorAll('.bonus-attachment');
+        if (!attachments.length) {
+            injectBBBage(btn, bbAmount);
+            return;
+        }
+
+        const info = bbDisplayText(bbAmount);
+        const wrap = document.createElement('span');
+        wrap.className = 'bonus-attachment ah-bb-inline';
+        wrap.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
+        if (info.title) wrap.title = info.title;
+        attachments[0].insertAdjacentElement('beforebegin', wrap);
     }
 
     function rarityFromAriaLabel(aria) {
@@ -392,7 +417,7 @@
             const itemType = /armor:/i.test(aria) ? 'armor' : 'weapon';
             const bonusCount = bonusCountFromAriaLabel(aria);
             const bbAmount = calcBunkerBucks(itemName, rarityKey, bonusCount, itemType);
-            injectBBBage(btn, bbAmount);
+            injectCollapsedBBInfo(btn, bbAmount);
         });
     }
 
@@ -920,6 +945,28 @@ function parseCurrentListingPrice() {
             background: rgba(20,20,20,0.85); color: #ffd666;
             font-size: 11px; font-weight: 700; z-index: 9; pointer-events: none;
             text-shadow: 0 1px 1px rgba(0,0,0,0.5);
+        }
+        .ah-bb-inline {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-bottom: 2px;
+        }
+        .ah-bb-inline .label-value {
+            color: #ffd666 !important;
+            font-weight: 700;
+        }
+        .bonus-attachment-item-bb-bonus::before {
+            content: "BB";
+            display: inline-block;
+            font-style: normal;
+            font-size: 9px;
+            font-weight: 700;
+            color: #ffd666;
+            border: 1px solid rgba(255, 214, 102, 0.45);
+            border-radius: 3px;
+            padding: 0 3px;
+            line-height: 1.3;
         }
 
         /* ── Modal shell ── */
