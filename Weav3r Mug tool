@@ -18,7 +18,10 @@
   const STORAGE_KEY = "weav3r_mugging_helper_v1";
   const DEFAULTS = {
     enabled: true,
-    enableBazaarTracking: false,
+    enableBazaarTracking: true,
+    bazaarScanMs: 1000,
+    soldAlertUnits: 250,
+    rapidJumpUnits: 40,
     tornApiKey: "",
     ffApiKey: "",
     statThresholdText: "500m",
@@ -42,10 +45,16 @@
     thresholdValue: 0,
     trackerEls: null,
     tracker: {
+      mode: "idle", // idle | baseline | tracking | alert
       running: false,
+      startedAt: 0,
+      lastScanAt: 0,
       lastSnapshot: new Map(),
       totals: new Map(), // name -> { name, units, gross }
+      totalUnits: 0,
       totalGross: 0,
+      alerts: [],
+      soldAlertTriggered: false,
     },
   };
 
@@ -160,6 +169,19 @@
     .wmh-tracker-top li {
       margin: 3px 0;
       color: #e2e8f0;
+    }
+    .wmh-alerts {
+      margin-top: 8px;
+      font-size: 11px;
+      line-height: 1.35;
+      color: #fecaca;
+    }
+    .wmh-alert {
+      margin-top: 4px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(127, 29, 29, 0.55);
+      border: 1px solid rgba(248, 113, 113, 0.45);
     }
 
     .wmh-meta {
@@ -306,41 +328,56 @@
   }
 
   function resetBazaarTracker() {
+    state.tracker.mode = "idle";
     state.tracker.running = false;
+    state.tracker.startedAt = 0;
+    state.tracker.lastScanAt = 0;
     state.tracker.lastSnapshot = new Map();
     state.tracker.totals = new Map();
+    state.tracker.totalUnits = 0;
     state.tracker.totalGross = 0;
+    state.tracker.alerts = [];
+    state.tracker.soldAlertTriggered = false;
     renderBazaarTracker();
   }
 
   function renderBazaarTracker(extra = "") {
-    if (!state.trackerEls?.stats || !state.trackerEls?.top) return;
+    if (!state.trackerEls?.stats || !state.trackerEls?.top || !state.trackerEls?.alerts) return;
     if (!state.cfg.enableBazaarTracking) {
-      state.trackerEls.stats.textContent = "Tracker disabled.";
+      state.trackerEls.stats.textContent = "Tracker disabled";
       state.trackerEls.top.innerHTML = "";
+      state.trackerEls.alerts.innerHTML = "";
       return;
     }
     if (!isTornBazaarPage()) {
       state.trackerEls.stats.textContent = "Open a Torn bazaar page to track sales.";
       state.trackerEls.top.innerHTML = "";
+      state.trackerEls.alerts.innerHTML = "";
       return;
     }
 
+    const minutesLive = state.tracker.startedAt ? Math.max(1 / 60, (now() - state.tracker.startedAt) / 60000) : 0;
+    const unitsPerMin = minutesLive ? (state.tracker.totalUnits / minutesLive) : 0;
+    const grossPerMin = minutesLive ? (state.tracker.totalGross / minutesLive) : 0;
     state.trackerEls.stats.textContent =
-      `Total sold (tracked): $${Math.round(state.tracker.totalGross).toLocaleString()}${extra ? ` • ${extra}` : ""}`;
+      `State: ${state.tracker.mode} | Sold: ${state.tracker.totalUnits} units | Gross: $${Math.round(state.tracker.totalGross).toLocaleString()} | U/min: ${unitsPerMin.toFixed(1)} | $/min: ${Math.round(grossPerMin).toLocaleString()}${extra ? ` • ${extra}` : ""}`;
 
     const top3 = Array.from(state.tracker.totals.values())
-      .sort((a, b) => b.gross - a.gross)
+      .sort((a, b) => b.units - a.units)
       .slice(0, 3);
 
     if (!top3.length) {
       state.trackerEls.top.innerHTML = "<li>No sales tracked yet.</li>";
-      return;
+    } else {
+      state.trackerEls.top.innerHTML = top3
+        .map((item, i) => `<li>#${i + 1} ${item.name}: ${item.units} sold ($${Math.round(item.gross).toLocaleString()})</li>`)
+        .join("");
     }
 
-    state.trackerEls.top.innerHTML = top3
-      .map((item, i) => `<li>#${i + 1} ${item.name}: $${Math.round(item.gross).toLocaleString()} (${item.units} sold)</li>`)
-      .join("");
+    const recentAlerts = state.tracker.alerts.slice(-3);
+    state.trackerEls.alerts.innerHTML = recentAlerts.length
+      ? recentAlerts.map((a) => `<div class="wmh-alert">${a}</div>`).join("")
+      : "";
   }
 
   function runBazaarTracker() {
@@ -351,33 +388,51 @@
 
     // Tracker is DOM-only; no external API requests are used here.
     const snapshot = extractTornBazaarRows();
+    const scanTs = now();
     if (!snapshot.size) {
       renderBazaarTracker("No bazaar rows detected.");
       return;
     }
 
     if (!state.tracker.running) {
+      state.tracker.mode = "baseline";
       state.tracker.running = true;
+      state.tracker.startedAt = scanTs;
+      state.tracker.lastScanAt = scanTs;
       state.tracker.lastSnapshot = snapshot;
       renderBazaarTracker(`Tracking ${snapshot.size} items.`);
       return;
     }
 
+    let deltaUnits = 0;
     for (const [name, prev] of state.tracker.lastSnapshot.entries()) {
       const curr = snapshot.get(name);
       if (!curr) continue;
       const sold = Math.max(0, prev.qty - curr.qty);
       if (!sold) continue;
+      deltaUnits += sold;
       const gross = sold * prev.price;
       const entry = state.tracker.totals.get(name) || { name, units: 0, gross: 0 };
       entry.units += sold;
       entry.gross += gross;
       state.tracker.totals.set(name, entry);
+      state.tracker.totalUnits += sold;
       state.tracker.totalGross += gross;
     }
 
+    state.tracker.mode = "tracking";
+    if (!state.tracker.soldAlertTriggered && state.tracker.totalUnits >= (Number(state.cfg.soldAlertUnits) || 250)) {
+      state.tracker.soldAlertTriggered = true;
+      state.tracker.mode = "alert";
+      state.tracker.alerts.push(`Threshold alert: ${state.tracker.totalUnits} total units sold.`);
+    }
+    if (deltaUnits >= (Number(state.cfg.rapidJumpUnits) || 40)) {
+      state.tracker.mode = "alert";
+      state.tracker.alerts.push(`Rapid jump alert: ${deltaUnits} units sold in ~${Math.max(1, Math.round((scanTs - state.tracker.lastScanAt) / 1000))}s.`);
+    }
+    state.tracker.lastScanAt = scanTs;
     state.tracker.lastSnapshot = snapshot;
-    renderBazaarTracker(`Tracking ${snapshot.size} items.`);
+    renderBazaarTracker(`Tracking ${snapshot.size} items. Last scan delta: ${deltaUnits}`);
   }
 
   function now() {
@@ -739,16 +794,6 @@
           <input id="wmh-enabled" type="checkbox">
           <label for="wmh-enabled" style="margin:0;">Enabled</label>
         </div>
-        <div class="wmh-divider">Torn bazaar sales tracker</div>
-        <div class="wmh-check">
-          <input id="wmh-track-bazaar" type="checkbox">
-          <label for="wmh-track-bazaar" style="margin:0;">Enable tracking</label>
-        </div>
-        <div class="wmh-actions">
-          <button class="wmh-btn wmh-secondary" id="wmh-reset-tracker">Reset tracked sales</button>
-        </div>
-        <div class="wmh-tracker-stats" id="wmh-tracker-stats"></div>
-        <ol class="wmh-tracker-top" id="wmh-tracker-top"></ol>
 
         <div class="wmh-actions">
           <button class="wmh-btn" id="wmh-save">Save</button>
@@ -766,7 +811,6 @@
     const batch = panel.querySelector("#wmh-batch");
     const tick = panel.querySelector("#wmh-tick");
     const enabled = panel.querySelector("#wmh-enabled");
-    const trackBazaar = panel.querySelector("#wmh-track-bazaar");
 
     tornKey.value = state.cfg.tornApiKey || "";
     ffKey.value = state.cfg.ffApiKey || "";
@@ -774,16 +818,6 @@
     batch.value = String(state.cfg.batchSize || 10);
     tick.value = String(state.cfg.tickMs || 8000);
     enabled.checked = !!state.cfg.enabled;
-    trackBazaar.checked = !!state.cfg.enableBazaarTracking;
-    state.trackerEls = {
-      stats: panel.querySelector("#wmh-tracker-stats"),
-      top: panel.querySelector("#wmh-tracker-top"),
-    };
-    renderBazaarTracker();
-
-    panel.querySelector("#wmh-reset-tracker").addEventListener("click", () => {
-      resetBazaarTracker();
-    });
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
       state.cfg.tornApiKey = tornKey.value.trim();
@@ -792,11 +826,9 @@
       state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
       state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
       state.cfg.enabled = !!enabled.checked;
-      state.cfg.enableBazaarTracking = !!trackBazaar.checked;
 
       state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
       saveConfig();
-      if (!state.cfg.enableBazaarTracking) resetBazaarTracker();
 
       // Requeue all visible sellers after config change
       for (const userId of state.sellers.keys()) {
@@ -824,6 +856,76 @@
     updateStatusLine();
   }
 
+  function buildBazaarPanel() {
+    const panel = document.createElement("div");
+    panel.className = "wmh-panel";
+    panel.id = "wmh-panel-bazaar";
+    panel.innerHTML = `
+      <div class="wmh-head" id="wmh-bazaar-head">
+        <span>Torn Bazaar Tracker</span>
+        <span id="wmh-bazaar-collapse-indicator">▾</span>
+      </div>
+      <div class="wmh-body">
+        <div class="wmh-check">
+          <input id="wmh-track-bazaar" type="checkbox">
+          <label for="wmh-track-bazaar" style="margin:0;">Enable tracking</label>
+        </div>
+        <div class="wmh-inline">
+          <div class="wmh-row">
+            <label for="wmh-sold-threshold">Sold alert (units)</label>
+            <input id="wmh-sold-threshold" type="number" min="1" step="1">
+          </div>
+          <div class="wmh-row">
+            <label for="wmh-rapid-jump">Rapid jump (units/scan)</label>
+            <input id="wmh-rapid-jump" type="number" min="1" step="1">
+          </div>
+        </div>
+        <div class="wmh-actions">
+          <button class="wmh-btn" id="wmh-save-bazaar">Save</button>
+          <button class="wmh-btn wmh-secondary" id="wmh-reset-tracker">Reset</button>
+        </div>
+        <div class="wmh-tracker-stats" id="wmh-tracker-stats"></div>
+        <ol class="wmh-tracker-top" id="wmh-tracker-top"></ol>
+        <div class="wmh-alerts" id="wmh-alerts"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const trackBazaar = panel.querySelector("#wmh-track-bazaar");
+    const soldThreshold = panel.querySelector("#wmh-sold-threshold");
+    const rapidJump = panel.querySelector("#wmh-rapid-jump");
+    trackBazaar.checked = !!state.cfg.enableBazaarTracking;
+    soldThreshold.value = String(state.cfg.soldAlertUnits || 250);
+    rapidJump.value = String(state.cfg.rapidJumpUnits || 40);
+
+    state.trackerEls = {
+      stats: panel.querySelector("#wmh-tracker-stats"),
+      top: panel.querySelector("#wmh-tracker-top"),
+      alerts: panel.querySelector("#wmh-alerts"),
+    };
+    renderBazaarTracker();
+
+    panel.querySelector("#wmh-save-bazaar").addEventListener("click", () => {
+      state.cfg.enableBazaarTracking = !!trackBazaar.checked;
+      state.cfg.soldAlertUnits = Math.max(1, Number(soldThreshold.value) || 250);
+      state.cfg.rapidJumpUnits = Math.max(1, Number(rapidJump.value) || 40);
+      saveConfig();
+      resetBazaarTracker();
+      runBazaarTracker();
+    });
+
+    panel.querySelector("#wmh-reset-tracker").addEventListener("click", () => {
+      resetBazaarTracker();
+      runBazaarTracker();
+    });
+
+    panel.querySelector("#wmh-bazaar-head").addEventListener("click", () => {
+      panel.classList.toggle("wmh-collapsed");
+      panel.querySelector("#wmh-bazaar-collapse-indicator").textContent =
+        panel.classList.contains("wmh-collapsed") ? "▸" : "▾";
+    });
+  }
+
   function setupObserver() {
     const debouncedScan = debounce(scanPage, 500);
 
@@ -846,7 +948,36 @@
     state.scanTimer = setInterval(scanPage, 3000);
   }
 
+  function setupBazaarObserver() {
+    const debouncedTrack = debounce(runBazaarTracker, 250);
+    state.observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.addedNodes?.length || m.removedNodes?.length) {
+          debouncedTrack();
+          break;
+        }
+      }
+    });
+    state.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  function startBazaarLoop() {
+    if (state.scanTimer) clearInterval(state.scanTimer);
+    state.scanTimer = setInterval(runBazaarTracker, Math.max(1000, Number(state.cfg.bazaarScanMs) || 1000));
+    runBazaarTracker();
+  }
+
   function init() {
+    if (isTornBazaarPage()) {
+      buildBazaarPanel();
+      setupBazaarObserver();
+      startBazaarLoop();
+      return;
+    }
+
     buildPanel();
     scanPage();
     setupObserver();
