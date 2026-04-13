@@ -20,8 +20,9 @@
     enabled: true,
     enableBazaarTracking: true,
     bazaarScanMs: 1000,
-    bazaarRemotePolling: true,
-    bazaarRemotePollMs: 5000,
+    bazaarAutoRefresh: true,
+    bazaarRefreshMs: 45000,
+    bazaarRefreshJitterPct: 20,
     soldAlertUnits: 250,
     rapidJumpUnits: 40,
     tornApiKey: "",
@@ -57,9 +58,8 @@
       totalGross: 0,
       alerts: [],
       soldAlertTriggered: false,
-      lastRemoteFetchAt: 0,
-      fetchInFlight: false,
       latestSource: "dom",
+      refreshTimer: null,
     },
   };
 
@@ -336,45 +336,6 @@
     return extractTornBazaarRowsFromRoot(document);
   }
 
-  async function fetchRemoteBazaarSnapshot() {
-    const url = `${location.origin}${location.pathname}${location.search}`;
-    const resp = await fetch(url, {
-      method: "GET",
-      credentials: "include",
-      cache: "no-store",
-    });
-    if (!resp.ok) throw new Error(`Remote bazaar fetch failed: HTTP ${resp.status}`);
-    const html = await resp.text();
-    const parsed = new DOMParser().parseFromString(html, "text/html");
-    return extractTornBazaarRowsFromRoot(parsed);
-  }
-
-  async function getLatestBazaarSnapshot() {
-    const nowTs = now();
-    const shouldRemotePoll =
-      !!state.cfg.bazaarRemotePolling &&
-      !state.tracker.fetchInFlight &&
-      (nowTs - state.tracker.lastRemoteFetchAt) >= Math.max(1000, Number(state.cfg.bazaarRemotePollMs) || 5000);
-
-    if (shouldRemotePoll) {
-      state.tracker.fetchInFlight = true;
-      try {
-        const remote = await fetchRemoteBazaarSnapshot();
-        state.tracker.lastRemoteFetchAt = now();
-        state.tracker.fetchInFlight = false;
-        state.tracker.latestSource = "remote";
-        return remote;
-      } catch (err) {
-        state.tracker.fetchInFlight = false;
-        state.tracker.latestSource = "dom";
-        state.tracker.alerts.push(`Remote poll failed, falling back to DOM snapshot.`);
-      }
-    }
-
-    state.tracker.latestSource = "dom";
-    return extractTornBazaarRows();
-  }
-
   function resetBazaarTracker() {
     state.tracker.mode = "idle";
     state.tracker.running = false;
@@ -386,10 +347,54 @@
     state.tracker.totalGross = 0;
     state.tracker.alerts = [];
     state.tracker.soldAlertTriggered = false;
-    state.tracker.lastRemoteFetchAt = 0;
-    state.tracker.fetchInFlight = false;
     state.tracker.latestSource = "dom";
     renderBazaarTracker();
+  }
+
+  function saveBazaarSessionState() {
+    if (!isTornBazaarPage()) return;
+    const data = {
+      startedAt: state.tracker.startedAt,
+      totalUnits: state.tracker.totalUnits,
+      totalGross: state.tracker.totalGross,
+      totals: Array.from(state.tracker.totals.entries()),
+      alerts: state.tracker.alerts.slice(-20),
+      soldAlertTriggered: state.tracker.soldAlertTriggered,
+    };
+    sessionStorage.setItem("wmh_bazaar_session_v1", JSON.stringify(data));
+  }
+
+  function loadBazaarSessionState() {
+    try {
+      const raw = sessionStorage.getItem("wmh_bazaar_session_v1");
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      state.tracker.startedAt = Number(data.startedAt) || 0;
+      state.tracker.totalUnits = Number(data.totalUnits) || 0;
+      state.tracker.totalGross = Number(data.totalGross) || 0;
+      state.tracker.totals = new Map(Array.isArray(data.totals) ? data.totals : []);
+      state.tracker.alerts = Array.isArray(data.alerts) ? data.alerts : [];
+      state.tracker.soldAlertTriggered = !!data.soldAlertTriggered;
+      if (state.tracker.startedAt) {
+        state.tracker.mode = "tracking";
+      }
+    } catch {
+      // ignore invalid stored tracker state
+    }
+  }
+
+  function scheduleBazaarRefresh() {
+    if (state.tracker.refreshTimer) clearTimeout(state.tracker.refreshTimer);
+    if (!state.cfg.bazaarAutoRefresh || !isTornBazaarPage()) return;
+    const baseMs = Math.max(5000, Number(state.cfg.bazaarRefreshMs) || 45000);
+    const jitterPct = Math.max(0, Math.min(80, Number(state.cfg.bazaarRefreshJitterPct) || 20));
+    const jitterWindow = baseMs * (jitterPct / 100);
+    const offset = (Math.random() * 2 - 1) * jitterWindow;
+    const delay = Math.max(5000, Math.round(baseMs + offset));
+    state.tracker.refreshTimer = setTimeout(() => {
+      saveBazaarSessionState();
+      location.reload();
+    }, delay);
   }
 
   function renderBazaarTracker(extra = "") {
@@ -431,14 +436,15 @@
       : "";
   }
 
-  async function runBazaarTracker() {
+  function runBazaarTracker() {
     if (!state.cfg.enableBazaarTracking || !isTornBazaarPage()) {
       renderBazaarTracker();
       return;
     }
 
-    // Tracker uses DOM snapshots, optionally refreshed from remote bazaar HTML polling.
-    const snapshot = await getLatestBazaarSnapshot();
+    // Tracker uses on-page DOM snapshots.
+    state.tracker.latestSource = "dom";
+    const snapshot = extractTornBazaarRows();
     const scanTs = now();
     if (!snapshot.size) {
       renderBazaarTracker("No bazaar rows detected.");
@@ -483,6 +489,7 @@
     }
     state.tracker.lastScanAt = scanTs;
     state.tracker.lastSnapshot = snapshot;
+    saveBazaarSessionState();
     renderBazaarTracker(`Tracking ${snapshot.size} items. Last scan delta: ${deltaUnits}`);
   }
 
@@ -932,12 +939,18 @@
           </div>
         </div>
         <div class="wmh-check">
-          <input id="wmh-remote-poll" type="checkbox">
-          <label for="wmh-remote-poll" style="margin:0;">Enable remote refresh polling</label>
+          <input id="wmh-auto-refresh" type="checkbox">
+          <label for="wmh-auto-refresh" style="margin:0;">Enable timed page refresh</label>
         </div>
-        <div class="wmh-row">
-          <label for="wmh-remote-poll-ms">Remote poll ms</label>
-          <input id="wmh-remote-poll-ms" type="number" min="1000" step="500">
+        <div class="wmh-inline">
+          <div class="wmh-row">
+            <label for="wmh-refresh-ms">Refresh ms</label>
+            <input id="wmh-refresh-ms" type="number" min="5000" step="1000">
+          </div>
+          <div class="wmh-row">
+            <label for="wmh-refresh-jitter">Jitter %</label>
+            <input id="wmh-refresh-jitter" type="number" min="0" max="80" step="1">
+          </div>
         </div>
         <div class="wmh-actions">
           <button class="wmh-btn" id="wmh-save-bazaar">Save</button>
@@ -953,13 +966,15 @@
     const trackBazaar = panel.querySelector("#wmh-track-bazaar");
     const soldThreshold = panel.querySelector("#wmh-sold-threshold");
     const rapidJump = panel.querySelector("#wmh-rapid-jump");
-    const remotePoll = panel.querySelector("#wmh-remote-poll");
-    const remotePollMs = panel.querySelector("#wmh-remote-poll-ms");
+    const autoRefresh = panel.querySelector("#wmh-auto-refresh");
+    const refreshMs = panel.querySelector("#wmh-refresh-ms");
+    const refreshJitter = panel.querySelector("#wmh-refresh-jitter");
     trackBazaar.checked = !!state.cfg.enableBazaarTracking;
     soldThreshold.value = String(state.cfg.soldAlertUnits || 250);
     rapidJump.value = String(state.cfg.rapidJumpUnits || 40);
-    remotePoll.checked = !!state.cfg.bazaarRemotePolling;
-    remotePollMs.value = String(state.cfg.bazaarRemotePollMs || 5000);
+    autoRefresh.checked = !!state.cfg.bazaarAutoRefresh;
+    refreshMs.value = String(state.cfg.bazaarRefreshMs || 45000);
+    refreshJitter.value = String(state.cfg.bazaarRefreshJitterPct || 20);
 
     state.trackerEls = {
       stats: panel.querySelector("#wmh-tracker-stats"),
@@ -972,15 +987,18 @@
       state.cfg.enableBazaarTracking = !!trackBazaar.checked;
       state.cfg.soldAlertUnits = Math.max(1, Number(soldThreshold.value) || 250);
       state.cfg.rapidJumpUnits = Math.max(1, Number(rapidJump.value) || 40);
-      state.cfg.bazaarRemotePolling = !!remotePoll.checked;
-      state.cfg.bazaarRemotePollMs = Math.max(1000, Number(remotePollMs.value) || 5000);
+      state.cfg.bazaarAutoRefresh = !!autoRefresh.checked;
+      state.cfg.bazaarRefreshMs = Math.max(5000, Number(refreshMs.value) || 45000);
+      state.cfg.bazaarRefreshJitterPct = Math.max(0, Math.min(80, Number(refreshJitter.value) || 20));
       saveConfig();
       resetBazaarTracker();
+      scheduleBazaarRefresh();
       runBazaarTracker();
     });
 
     panel.querySelector("#wmh-reset-tracker").addEventListener("click", () => {
       resetBazaarTracker();
+      scheduleBazaarRefresh();
       runBazaarTracker();
     });
 
@@ -1032,11 +1050,13 @@
   function startBazaarLoop() {
     if (state.scanTimer) clearInterval(state.scanTimer);
     state.scanTimer = setInterval(runBazaarTracker, Math.max(1000, Number(state.cfg.bazaarScanMs) || 1000));
+    scheduleBazaarRefresh();
     runBazaarTracker();
   }
 
   function init() {
     if (isTornBazaarPage()) {
+      loadBazaarSessionState();
       buildBazaarPanel();
       setupBazaarObserver();
       startBazaarLoop();
