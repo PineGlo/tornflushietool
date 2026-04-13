@@ -761,6 +761,19 @@
             await sleep(rand(10, 25));
             const success = await doDeposit();
             if (success) {
+                await sleep(rand(80, 140));
+
+                const vaultAfterDeposit = getVaultTotal();
+                const onHandAfterDeposit = getCash();
+                const vaultIsFull = Number.isFinite(vaultAfterDeposit) && vaultAfterDeposit >= VAULT_CAP;
+                const hasCashRemaining = Number.isFinite(onHandAfterDeposit) && onHandAfterDeposit > 0;
+
+                if (vaultIsFull && hasCashRemaining) {
+                    setDepositRequest({ ...request, target: 'faction' });
+                    goToFactionArmoryPage();
+                    return;
+                }
+
                 clearDepositRequest();
                 await sleep(rand(80, 140));
             }
