@@ -59,7 +59,8 @@
             apiKey: '',
             forceFreshApi: false,
             hospSoonEnabled: false,
-            hospSoonMaxMinutes: 3
+            hospSoonMaxMinutes: 3,
+            autoAttackOnZero: false
         },
 
         ffCache: new Map(),       // playerId -> FF row
@@ -98,7 +99,10 @@
 
         attackHospital: {
             untilMs: null,
-            refreshInFlight: false
+            refreshInFlight: false,
+            autoAttackArmed: false,
+            autoAttackTriggered: false,
+            uiStatus: null
         }
     };
 
@@ -935,6 +939,10 @@
         return Math.max(0, apiRow.untilMs - nowMs());
     }
 
+    function isHospitalStateText(value) {
+        return normalizeStatusText(value).includes('hospital');
+    }
+
     function evaluateCard(item) {
         if (item.reward < state.settings.minReward) {
             return { match: false, reason: 'reward low', ffRow: null, apiRow: null };
@@ -1094,6 +1102,113 @@
         return Number.isFinite(id) && id > 0 ? id : null;
     }
 
+    function setAttackUiStatus(text) {
+        if (state.attackHospital.uiStatus) {
+            state.attackHospital.uiStatus.textContent = text;
+        }
+    }
+
+    function tryStartAttackNow() {
+        if (state.attackHospital.autoAttackTriggered) return true;
+
+        const controls = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
+        const attackControl = controls.find((el) => {
+            const text = String(el.value || el.textContent || '').trim().toLowerCase();
+            if (!text.includes('attack')) return false;
+            if (el.disabled) return false;
+            return true;
+        });
+
+        if (!attackControl) {
+            setAttackUiStatus('Auto-start armed: waiting for attack button...');
+            return false;
+        }
+
+        state.attackHospital.autoAttackTriggered = true;
+        setAttackUiStatus('Auto-start triggered: clicked attack.');
+        attackControl.click();
+        return true;
+    }
+
+    function maybeAutoStartAttackFromApi(result) {
+        if (!state.settings.autoAttackOnZero) return;
+        if (!state.attackHospital.autoAttackArmed) return;
+        if (!result || !result.ok) return;
+        if (isHospitalStateText(result.state)) return;
+
+        tryStartAttackNow();
+    }
+
+    function buildAttackUI() {
+        if (document.querySelector('.bha-attack-panel')) return;
+
+        const panel = createEl('div', {
+            className: 'bha-attack-panel',
+            style: {
+                position: 'fixed',
+                top: '120px',
+                right: '18px',
+                zIndex: 999999,
+                background: 'rgba(18, 22, 28, 0.96)',
+                color: '#eef4ff',
+                border: '1px solid rgba(110, 155, 255, 0.24)',
+                borderRadius: '12px',
+                boxShadow: '0 10px 28px rgba(0,0,0,0.38)',
+                padding: '10px',
+                width: '300px',
+                font: '13px/1.35 Arial, sans-serif'
+            }
+        });
+
+        const title = createEl('div', {
+            text: 'Attack Page Auto-Start',
+            style: { fontWeight: '700', marginBottom: '8px' }
+        });
+
+        const toggleWrap = createEl('label', {
+            style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }
+        }, [
+            document.createTextNode('Enable auto-start at zero'),
+            createEl('input', {
+                type: 'checkbox',
+                checked: !!state.settings.autoAttackOnZero,
+                onchange: (e) => {
+                    state.settings.autoAttackOnZero = !!e.target.checked;
+                    saveSettings();
+                }
+            })
+        ]);
+
+        const armBtn = createEl('button', {
+            className: 'bha-btn',
+            textContent: 'Arm auto-start',
+            onclick: () => {
+                state.attackHospital.autoAttackArmed = true;
+                state.attackHospital.autoAttackTriggered = false;
+                setAttackUiStatus('Auto-start armed. Waiting for release...');
+            }
+        });
+
+        const disarmBtn = createEl('button', {
+            className: 'bha-btn',
+            textContent: 'Disarm',
+            style: { marginLeft: '8px' },
+            onclick: () => {
+                state.attackHospital.autoAttackArmed = false;
+                setAttackUiStatus('Auto-start disarmed.');
+            }
+        });
+
+        const status = createEl('div', {
+            text: 'Auto-start idle.',
+            style: { marginTop: '8px', opacity: '0.9', fontSize: '12px' }
+        });
+        state.attackHospital.uiStatus = status;
+
+        panel.append(title, toggleWrap, armBtn, disarmBtn, status);
+        document.body.appendChild(panel);
+    }
+
     function renderAttackHospitalStatus(apiRow) {
         const titleEl = document.querySelector('.title___fOh2J');
         if (!titleEl) return;
@@ -1104,6 +1219,9 @@
             titleEl.textContent = `This person is currently in hospital and cannot be attacked. Release ETA: ${formatRemaining(remainingFallback)}.`;
             if (remainingFallback === 0) {
                 refreshAttackHospitalStatus();
+                if (state.settings.autoAttackOnZero && state.attackHospital.autoAttackArmed) {
+                    setAttackUiStatus('Zero reached: forcing API refresh...');
+                }
             }
             return;
         }
@@ -1122,6 +1240,7 @@
         if (!result || !result.ok) return;
         state.attackHospital.untilMs = result.untilMs || null;
         renderAttackHospitalStatus(result);
+        maybeAutoStartAttackFromApi(result);
     }
 
     function startAttackHospitalLoop() {
@@ -1186,6 +1305,7 @@
             restartRefreshLoop();
             scanAndRender();
         } else if (isAttackPage()) {
+            buildAttackUI();
             startAttackHospitalLoop();
         }
         log('Bounty Hunter Assistant initialized');
