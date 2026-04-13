@@ -363,6 +363,39 @@
         target.appendChild(badge);
     }
 
+    function rarityFromAriaLabel(aria) {
+        const t = (aria || '').toLowerCase();
+        if (t.includes('extremely rare') || t.includes('very rare')) return 'red';
+        if (t.includes('extraordinary') || /\brare\b/.test(t)) return 'orange';
+        if (t.includes('uncommon') || t.includes('yellow')) return 'yellow';
+        return null;
+    }
+
+    function bonusCountFromAriaLabel(aria) {
+        const t = (aria || '').toLowerCase();
+        let count = 0;
+        for (const b of bonusList) {
+            const n = b.title.toLowerCase();
+            if (new RegExp(`\\b${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(t)) count++;
+        }
+        return Math.min(2, count);
+    }
+
+    function injectCollapsedAuctionButtons() {
+        document.querySelectorAll('button.view-info.wai-btn').forEach(btn => {
+            const aria = btn.getAttribute('aria-label') || '';
+            if (!aria) return;
+
+            const nameMatch = aria.match(/^\s*([^.(]+?)\s*\(/);
+            const itemName = nameMatch ? nameMatch[1].trim() : '';
+            const rarityKey = rarityFromAriaLabel(aria);
+            const itemType = /armor:/i.test(aria) ? 'armor' : 'weapon';
+            const bonusCount = bonusCountFromAriaLabel(aria);
+            const bbAmount = calcBunkerBucks(itemName, rarityKey, bonusCount, itemType);
+            injectBBBage(btn, bbAmount);
+        });
+    }
+
     const profileLink = (id, name) => id ? `<a href="https://www.torn.com/profiles.php?XID=${id}" target="_blank">${name||id}</a>` : 'Unknown';
 
     // Delta comparison vs sourceStats
@@ -1890,6 +1923,8 @@ function parseCurrentListingPrice() {
     }
 
     function injectAuction() {
+        injectCollapsedAuctionButtons();
+
         for (const sel of ['.itemInfoWrapper___nA_eu','[class*="itemInfoWrapper"]','[class*="itemInfo___"]']) {
             const els = document.querySelectorAll(sel);
             if (!els.length) continue;
