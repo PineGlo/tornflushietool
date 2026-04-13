@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Weav3r Mugging Helper
 // @namespace    Violentmonkey Scripts
-// @version      1.0.0
+// @version      1.1.0
 // @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links.
 // @match        https://weav3r.dev/item/*
+// @match        https://www.torn.com/bazaar.php*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      api.torn.com
@@ -17,6 +18,7 @@
   const STORAGE_KEY = "weav3r_mugging_helper_v1";
   const DEFAULTS = {
     enabled: true,
+    enableBazaarTracking: false,
     tornApiKey: "",
     ffApiKey: "",
     statThresholdText: "500m",
@@ -38,6 +40,13 @@
     scanTimer: null,
     tickTimer: null,
     thresholdValue: 0,
+    trackerEls: null,
+    tracker: {
+      running: false,
+      lastSnapshot: new Map(),
+      totals: new Map(), // name -> { name, units, gross }
+      totalGross: 0,
+    },
   };
 
   state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
@@ -129,6 +138,28 @@
       color: #93c5fd;
       line-height: 1.35;
       word-break: break-word;
+    }
+    .wmh-divider {
+      margin: 12px 0 8px;
+      border-top: 1px solid rgba(148, 163, 184, 0.2);
+      padding-top: 8px;
+      color: #cbd5e1;
+      font-weight: 700;
+    }
+    .wmh-tracker-stats {
+      margin-top: 8px;
+      color: #bfdbfe;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .wmh-tracker-top {
+      margin-top: 4px;
+      padding-left: 16px;
+      font-size: 11px;
+    }
+    .wmh-tracker-top li {
+      margin: 3px 0;
+      color: #e2e8f0;
     }
 
     .wmh-meta {
@@ -229,6 +260,124 @@
     if (abs >= 1e6) return (n / 1e6).toFixed(2).replace(/\.00$/, "") + "m";
     if (abs >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
     return String(Math.round(n));
+  }
+
+  function isTornBazaarPage() {
+    return location.hostname === "www.torn.com" && location.pathname.includes("bazaar.php");
+  }
+
+  function parseMoney(text) {
+    const m = String(text || "").match(/\$([\d,]+(?:\.\d+)?)/);
+    if (!m) return null;
+    const n = Number(m[1].replace(/,/g, ""));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function parseStock(text) {
+    const m = String(text || "").match(/\(([\d,]+)\s+in stock\)/i);
+    if (!m) return null;
+    const n = Number(m[1].replace(/,/g, ""));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function extractTornBazaarRows() {
+    const rows = Array.from(document.querySelectorAll("li, tr, div"));
+    const snapshot = new Map();
+
+    for (const row of rows) {
+      const text = row.textContent?.replace(/\s+/g, " ").trim() || "";
+      if (!/\([\d,]+\s+in stock\)/i.test(text) || !/\$[\d,]+/.test(text)) continue;
+
+      const nameEl =
+        row.querySelector('a[href*="item.php"]') ||
+        row.querySelector('[class*="name" i]') ||
+        row.querySelector("strong");
+
+      let name = (nameEl?.textContent || "").replace(/\s+/g, " ").trim();
+      if (!name) {
+        name = text.split("$")[0].replace(/\s+/g, " ").trim();
+      }
+      const price = parseMoney(text);
+      const qty = parseStock(text);
+      if (!name || !Number.isFinite(price) || !Number.isFinite(qty)) continue;
+      snapshot.set(name, { name, price, qty });
+    }
+
+    return snapshot;
+  }
+
+  function resetBazaarTracker() {
+    state.tracker.running = false;
+    state.tracker.lastSnapshot = new Map();
+    state.tracker.totals = new Map();
+    state.tracker.totalGross = 0;
+    renderBazaarTracker();
+  }
+
+  function renderBazaarTracker(extra = "") {
+    if (!state.trackerEls?.stats || !state.trackerEls?.top) return;
+    if (!state.cfg.enableBazaarTracking) {
+      state.trackerEls.stats.textContent = "Tracker disabled.";
+      state.trackerEls.top.innerHTML = "";
+      return;
+    }
+    if (!isTornBazaarPage()) {
+      state.trackerEls.stats.textContent = "Open a Torn bazaar page to track sales.";
+      state.trackerEls.top.innerHTML = "";
+      return;
+    }
+
+    state.trackerEls.stats.textContent =
+      `Total sold (tracked): $${Math.round(state.tracker.totalGross).toLocaleString()}${extra ? ` • ${extra}` : ""}`;
+
+    const top3 = Array.from(state.tracker.totals.values())
+      .sort((a, b) => b.gross - a.gross)
+      .slice(0, 3);
+
+    if (!top3.length) {
+      state.trackerEls.top.innerHTML = "<li>No sales tracked yet.</li>";
+      return;
+    }
+
+    state.trackerEls.top.innerHTML = top3
+      .map((item, i) => `<li>#${i + 1} ${item.name}: $${Math.round(item.gross).toLocaleString()} (${item.units} sold)</li>`)
+      .join("");
+  }
+
+  function runBazaarTracker() {
+    if (!state.cfg.enableBazaarTracking || !isTornBazaarPage()) {
+      renderBazaarTracker();
+      return;
+    }
+
+    const snapshot = extractTornBazaarRows();
+    if (!snapshot.size) {
+      renderBazaarTracker("No bazaar rows detected.");
+      return;
+    }
+
+    if (!state.tracker.running) {
+      state.tracker.running = true;
+      state.tracker.lastSnapshot = snapshot;
+      renderBazaarTracker(`Tracking ${snapshot.size} items.`);
+      return;
+    }
+
+    for (const [name, prev] of state.tracker.lastSnapshot.entries()) {
+      const curr = snapshot.get(name);
+      if (!curr) continue;
+      const sold = Math.max(0, prev.qty - curr.qty);
+      if (!sold) continue;
+      const gross = sold * prev.price;
+      const entry = state.tracker.totals.get(name) || { name, units: 0, gross: 0 };
+      entry.units += sold;
+      entry.gross += gross;
+      state.tracker.totals.set(name, entry);
+      state.tracker.totalGross += gross;
+    }
+
+    state.tracker.lastSnapshot = snapshot;
+    renderBazaarTracker(`Tracking ${snapshot.size} items.`);
   }
 
   function now() {
@@ -343,6 +492,7 @@
       queueIfNeeded(userId);
       renderSeller(userId);
     }
+    runBazaarTracker();
     updateStatusLine();
   }
 
@@ -589,6 +739,16 @@
           <input id="wmh-enabled" type="checkbox">
           <label for="wmh-enabled" style="margin:0;">Enabled</label>
         </div>
+        <div class="wmh-divider">Torn bazaar sales tracker</div>
+        <div class="wmh-check">
+          <input id="wmh-track-bazaar" type="checkbox">
+          <label for="wmh-track-bazaar" style="margin:0;">Enable tracking</label>
+        </div>
+        <div class="wmh-actions">
+          <button class="wmh-btn wmh-secondary" id="wmh-reset-tracker">Reset tracked sales</button>
+        </div>
+        <div class="wmh-tracker-stats" id="wmh-tracker-stats"></div>
+        <ol class="wmh-tracker-top" id="wmh-tracker-top"></ol>
 
         <div class="wmh-actions">
           <button class="wmh-btn" id="wmh-save">Save</button>
@@ -606,6 +766,7 @@
     const batch = panel.querySelector("#wmh-batch");
     const tick = panel.querySelector("#wmh-tick");
     const enabled = panel.querySelector("#wmh-enabled");
+    const trackBazaar = panel.querySelector("#wmh-track-bazaar");
 
     tornKey.value = state.cfg.tornApiKey || "";
     ffKey.value = state.cfg.ffApiKey || "";
@@ -613,6 +774,16 @@
     batch.value = String(state.cfg.batchSize || 10);
     tick.value = String(state.cfg.tickMs || 8000);
     enabled.checked = !!state.cfg.enabled;
+    trackBazaar.checked = !!state.cfg.enableBazaarTracking;
+    state.trackerEls = {
+      stats: panel.querySelector("#wmh-tracker-stats"),
+      top: panel.querySelector("#wmh-tracker-top"),
+    };
+    renderBazaarTracker();
+
+    panel.querySelector("#wmh-reset-tracker").addEventListener("click", () => {
+      resetBazaarTracker();
+    });
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
       state.cfg.tornApiKey = tornKey.value.trim();
@@ -621,9 +792,11 @@
       state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
       state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
       state.cfg.enabled = !!enabled.checked;
+      state.cfg.enableBazaarTracking = !!trackBazaar.checked;
 
       state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
       saveConfig();
+      if (!state.cfg.enableBazaarTracking) resetBazaarTracker();
 
       // Requeue all visible sellers after config change
       for (const userId of state.sellers.keys()) {
