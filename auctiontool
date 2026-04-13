@@ -371,28 +371,35 @@
     }
 
     function injectCollapsedBBInfo(btn, bbAmount) {
-        btn.querySelector('.ah-bb-inline')?.remove();
-        btn.querySelector('.ah-bb-always')?.remove();
+        const row = btn.closest('li, .item-cont-wrap, [class*="itemInfoWrapper"], [class*="itemInfo___"], [class*="auction"]') || btn.parentElement;
+        if (!row) return;
+
+        row.querySelector('.ah-bb-inline')?.remove();
         if (bbAmount == null) return;
 
         const info = bbDisplayText(bbAmount);
-        if (getComputedStyle(btn).position === 'static') btn.style.position = 'relative';
-        const always = document.createElement('span');
-        always.className = 'bonus-attachment ah-bb-inline ah-bb-always';
-        always.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
-        if (info.title) always.title = info.title;
-        btn.appendChild(always);
-
-        const attachments = btn.querySelectorAll('.bonus-attachment');
-        if (!attachments.length) {
-            injectBBBage(btn, bbAmount);
-            return;
+        let container = row.querySelector('.infobonuses');
+        if (!container) {
+            container = document.createElement('div');
+            container.className = 'infobonuses';
+            btn.insertAdjacentElement('afterend', container);
         }
+
         const wrap = document.createElement('span');
         wrap.className = 'bonus-attachment ah-bb-inline';
         wrap.innerHTML = `<i class="bonus-attachment-item-bb-bonus"></i><span class="label-value t-overflow">${info.text}</span>`;
         if (info.title) wrap.title = info.title;
-        attachments[0].insertAdjacentElement('beforebegin', wrap);
+        container.insertAdjacentElement('afterbegin', wrap);
+    }
+
+    function rarityFromItemPlate(btn, fallbackRarity = null) {
+        const row = btn.closest('li, .item-cont-wrap, [class*="itemInfoWrapper"], [class*="itemInfo___"], [class*="auction"]') || btn.parentElement;
+        const plate = row?.querySelector('.item-plate');
+        const cls = plate?.className?.toLowerCase() || '';
+        if (cls.includes('glow-red')) return 'red';
+        if (cls.includes('glow-orange')) return 'orange';
+        if (cls.includes('glow-yellow')) return 'yellow';
+        return fallbackRarity;
     }
 
     function rarityFromAriaLabel(aria) {
@@ -420,7 +427,7 @@
 
             const nameMatch = aria.match(/^\s*([^.(]+?)\s*\(/);
             const itemName = nameMatch ? nameMatch[1].trim() : '';
-            const rarityKey = rarityFromAriaLabel(aria);
+            const rarityKey = rarityFromItemPlate(btn, rarityFromAriaLabel(aria));
             const itemType = /armor:/i.test(aria) ? 'armor' : 'weapon';
             const bonusCount = bonusCountFromAriaLabel(aria);
             const bbAmount = calcBunkerBucks(itemName, rarityKey, bonusCount, itemType);
@@ -962,16 +969,6 @@ function parseCurrentListingPrice() {
         .ah-bb-inline .label-value {
             color: #ffd666 !important;
             font-weight: 700;
-        }
-        .ah-bb-always {
-            position: absolute;
-            top: 2px;
-            left: 2px;
-            z-index: 6;
-            background: rgba(0,0,0,0.65);
-            border-radius: 3px;
-            padding: 1px 4px;
-            max-width: calc(100% - 6px);
         }
         .bonus-attachment-item-bb-bonus::before {
             content: "BB";
