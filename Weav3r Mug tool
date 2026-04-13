@@ -1,0 +1,684 @@
+// ==UserScript==
+// @name         Weav3r Mugging Helper
+// @namespace    Violentmonkey Scripts
+// @version      1.0.0
+// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links.
+// @match        https://weav3r.dev/item/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @connect      api.torn.com
+// @connect      ffscouter.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const STORAGE_KEY = "weav3r_mugging_helper_v1";
+  const DEFAULTS = {
+    enabled: true,
+    tornApiKey: "",
+    ffApiKey: "",
+    statThresholdText: "500m",
+    batchSize: 10,
+    tickMs: 8000,
+    tornTtlMs: 60 * 1000,
+    ffTtlMs: 60 * 60 * 1000,
+    debug: false,
+  };
+
+  const state = {
+    cfg: loadConfig(),
+    sellers: new Map(),      // userId -> seller object
+    tornCache: new Map(),    // userId -> { status, ts, raw }
+    ffCache: new Map(),      // userId -> { bs_estimate, bs_estimate_human, fair_fight, ts, raw }
+    pendingTorn: new Set(),
+    pendingFF: new Set(),
+    observer: null,
+    scanTimer: null,
+    tickTimer: null,
+    thresholdValue: 0,
+  };
+
+  state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
+
+  GM_addStyle(`
+    .wmh-panel {
+      position: fixed;
+      top: 88px;
+      right: 18px;
+      z-index: 999999;
+      width: 300px;
+      background: rgba(15, 23, 42, 0.96);
+      color: #e5e7eb;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 12px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      backdrop-filter: blur(8px);
+    }
+    .wmh-panel * { box-sizing: border-box; }
+    .wmh-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      font-weight: 700;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+      cursor: pointer;
+      user-select: none;
+    }
+    .wmh-body {
+      padding: 10px 12px 12px;
+    }
+    .wmh-collapsed .wmh-body {
+      display: none;
+    }
+    .wmh-row {
+      margin-bottom: 8px;
+    }
+    .wmh-row label {
+      display: block;
+      margin-bottom: 4px;
+      color: #cbd5e1;
+      font-size: 11px;
+    }
+    .wmh-row input[type="text"],
+    .wmh-row input[type="password"],
+    .wmh-row input[type="number"] {
+      width: 100%;
+      padding: 7px 8px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      border-radius: 8px;
+      background: rgba(30, 41, 59, 0.95);
+      color: #f8fafc;
+      outline: none;
+    }
+    .wmh-inline {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .wmh-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0;
+    }
+    .wmh-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .wmh-btn {
+      flex: 1;
+      padding: 8px 10px;
+      border: 0;
+      border-radius: 8px;
+      background: #2563eb;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .wmh-btn.wmh-secondary {
+      background: #334155;
+    }
+    .wmh-statusline {
+      margin-top: 10px;
+      color: #93c5fd;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .wmh-meta {
+      margin-top: 4px;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .wmh-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(15, 23, 42, 0.72);
+      color: #e2e8f0;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .wmh-badge.ok {
+      background: rgba(22, 101, 52, 0.88);
+      border-color: rgba(74, 222, 128, 0.55);
+      color: #dcfce7;
+    }
+    .wmh-badge.bad {
+      background: rgba(127, 29, 29, 0.88);
+      border-color: rgba(248, 113, 113, 0.55);
+      color: #fee2e2;
+    }
+    .wmh-badge.neutral {
+      background: rgba(51, 65, 85, 0.88);
+      color: #e2e8f0;
+    }
+    .wmh-attack {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: #1d4ed8;
+      color: #fff !important;
+      font-weight: 700;
+      text-decoration: none !important;
+    }
+    .wmh-attack:hover {
+      filter: brightness(1.08);
+      text-decoration: none !important;
+    }
+
+    .wmh-row-good {
+      outline: 1px solid rgba(74, 222, 128, 0.6) !important;
+      box-shadow: inset 0 0 0 9999px rgba(22, 101, 52, 0.15);
+    }
+  `);
+
+  function loadConfig() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+      return { ...DEFAULTS, ...parsed };
+    } catch {
+      return { ...DEFAULTS };
+    }
+  }
+
+  function saveConfig() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.cfg));
+  }
+
+  function log(...args) {
+    if (state.cfg.debug) console.log("[WMH]", ...args);
+  }
+
+  function parseHumanNumber(input) {
+    if (typeof input === "number") return input;
+    const raw = String(input || "").trim().toLowerCase().replace(/,/g, "");
+    if (!raw) return 0;
+    const match = raw.match(/^(\d+(?:\.\d+)?)([kmbt])?$/i);
+    if (!match) {
+      const asNum = Number(raw);
+      return Number.isFinite(asNum) ? asNum : 0;
+    }
+    const value = Number(match[1]);
+    const suffix = (match[2] || "").toLowerCase();
+    const mult =
+      suffix === "k" ? 1e3 :
+      suffix === "m" ? 1e6 :
+      suffix === "b" ? 1e9 :
+      suffix === "t" ? 1e12 : 1;
+    return value * mult;
+  }
+
+  function humanizeNumber(n) {
+    if (n == null || !Number.isFinite(n)) return "?";
+    const abs = Math.abs(n);
+    if (abs >= 1e12) return (n / 1e12).toFixed(2).replace(/\.00$/, "") + "t";
+    if (abs >= 1e9) return (n / 1e9).toFixed(2).replace(/\.00$/, "") + "b";
+    if (abs >= 1e6) return (n / 1e6).toFixed(2).replace(/\.00$/, "") + "m";
+    if (abs >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k";
+    return String(Math.round(n));
+  }
+
+  function now() {
+    return Date.now();
+  }
+
+  function isFresh(entry, ttlMs) {
+    return !!entry && (now() - entry.ts) < ttlMs;
+  }
+
+  function debounce(fn, wait) {
+    let t = null;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  function parseUserIdFromHref(href) {
+    if (!href) return null;
+    const match = href.match(/(?:userId=|XID=)(\d+)/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  function findSellerAnchors() {
+    return Array.from(document.querySelectorAll('a[href*="bazaar.php?userId="]'));
+  }
+
+  function findRowForAnchor(anchor) {
+    return (
+      anchor.closest('tr') ||
+      anchor.closest('[role="row"]') ||
+      anchor.closest('.grid') ||
+      anchor.closest('li') ||
+      anchor.parentElement?.parentElement ||
+      anchor.parentElement
+    );
+  }
+
+  function ensureSeller(userId, anchor) {
+    let seller = state.sellers.get(userId);
+    if (!seller) {
+      seller = {
+        userId,
+        anchor,
+        row: findRowForAnchor(anchor),
+        metaEl: null,
+        badgeEl: null,
+        attackEl: null,
+      };
+      state.sellers.set(userId, seller);
+    } else {
+      seller.anchor = anchor;
+      seller.row = findRowForAnchor(anchor);
+    }
+    ensureSellerUi(seller);
+    return seller;
+  }
+
+  function ensureSellerUi(seller) {
+    if (!seller.anchor || !seller.anchor.isConnected) return;
+
+    let meta = seller.anchor.parentElement?.querySelector(`.wmh-meta[data-wmh-id="${seller.userId}"]`);
+    if (!meta) {
+      meta = document.createElement("div");
+      meta.className = "wmh-meta";
+      meta.dataset.wmhId = String(seller.userId);
+
+      const badge = document.createElement("span");
+      badge.className = "wmh-badge neutral";
+      badge.textContent = "Checking...";
+
+      const attack = document.createElement("a");
+      attack.className = "wmh-attack";
+      attack.href = `https://www.torn.com/loader.php?sid=attack&user2ID=${seller.userId}`;
+      attack.target = "_blank";
+      attack.rel = "noopener noreferrer";
+      attack.textContent = "Attack";
+
+      meta.appendChild(badge);
+      meta.appendChild(attack);
+
+      seller.anchor.insertAdjacentElement("afterend", meta);
+
+      seller.metaEl = meta;
+      seller.badgeEl = badge;
+      seller.attackEl = attack;
+    } else {
+      seller.metaEl = meta;
+      seller.badgeEl = meta.querySelector(".wmh-badge");
+      seller.attackEl = meta.querySelector(".wmh-attack");
+      if (seller.attackEl) {
+        seller.attackEl.href = `https://www.torn.com/loader.php?sid=attack&user2ID=${seller.userId}`;
+      }
+    }
+  }
+
+  function queueIfNeeded(userId) {
+    const torn = state.tornCache.get(userId);
+    const ff = state.ffCache.get(userId);
+
+    if (!isFresh(torn, state.cfg.tornTtlMs)) state.pendingTorn.add(userId);
+    if (!isFresh(ff, state.cfg.ffTtlMs)) state.pendingFF.add(userId);
+  }
+
+  function scanPage() {
+    const anchors = findSellerAnchors();
+    for (const anchor of anchors) {
+      const userId = parseUserIdFromHref(anchor.href);
+      if (!userId) continue;
+      ensureSeller(userId, anchor);
+      queueIfNeeded(userId);
+      renderSeller(userId);
+    }
+    updateStatusLine();
+  }
+
+  function getTornStatusText(json) {
+    return (
+      json?.status?.description ||
+      json?.status?.details ||
+      json?.status?.state ||
+      json?.status ||
+      ""
+    );
+  }
+
+  function renderSeller(userId) {
+    const seller = state.sellers.get(userId);
+    if (!seller || !seller.anchor?.isConnected) return;
+
+    ensureSellerUi(seller);
+
+    const torn = state.tornCache.get(userId);
+    const ff = state.ffCache.get(userId);
+    const statusText = torn?.status || "…";
+    const bs = ff?.bs_estimate;
+    const threshold = state.thresholdValue;
+    const okay = statusText === "Okay";
+    const underCap = Number.isFinite(bs) && bs <= threshold;
+    const good = okay && underCap;
+
+    if (seller.badgeEl) {
+      seller.badgeEl.className = "wmh-badge neutral";
+
+      if (!torn && !ff) {
+        seller.badgeEl.textContent = "Checking...";
+      } else if (torn && !ff) {
+        seller.badgeEl.textContent = `${statusText} | FF...`;
+        seller.badgeEl.classList.add(statusText === "Okay" ? "ok" : "bad");
+      } else if (!torn && ff) {
+        seller.badgeEl.textContent = `...? | ${ff.bs_estimate_human || humanizeNumber(ff.bs_estimate)}`;
+      } else {
+        const bsText = ff.bs_estimate_human || humanizeNumber(ff.bs_estimate);
+        seller.badgeEl.textContent = `${statusText} | ${bsText}`;
+        if (good) {
+          seller.badgeEl.classList.add("ok");
+        } else if (statusText !== "Okay" || (Number.isFinite(bs) && bs > threshold)) {
+          seller.badgeEl.classList.add("bad");
+        } else {
+          seller.badgeEl.classList.add("neutral");
+        }
+      }
+    }
+
+    if (seller.row) {
+      seller.row.classList.toggle("wmh-row-good", good);
+    }
+  }
+
+  function updateStatusLine() {
+    const line = document.getElementById("wmh-statusline");
+    if (!line) return;
+
+    const visible = state.sellers.size;
+    const queuedTorn = state.pendingTorn.size;
+    const queuedFF = state.pendingFF.size;
+    line.textContent =
+      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Threshold: ${state.cfg.statThresholdText}`;
+  }
+
+  function takeFromSet(setObj, maxCount) {
+    const out = [];
+    for (const value of setObj) {
+      out.push(value);
+      if (out.length >= maxCount) break;
+    }
+    out.forEach(v => setObj.delete(v));
+    return out;
+  }
+
+  function gmGet(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        timeout: 20000,
+        onload: (resp) => {
+          if (resp.status >= 200 && resp.status < 300) {
+            resolve(resp);
+          } else {
+            reject(new Error(`HTTP ${resp.status}: ${resp.responseText || "request failed"}`));
+          }
+        },
+        onerror: (err) => reject(err),
+        ontimeout: () => reject(new Error("Request timed out")),
+      });
+    });
+  }
+
+  async function fetchFFBatch(userIds) {
+    if (!state.cfg.ffApiKey || !userIds.length) return;
+    const url =
+      `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(state.cfg.ffApiKey)}&targets=${encodeURIComponent(userIds.join(","))}`;
+
+    try {
+      const resp = await gmGet(url);
+      const data = JSON.parse(resp.responseText);
+      if (!Array.isArray(data)) {
+        log("Unexpected FF response:", data);
+        return;
+      }
+
+      const seen = new Set();
+      for (const item of data) {
+        if (!item || !item.player_id) continue;
+        seen.add(Number(item.player_id));
+        state.ffCache.set(Number(item.player_id), {
+          bs_estimate: Number.isFinite(item.bs_estimate) ? item.bs_estimate : null,
+          bs_estimate_human: item.bs_estimate_human || null,
+          fair_fight: Number.isFinite(item.fair_fight) ? item.fair_fight : null,
+          raw: item,
+          ts: now(),
+        });
+        renderSeller(Number(item.player_id));
+      }
+
+      for (const userId of userIds) {
+        if (!seen.has(userId)) {
+          state.ffCache.set(userId, {
+            bs_estimate: null,
+            bs_estimate_human: null,
+            fair_fight: null,
+            raw: null,
+            ts: now(),
+          });
+          renderSeller(userId);
+        }
+      }
+    } catch (err) {
+      log("FF batch failed:", err);
+      for (const userId of userIds) {
+        state.pendingFF.add(userId);
+      }
+    }
+  }
+
+  async function fetchTornStatus(userId) {
+    if (!state.cfg.tornApiKey || !userId) return;
+
+    // Old-style endpoint kept deliberately because it is simple and widely supported.
+    const url =
+      `https://api.torn.com/user/${userId}?selections=profile&key=${encodeURIComponent(state.cfg.tornApiKey)}`;
+
+    try {
+      const resp = await gmGet(url);
+      const data = JSON.parse(resp.responseText);
+
+      if (data?.error) {
+        log(`Torn API error for ${userId}:`, data.error);
+        return;
+      }
+
+      const status = String(getTornStatusText(data) || "").trim();
+      state.tornCache.set(userId, {
+        status,
+        raw: data,
+        ts: now(),
+      });
+      renderSeller(userId);
+    } catch (err) {
+      log(`Torn status failed for ${userId}:`, err);
+      state.pendingTorn.add(userId);
+    }
+  }
+
+  async function processQueues() {
+    if (!state.cfg.enabled) return;
+
+    scanPage();
+
+    const batchSize = Math.max(1, Number(state.cfg.batchSize) || 10);
+
+    const ffIds = takeFromSet(state.pendingFF, batchSize);
+    const tornIds = takeFromSet(state.pendingTorn, batchSize);
+
+    if (ffIds.length) {
+      fetchFFBatch(ffIds);
+    }
+
+    if (tornIds.length) {
+      Promise.allSettled(tornIds.map(fetchTornStatus)).then(() => {
+        for (const id of tornIds) renderSeller(id);
+      });
+    }
+
+    updateStatusLine();
+  }
+
+  function startLoop() {
+    stopLoop();
+    state.tickTimer = setInterval(processQueues, Math.max(1000, Number(state.cfg.tickMs) || 8000));
+    processQueues();
+  }
+
+  function stopLoop() {
+    if (state.tickTimer) clearInterval(state.tickTimer);
+    state.tickTimer = null;
+  }
+
+  function buildPanel() {
+    const panel = document.createElement("div");
+    panel.className = "wmh-panel";
+    panel.id = "wmh-panel";
+    panel.innerHTML = `
+      <div class="wmh-head" id="wmh-head">
+        <span>Weav3r Mugging Helper</span>
+        <span id="wmh-collapse-indicator">▾</span>
+      </div>
+      <div class="wmh-body">
+        <div class="wmh-row">
+          <label for="wmh-torn-key">Torn API key</label>
+          <input id="wmh-torn-key" type="password" placeholder="Your Torn API key">
+        </div>
+
+        <div class="wmh-row">
+          <label for="wmh-ff-key">FF Scouter API key</label>
+          <input id="wmh-ff-key" type="password" placeholder="Your FF Scouter key">
+        </div>
+
+        <div class="wmh-row">
+          <label for="wmh-threshold">Max estimated stats</label>
+          <input id="wmh-threshold" type="text" placeholder="e.g. 500m, 1.2b">
+        </div>
+
+        <div class="wmh-inline">
+          <div class="wmh-row">
+            <label for="wmh-batch">Batch size</label>
+            <input id="wmh-batch" type="number" min="1" max="50">
+          </div>
+          <div class="wmh-row">
+            <label for="wmh-tick">Tick ms</label>
+            <input id="wmh-tick" type="number" min="1000" step="1000">
+          </div>
+        </div>
+
+        <div class="wmh-check">
+          <input id="wmh-enabled" type="checkbox">
+          <label for="wmh-enabled" style="margin:0;">Enabled</label>
+        </div>
+
+        <div class="wmh-actions">
+          <button class="wmh-btn" id="wmh-save">Save</button>
+          <button class="wmh-btn wmh-secondary" id="wmh-refresh">Rescan</button>
+        </div>
+
+        <div class="wmh-statusline" id="wmh-statusline"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+
+    const tornKey = panel.querySelector("#wmh-torn-key");
+    const ffKey = panel.querySelector("#wmh-ff-key");
+    const threshold = panel.querySelector("#wmh-threshold");
+    const batch = panel.querySelector("#wmh-batch");
+    const tick = panel.querySelector("#wmh-tick");
+    const enabled = panel.querySelector("#wmh-enabled");
+
+    tornKey.value = state.cfg.tornApiKey || "";
+    ffKey.value = state.cfg.ffApiKey || "";
+    threshold.value = state.cfg.statThresholdText || "";
+    batch.value = String(state.cfg.batchSize || 10);
+    tick.value = String(state.cfg.tickMs || 8000);
+    enabled.checked = !!state.cfg.enabled;
+
+    panel.querySelector("#wmh-save").addEventListener("click", () => {
+      state.cfg.tornApiKey = tornKey.value.trim();
+      state.cfg.ffApiKey = ffKey.value.trim();
+      state.cfg.statThresholdText = threshold.value.trim();
+      state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
+      state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
+      state.cfg.enabled = !!enabled.checked;
+
+      state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
+      saveConfig();
+
+      // Requeue all visible sellers after config change
+      for (const userId of state.sellers.keys()) {
+        state.pendingTorn.add(userId);
+        state.pendingFF.add(userId);
+      }
+      processQueues();
+      startLoop();
+    });
+
+    panel.querySelector("#wmh-refresh").addEventListener("click", () => {
+      for (const userId of state.sellers.keys()) {
+        state.pendingTorn.add(userId);
+        state.pendingFF.add(userId);
+      }
+      processQueues();
+    });
+
+    panel.querySelector("#wmh-head").addEventListener("click", () => {
+      panel.classList.toggle("wmh-collapsed");
+      panel.querySelector("#wmh-collapse-indicator").textContent =
+        panel.classList.contains("wmh-collapsed") ? "▸" : "▾";
+    });
+
+    updateStatusLine();
+  }
+
+  function setupObserver() {
+    const debouncedScan = debounce(scanPage, 500);
+
+    state.observer = new MutationObserver((mutations) => {
+      let shouldScan = false;
+      for (const m of mutations) {
+        if (m.addedNodes?.length || m.removedNodes?.length) {
+          shouldScan = true;
+          break;
+        }
+      }
+      if (shouldScan) debouncedScan();
+    });
+
+    state.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+
+    state.scanTimer = setInterval(scanPage, 3000);
+  }
+
+  function init() {
+    buildPanel();
+    scanPage();
+    setupObserver();
+    startLoop();
+  }
+
+  init();
+})();
