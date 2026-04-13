@@ -20,6 +20,8 @@
     enabled: true,
     enableBazaarTracking: true,
     bazaarScanMs: 1000,
+    bazaarRemotePolling: true,
+    bazaarRemotePollMs: 5000,
     soldAlertUnits: 250,
     rapidJumpUnits: 40,
     tornApiKey: "",
@@ -55,6 +57,9 @@
       totalGross: 0,
       alerts: [],
       soldAlertTriggered: false,
+      lastRemoteFetchAt: 0,
+      fetchInFlight: false,
+      latestSource: "dom",
     },
   };
 
@@ -306,8 +311,8 @@
     return parseInteger(text);
   }
 
-  function extractTornBazaarRows() {
-    const rows = Array.from(document.querySelectorAll('[data-testid="description"], .description___Y2Nrl'));
+  function extractTornBazaarRowsFromRoot(rootNode) {
+    const rows = Array.from(rootNode.querySelectorAll('[data-testid="description"], .description___Y2Nrl'));
     const snapshot = new Map();
 
     for (const row of rows) {
@@ -327,6 +332,49 @@
     return snapshot;
   }
 
+  function extractTornBazaarRows() {
+    return extractTornBazaarRowsFromRoot(document);
+  }
+
+  async function fetchRemoteBazaarSnapshot() {
+    const url = `${location.origin}${location.pathname}${location.search}`;
+    const resp = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (!resp.ok) throw new Error(`Remote bazaar fetch failed: HTTP ${resp.status}`);
+    const html = await resp.text();
+    const parsed = new DOMParser().parseFromString(html, "text/html");
+    return extractTornBazaarRowsFromRoot(parsed);
+  }
+
+  async function getLatestBazaarSnapshot() {
+    const nowTs = now();
+    const shouldRemotePoll =
+      !!state.cfg.bazaarRemotePolling &&
+      !state.tracker.fetchInFlight &&
+      (nowTs - state.tracker.lastRemoteFetchAt) >= Math.max(1000, Number(state.cfg.bazaarRemotePollMs) || 5000);
+
+    if (shouldRemotePoll) {
+      state.tracker.fetchInFlight = true;
+      try {
+        const remote = await fetchRemoteBazaarSnapshot();
+        state.tracker.lastRemoteFetchAt = now();
+        state.tracker.fetchInFlight = false;
+        state.tracker.latestSource = "remote";
+        return remote;
+      } catch (err) {
+        state.tracker.fetchInFlight = false;
+        state.tracker.latestSource = "dom";
+        state.tracker.alerts.push(`Remote poll failed, falling back to DOM snapshot.`);
+      }
+    }
+
+    state.tracker.latestSource = "dom";
+    return extractTornBazaarRows();
+  }
+
   function resetBazaarTracker() {
     state.tracker.mode = "idle";
     state.tracker.running = false;
@@ -338,6 +386,9 @@
     state.tracker.totalGross = 0;
     state.tracker.alerts = [];
     state.tracker.soldAlertTriggered = false;
+    state.tracker.lastRemoteFetchAt = 0;
+    state.tracker.fetchInFlight = false;
+    state.tracker.latestSource = "dom";
     renderBazaarTracker();
   }
 
@@ -360,7 +411,7 @@
     const unitsPerMin = minutesLive ? (state.tracker.totalUnits / minutesLive) : 0;
     const grossPerMin = minutesLive ? (state.tracker.totalGross / minutesLive) : 0;
     state.trackerEls.stats.textContent =
-      `State: ${state.tracker.mode} | Sold: ${state.tracker.totalUnits} units | Gross: $${Math.round(state.tracker.totalGross).toLocaleString()} | U/min: ${unitsPerMin.toFixed(1)} | $/min: ${Math.round(grossPerMin).toLocaleString()}${extra ? ` • ${extra}` : ""}`;
+      `State: ${state.tracker.mode} | Src: ${state.tracker.latestSource} | Sold: ${state.tracker.totalUnits} units | Gross: $${Math.round(state.tracker.totalGross).toLocaleString()} | U/min: ${unitsPerMin.toFixed(1)} | $/min: ${Math.round(grossPerMin).toLocaleString()}${extra ? ` • ${extra}` : ""}`;
 
     const top3 = Array.from(state.tracker.totals.values())
       .sort((a, b) => b.units - a.units)
@@ -380,14 +431,14 @@
       : "";
   }
 
-  function runBazaarTracker() {
+  async function runBazaarTracker() {
     if (!state.cfg.enableBazaarTracking || !isTornBazaarPage()) {
       renderBazaarTracker();
       return;
     }
 
-    // Tracker is DOM-only; no external API requests are used here.
-    const snapshot = extractTornBazaarRows();
+    // Tracker uses DOM snapshots, optionally refreshed from remote bazaar HTML polling.
+    const snapshot = await getLatestBazaarSnapshot();
     const scanTs = now();
     if (!snapshot.size) {
       renderBazaarTracker("No bazaar rows detected.");
@@ -880,6 +931,14 @@
             <input id="wmh-rapid-jump" type="number" min="1" step="1">
           </div>
         </div>
+        <div class="wmh-check">
+          <input id="wmh-remote-poll" type="checkbox">
+          <label for="wmh-remote-poll" style="margin:0;">Enable remote refresh polling</label>
+        </div>
+        <div class="wmh-row">
+          <label for="wmh-remote-poll-ms">Remote poll ms</label>
+          <input id="wmh-remote-poll-ms" type="number" min="1000" step="500">
+        </div>
         <div class="wmh-actions">
           <button class="wmh-btn" id="wmh-save-bazaar">Save</button>
           <button class="wmh-btn wmh-secondary" id="wmh-reset-tracker">Reset</button>
@@ -894,9 +953,13 @@
     const trackBazaar = panel.querySelector("#wmh-track-bazaar");
     const soldThreshold = panel.querySelector("#wmh-sold-threshold");
     const rapidJump = panel.querySelector("#wmh-rapid-jump");
+    const remotePoll = panel.querySelector("#wmh-remote-poll");
+    const remotePollMs = panel.querySelector("#wmh-remote-poll-ms");
     trackBazaar.checked = !!state.cfg.enableBazaarTracking;
     soldThreshold.value = String(state.cfg.soldAlertUnits || 250);
     rapidJump.value = String(state.cfg.rapidJumpUnits || 40);
+    remotePoll.checked = !!state.cfg.bazaarRemotePolling;
+    remotePollMs.value = String(state.cfg.bazaarRemotePollMs || 5000);
 
     state.trackerEls = {
       stats: panel.querySelector("#wmh-tracker-stats"),
@@ -909,6 +972,8 @@
       state.cfg.enableBazaarTracking = !!trackBazaar.checked;
       state.cfg.soldAlertUnits = Math.max(1, Number(soldThreshold.value) || 250);
       state.cfg.rapidJumpUnits = Math.max(1, Number(rapidJump.value) || 40);
+      state.cfg.bazaarRemotePolling = !!remotePoll.checked;
+      state.cfg.bazaarRemotePollMs = Math.max(1000, Number(remotePollMs.value) || 5000);
       saveConfig();
       resetBazaarTracker();
       runBazaarTracker();
