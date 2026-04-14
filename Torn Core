@@ -19,6 +19,11 @@
     const CORE_NAME = 'torn_core_v2';
     const CHANNEL_NAME = 'torn_core_v2_channel';
     const EVENT_NAME = 'torn_core_v2_update';
+    const BRIDGE_KEYS = {
+        snapshot: 'torn_core_v2_bridge_snapshot',
+        requests: 'torn_core_v2_bridge_requests',
+        responses: 'torn_core_v2_bridge_responses',
+    };
 
     const STORAGE_KEYS = {
         settings: 'torn_core_v2_settings',
@@ -73,6 +78,7 @@
             dom: null,
             leader: null,
             ui: null,
+            bridge: null,
         },
         brokerSeq: 0,
         brokerPending: {},
@@ -418,6 +424,27 @@
             getUser(userId) {
                 return state.core.users.byId[String(userId)] || null;
             },
+            async getFreshUser(userId, opts = {}) {
+                const id = Number(userId);
+                if (!Number.isFinite(id)) return null;
+                if (opts.ff) {
+                    await requestBroker('user.refresh.ff.batch', { userIds: [id] });
+                }
+                if (opts.torn !== false) {
+                    await requestBroker('user.refresh.torn.batch', {
+                        userIds: [id],
+                        forceFresh: !!opts.forceFresh,
+                        forceSingleApi: !!opts.forceSingleApi,
+                    });
+                }
+                return state.core.users.byId[String(id)] || null;
+            },
+            requestUsersFFRefresh(userIds = []) {
+                return requestBroker('user.refresh.ff.batch', { userIds });
+            },
+            requestUsersTornRefresh(userIds = [], opts = {}) {
+                return requestBroker('user.refresh.torn.batch', { userIds, ...opts });
+            },
             subscribe(callback) {
                 if (typeof callback !== 'function') return () => {};
                 const handler = (event) => callback(event.detail);
@@ -471,6 +498,7 @@
         state.lastPublishedAt = now();
 
         persistSnapshot(snapshot);
+        publishBridgeSnapshot(snapshot);
         broadcast({
             type: 'core-update',
             snapshot,
@@ -480,6 +508,59 @@
         dispatchWindowUpdate();
         renderPanel();
         return true;
+    }
+
+    function publishBridgeSnapshot(snapshot) {
+        try {
+            GM_setValue(BRIDGE_KEYS.snapshot, {
+                ts: Number(snapshot?.ts || now()),
+                leaderTabId: snapshot?.leaderTabId || null,
+                users: snapshot?.users || { byId: {} },
+                api: { stats: snapshot?.api?.stats || {} },
+            });
+        } catch (err) {
+            log('Failed to publish bridge snapshot', err);
+        }
+    }
+
+    function appendBridgeResponse(item) {
+        try {
+            const responses = GM_getValue(BRIDGE_KEYS.responses, []) || [];
+            responses.push(item);
+            GM_setValue(BRIDGE_KEYS.responses, responses.slice(-200));
+        } catch (err) {
+            log('Failed to append bridge response', err);
+        }
+    }
+
+    function processBridgeRequests() {
+        if (!state.isLeader) return;
+        const requests = GM_getValue(BRIDGE_KEYS.requests, []) || [];
+        if (!Array.isArray(requests) || !requests.length) return;
+
+        const responses = GM_getValue(BRIDGE_KEYS.responses, []) || [];
+        const responded = new Set(responses.map((r) => r?.requestId).filter(Boolean));
+
+        requests.forEach((req) => {
+            if (!req?.id || responded.has(req.id)) return;
+            Promise.resolve(handleBrokerRequest({
+                id: req.id,
+                type: req.type,
+                payload: req.payload || {},
+                requesterTabId: req.requester || 'bridge',
+                requestedAt: Number(req.createdAt) || now(),
+            }))
+                .then((result) => appendBridgeResponse({ requestId: req.id, at: now(), result }))
+                .catch((err) => appendBridgeResponse({
+                    requestId: req.id,
+                    at: now(),
+                    result: { ok: false, error: String(err?.message || err || 'Bridge broker execution failed') }
+                }));
+        });
+
+        if (requests.length > 200) {
+            GM_setValue(BRIDGE_KEYS.requests, requests.slice(-200));
+        }
     }
 
     function requestBroker(type, payload = {}) {
@@ -1834,6 +1915,10 @@
         state.loops.ui = setInterval(() => {
             renderPanel();
         }, 1000);
+
+        state.loops.bridge = setInterval(() => {
+            processBridgeRequests();
+        }, 800);
     }
 
     init();
