@@ -10,12 +10,14 @@
 // @match        https://www.torn.com/bazaar.php*
 // @match        https://www.torn.com/displaycase.php*
 // @match        https://www.torn.com/factions.php*
+// @match        https://www.torn.com/trade.php*
 // @match        https://torn.com/amarket.php*
 // @match        https://torn.com/page.php?sid=ItemMarket*
 // @match        https://torn.com/item.php*
 // @match        https://torn.com/bazaar.php*
 // @match        https://torn.com/displaycase.php*
 // @match        https://torn.com/factions.php*
+// @match        https://torn.com/trade.php*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      btrmmuuoofbonmuwrkzg.supabase.co
@@ -1912,6 +1914,7 @@ function parseCurrentListingPrice() {
         if (u.includes('item.php'))       return 'inventory';
         if (u.includes('bazaar.php'))     return 'bazaar';
         if (u.includes('displaycase.php')) return 'displaycase';
+        if (u.includes('trade.php'))      return 'trading';
         if (u.includes('factions.php') && u.includes('armoury')) return 'armory';
         return 'unknown';
     };
@@ -2039,6 +2042,10 @@ function parseCurrentListingPrice() {
             injectInto(document.querySelectorAll('li.show-item-info'));
         } else if (pt === 'bazaar') {
             injectInto(document.querySelectorAll('div.show-item-info,[class*="info___"].show-item-info'));
+        } else if (pt === 'trading') {
+            injectInto(document.querySelectorAll(
+                '.itemInfoWrapper___nA_eu,[class*="itemInfo___"],li.show-item-info,div.show-item-info,[class*="info___"].show-item-info'
+            ), false);
         } else if (pt === 'armory') {
             injectInto(Array.from(document.querySelectorAll('div.view-item-info')).filter(e => e.style.display !== 'none'));
         }
