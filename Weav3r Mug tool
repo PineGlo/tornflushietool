@@ -1,14 +1,13 @@
 // ==UserScript==
 // @name         Weav3r Mugging Helper
 // @namespace    Violentmonkey Scripts
-// @version      1.1.0
-// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links.
+// @version      1.3.1
+// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links, skips protected/alliance members, and shows hospital countdowns.
 // @match        https://weav3r.dev/item/*
 // @match        https://www.torn.com/bazaar.php*
-// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM_addStyle
-// @connect      api.torn.com
-// @connect      ffscouter.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -18,6 +17,19 @@
   const STORAGE_KEY = "weav3r_mugging_helper_v1";
   const DEFAULTS = {
     enabled: true,
+    useCoreBackend: true,
+
+    // Mugging tool
+    statThresholdText: "500m",
+    batchSize: 15,
+    tickMs: 6000,
+    debug: false,
+
+    // Protected/alliance behavior
+    skipProtectedTargets: true,
+    highlightProtectedBlue: true,
+
+    // Bazaar tracker
     enableBazaarTracking: true,
     bazaarScanMs: 1000,
     bazaarAutoRefresh: true,
@@ -25,35 +37,40 @@
     bazaarRefreshJitterPct: 20,
     soldAlertUnits: 250,
     rapidJumpUnits: 40,
-    tornApiKey: "",
-    ffApiKey: "",
-    statThresholdText: "500m",
-    batchSize: 10,
-    tickMs: 8000,
-    tornTtlMs: 60 * 1000,
-    ffTtlMs: 60 * 60 * 1000,
-    debug: false,
+  };
+
+  const CORE_STALE = {
+    tornMs: 60 * 1000,
+    ffMs: 3 * 24 * 60 * 60 * 1000,
   };
 
   const state = {
     cfg: loadConfig(),
-    sellers: new Map(),      // userId -> seller object
-    tornCache: new Map(),    // userId -> { status, ts, raw }
-    ffCache: new Map(),      // userId -> { bs_estimate, bs_estimate_human, fair_fight, ts, raw }
-    pendingTorn: new Set(),
-    pendingFF: new Set(),
+    sellers: new Map(),
+    coreClient: null,
+    coreMode: "offline",
+    bridgeSnapshotTs: 0,
+    domBridgeSnapshot: null,
+    domBridgeTimer: null,
+    thresholdValue: 0,
     observer: null,
     scanTimer: null,
     tickTimer: null,
-    thresholdValue: 0,
     trackerEls: null,
+    lastPlan: {
+      visible: 0,
+      protected: 0,
+      needFF: 0,
+      eligible: 0,
+      needTorn: 0,
+    },
     tracker: {
-      mode: "idle", // idle | baseline | tracking | alert
+      mode: "idle",
       running: false,
       startedAt: 0,
       lastScanAt: 0,
       lastSnapshot: new Map(),
-      totals: new Map(), // name -> { name, units, gross }
+      totals: new Map(),
       totalUnits: 0,
       totalGross: 0,
       alerts: [],
@@ -71,7 +88,7 @@
       top: 88px;
       right: 18px;
       z-index: 999999;
-      width: 300px;
+      width: 320px;
       background: rgba(15, 23, 42, 0.96);
       color: #e5e7eb;
       border: 1px solid rgba(148, 163, 184, 0.35);
@@ -222,6 +239,11 @@
       background: rgba(51, 65, 85, 0.88);
       color: #e2e8f0;
     }
+    .wmh-badge.protected {
+      background: rgba(30, 64, 175, 0.9);
+      border-color: rgba(96, 165, 250, 0.55);
+      color: #dbeafe;
+    }
     .wmh-attack {
       display: inline-flex;
       align-items: center;
@@ -241,6 +263,14 @@
       outline: 1px solid rgba(74, 222, 128, 0.6) !important;
       box-shadow: inset 0 0 0 9999px rgba(22, 101, 52, 0.15);
     }
+    .wmh-row-bad {
+      outline: 1px solid rgba(248, 113, 113, 0.55) !important;
+      box-shadow: inset 0 0 0 9999px rgba(127, 29, 29, 0.12);
+    }
+    .wmh-row-protected {
+      outline: 1px solid rgba(96, 165, 250, 0.65) !important;
+      box-shadow: inset 0 0 0 9999px rgba(30, 64, 175, 0.14);
+    }
   `);
 
   function loadConfig() {
@@ -258,6 +288,18 @@
 
   function log(...args) {
     if (state.cfg.debug) console.log("[WMH]", ...args);
+  }
+
+  function now() {
+    return Date.now();
+  }
+
+  function debounce(fn, wait) {
+    let t = null;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), wait);
+    };
   }
 
   function parseHumanNumber(input) {
@@ -289,10 +331,6 @@
     return String(Math.round(n));
   }
 
-  function isTornBazaarPage() {
-    return location.hostname === "www.torn.com" && location.pathname.includes("bazaar.php");
-  }
-
   function parseMoney(text) {
     const m = String(text || "").match(/\$([\d,]+(?:\.\d+)?)/);
     if (!m) return null;
@@ -309,6 +347,16 @@
     const m = String(text || "").match(/\(([\d,]+)\s+in stock\)/i);
     if (m) return parseInteger(m[1]);
     return parseInteger(text);
+  }
+
+  function isTornBazaarPage() {
+    return location.hostname === "www.torn.com" && location.pathname.includes("bazaar.php");
+  }
+
+  function parseUserIdFromHref(href) {
+    if (!href) return null;
+    const match = href.match(/(?:userId=|XID=)(\d+)/i);
+    return match ? Number(match[1]) : null;
   }
 
   function extractTornBazaarRowsFromRoot(rootNode) {
@@ -375,12 +423,8 @@
       state.tracker.totals = new Map(Array.isArray(data.totals) ? data.totals : []);
       state.tracker.alerts = Array.isArray(data.alerts) ? data.alerts : [];
       state.tracker.soldAlertTriggered = !!data.soldAlertTriggered;
-      if (state.tracker.startedAt) {
-        state.tracker.mode = "tracking";
-      }
-    } catch {
-      // ignore invalid stored tracker state
-    }
+      if (state.tracker.startedAt) state.tracker.mode = "tracking";
+    } catch {}
   }
 
   function scheduleBazaarRefresh() {
@@ -442,7 +486,6 @@
       return;
     }
 
-    // Tracker uses on-page DOM snapshots.
     state.tracker.latestSource = "dom";
     const snapshot = extractTornBazaarRows();
     const scanTs = now();
@@ -493,38 +536,16 @@
     renderBazaarTracker(`Tracking ${snapshot.size} items. Last scan delta: ${deltaUnits}`);
   }
 
-  function now() {
-    return Date.now();
-  }
-
-  function isFresh(entry, ttlMs) {
-    return !!entry && (now() - entry.ts) < ttlMs;
-  }
-
-  function debounce(fn, wait) {
-    let t = null;
-    return (...args) => {
-      clearTimeout(t);
-      t = setTimeout(() => fn(...args), wait);
-    };
-  }
-
-  function parseUserIdFromHref(href) {
-    if (!href) return null;
-    const match = href.match(/(?:userId=|XID=)(\d+)/i);
-    return match ? Number(match[1]) : null;
-  }
-
   function findSellerAnchors() {
     return Array.from(document.querySelectorAll('a[href*="bazaar.php?userId="]'));
   }
 
   function findRowForAnchor(anchor) {
     return (
-      anchor.closest('tr') ||
+      anchor.closest("tr") ||
       anchor.closest('[role="row"]') ||
-      anchor.closest('.grid') ||
-      anchor.closest('li') ||
+      anchor.closest(".grid") ||
+      anchor.closest("li") ||
       anchor.parentElement?.parentElement ||
       anchor.parentElement
     );
@@ -553,7 +574,7 @@
   function ensureSellerUi(seller) {
     if (!seller.anchor || !seller.anchor.isConnected) return;
 
-    let meta = seller.anchor.parentElement?.querySelector(`.wmh-meta[data-wmh-id="${seller.userId}"]`);
+    let meta = seller.anchor.parentElement?.querySelector(\`.wmh-meta[data-wmh-id="\${seller.userId}"]\`);
     if (!meta) {
       meta = document.createElement("div");
       meta.className = "wmh-meta";
@@ -565,7 +586,7 @@
 
       const attack = document.createElement("a");
       attack.className = "wmh-attack";
-      attack.href = `https://www.torn.com/loader.php?sid=attack&user2ID=${seller.userId}`;
+      attack.href = \`https://www.torn.com/loader.php?sid=attack&user2ID=\${seller.userId}\`;
       attack.target = "_blank";
       attack.rel = "noopener noreferrer";
       attack.textContent = "Attack";
@@ -583,17 +604,9 @@
       seller.badgeEl = meta.querySelector(".wmh-badge");
       seller.attackEl = meta.querySelector(".wmh-attack");
       if (seller.attackEl) {
-        seller.attackEl.href = `https://www.torn.com/loader.php?sid=attack&user2ID=${seller.userId}`;
+        seller.attackEl.href = \`https://www.torn.com/loader.php?sid=attack&user2ID=\${seller.userId}\`;
       }
     }
-  }
-
-  function queueIfNeeded(userId) {
-    const torn = state.tornCache.get(userId);
-    const ff = state.ffCache.get(userId);
-
-    if (!isFresh(torn, state.cfg.tornTtlMs)) state.pendingTorn.add(userId);
-    if (!isFresh(ff, state.cfg.ffTtlMs)) state.pendingFF.add(userId);
   }
 
   function scanPage() {
@@ -602,21 +615,93 @@
       const userId = parseUserIdFromHref(anchor.href);
       if (!userId) continue;
       ensureSeller(userId, anchor);
-      queueIfNeeded(userId);
       renderSeller(userId);
     }
     runBazaarTracker();
     updateStatusLine();
   }
 
-  function getTornStatusText(json) {
-    return (
-      json?.status?.description ||
-      json?.status?.details ||
-      json?.status?.state ||
-      json?.status ||
-      ""
-    );
+  function getCoreState() {
+    try {
+      return window.TornCore?.getState?.() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getProtectedMapFromCore() {
+    const coreState = getCoreState() || state.domBridgeSnapshot || null;
+    if (!coreState || typeof coreState !== "object") return {};
+
+    if (coreState.protectedMembers?.byUserId && typeof coreState.protectedMembers.byUserId === "object") {
+      return coreState.protectedMembers.byUserId;
+    }
+
+    if (coreState.allianceProtection?.protectedMembers?.byUserId && typeof coreState.allianceProtection.protectedMembers.byUserId === "object") {
+      return coreState.allianceProtection.protectedMembers.byUserId;
+    }
+
+    if (coreState.protectedMembers && typeof coreState.protectedMembers === "object") {
+      return coreState.protectedMembers;
+    }
+
+    return {};
+  }
+
+  function getProtectedMemberInfo(userId) {
+    const map = getProtectedMapFromCore();
+    return map?.[String(userId)] || map?.[Number(userId)] || null;
+  }
+
+  function mapCoreUserToSellerTruth(userId) {
+    const coreUser = state.coreClient?.getUser?.(userId) || null;
+    const torn = coreUser?.torn || null;
+    const ff = coreUser?.ff || null;
+    const tornAt = Number(torn?.lastRefreshAt) || 0;
+    const ffAt = Number(ff?.lastRefreshAt) || 0;
+    const tornFresh = tornAt && (now() - tornAt) <= CORE_STALE.tornMs;
+    const ffFresh = ffAt && (now() - ffAt) <= CORE_STALE.ffMs;
+    const protectedInfo = getProtectedMemberInfo(userId);
+
+    return {
+      status: torn?.status || "",
+      estimatedStats: Number.isFinite(ff?.estimatedStats) ? ff.estimatedStats : null,
+      estimatedStatsHuman: ff?.estimatedStatsHuman || "",
+      tornFresh: !!tornFresh,
+      ffFresh: !!ffFresh,
+      stale: !tornFresh || !ffFresh,
+      protectedInfo,
+      isProtected: !!protectedInfo,
+    };
+  }
+
+  function isUnderThreshold(truth) {
+    return Number.isFinite(truth?.estimatedStats) && truth.estimatedStats <= state.thresholdValue;
+  }
+
+  function formatCountdownMs(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return "0m";
+
+    const totalSeconds = Math.floor(ms / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.ceil((totalSeconds % 3600) / 60);
+
+    if (hours > 0) {
+      return \`\${hours}h \${String(minutes).padStart(2, "0")}m\`;
+    }
+    return \`\${Math.max(0, minutes)}m\`;
+  }
+
+  function getHospitalCountdownText(userId) {
+    const coreUser = state.coreClient?.getUser?.(userId) || null;
+    const torn = coreUser?.torn || null;
+    const hospitalUntil = Number(torn?.hospitalUntil) || 0;
+
+    if (!hospitalUntil) return "";
+    const remainingMs = hospitalUntil - now();
+    if (remainingMs <= 0) return "Hosp 0m";
+
+    return \`Hosp \${formatCountdownMs(remainingMs)}\`;
   }
 
   function renderSeller(userId) {
@@ -625,31 +710,37 @@
 
     ensureSellerUi(seller);
 
-    const torn = state.tornCache.get(userId);
-    const ff = state.ffCache.get(userId);
-    const statusText = torn?.status || "…";
-    const bs = ff?.bs_estimate;
-    const threshold = state.thresholdValue;
+    const truth = mapCoreUserToSellerTruth(userId);
+    const statusText = truth.status || "…";
+    const bs = truth.estimatedStats;
     const okay = statusText === "Okay";
-    const underCap = Number.isFinite(bs) && bs <= threshold;
+    const underCap = isUnderThreshold(truth);
     const good = okay && underCap;
+    const evaluable = !!truth.status && Number.isFinite(bs);
+    const bad = evaluable && !good;
+    const bsText = truth.estimatedStatsHuman || (Number.isFinite(bs) ? humanizeNumber(bs) : "?");
+    const protectedInfo = truth.protectedInfo;
+    const hospitalCountdown = statusText === "Hospital" ? getHospitalCountdownText(userId) : "";
 
     if (seller.badgeEl) {
       seller.badgeEl.className = "wmh-badge neutral";
 
-      if (!torn && !ff) {
-        seller.badgeEl.textContent = "Checking...";
-      } else if (torn && !ff) {
-        seller.badgeEl.textContent = `${statusText} | FF...`;
-        seller.badgeEl.classList.add(statusText === "Okay" ? "ok" : "bad");
-      } else if (!torn && ff) {
-        seller.badgeEl.textContent = `...? | ${ff.bs_estimate_human || humanizeNumber(ff.bs_estimate)}`;
+      if (truth.isProtected && state.cfg.highlightProtectedBlue) {
+        const factionName = protectedInfo?.factionName || protectedInfo?.name || "Alliance";
+        seller.badgeEl.textContent = \`Protected | \${factionName}\`;
+        seller.badgeEl.classList.add("protected");
       } else {
-        const bsText = ff.bs_estimate_human || humanizeNumber(ff.bs_estimate);
-        seller.badgeEl.textContent = `${statusText} | ${bsText}`;
+        let badgeLeft = truth.status || "Unknown";
+
+        if (statusText === "Hospital" && hospitalCountdown) {
+          badgeLeft = hospitalCountdown;
+        }
+
+        seller.badgeEl.textContent = \`\${badgeLeft} | \${bsText}\`;
+
         if (good) {
           seller.badgeEl.classList.add("ok");
-        } else if (statusText !== "Okay" || (Number.isFinite(bs) && bs > threshold)) {
+        } else if (bad) {
           seller.badgeEl.classList.add("bad");
         } else {
           seller.badgeEl.classList.add("neutral");
@@ -658,7 +749,9 @@
     }
 
     if (seller.row) {
-      seller.row.classList.toggle("wmh-row-good", good);
+      seller.row.classList.toggle("wmh-row-good", !truth.isProtected && good);
+      seller.row.classList.toggle("wmh-row-bad", !truth.isProtected && bad);
+      seller.row.classList.toggle("wmh-row-protected", !!(truth.isProtected && state.cfg.highlightProtectedBlue));
     }
   }
 
@@ -666,150 +759,237 @@
     const line = document.getElementById("wmh-statusline");
     if (!line) return;
 
-    const visible = state.sellers.size;
-    const queuedTorn = state.pendingTorn.size;
-    const queuedFF = state.pendingFF.size;
     line.textContent =
-      `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Threshold: ${state.cfg.statThresholdText}`;
+      \`Visible: \${state.lastPlan.visible} | Protected: \${state.lastPlan.protected} | FF queue: \${state.lastPlan.needFF} | Eligible: \${state.lastPlan.eligible} | Torn queue: \${state.lastPlan.needTorn} | Backend: \${state.coreMode} | Threshold: \${state.cfg.statThresholdText}\`;
   }
 
-  function takeFromSet(setObj, maxCount) {
-    const out = [];
-    for (const value of setObj) {
-      out.push(value);
-      if (out.length >= maxCount) break;
+  function createCoreClient() {
+    if (state.cfg.useCoreBackend && window.TornCore?.request) {
+      return {
+        mode: "direct",
+        getUser: (userId) => window.TornCore.getUser?.(userId) || null,
+        subscribe: (cb) => window.TornCore.subscribe ? window.TornCore.subscribe(cb) : (() => {}),
+        requestUsersFFRefresh: (userIds) => window.TornCore.request("user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => window.TornCore.request("user.refresh.torn.batch", { userIds, ...opts }),
+      };
     }
-    out.forEach(v => setObj.delete(v));
-    return out;
+
+    if (state.domBridgeSnapshot?.users?.byId) {
+      return {
+        mode: "bridge_dom",
+        getUser: (userId) => state.domBridgeSnapshot?.users?.byId?.[String(userId)] || null,
+        subscribe: () => (() => {}),
+        requestUsersFFRefresh: (userIds) => requestDomBridge("user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => requestDomBridge("user.refresh.torn.batch", { userIds, ...opts }),
+      };
+    }
+
+    const bridgeSnapshotKey = "torn_core_v2_bridge_snapshot";
+    const bridgeRequestKey = "torn_core_v2_bridge_requests";
+    const bridgeResponseKey = "torn_core_v2_bridge_responses";
+
+    const readSnapshot = () => GM_getValue(bridgeSnapshotKey, null);
+    if (readSnapshot()?.users?.byId) {
+      return {
+        mode: "bridge",
+        getUser: (userId) => {
+          const snapshot = readSnapshot();
+          return snapshot?.users?.byId?.[String(userId)] || null;
+        },
+        subscribe: (cb) => {
+          let lastTs = state.bridgeSnapshotTs;
+          const timer = setInterval(() => {
+            const snapshot = readSnapshot();
+            const ts = Number(snapshot?.ts || 0);
+            if (ts && ts !== lastTs) {
+              lastTs = ts;
+              state.bridgeSnapshotTs = ts;
+              cb(snapshot);
+            }
+          }, 2000);
+          return () => clearInterval(timer);
+        },
+        requestUsersFFRefresh: (userIds) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "user.refresh.ff.batch", { userIds }),
+        requestUsersTornRefresh: (userIds, opts = {}) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "user.refresh.torn.batch", { userIds, ...opts }),
+      };
+    }
+
+    return {
+      mode: "offline",
+      getUser: () => null,
+      subscribe: () => (() => {}),
+      requestUsersFFRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
+      requestUsersTornRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
+    };
   }
 
-  function gmGet(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: "GET",
-        url,
-        timeout: 20000,
-        onload: (resp) => {
-          if (resp.status >= 200 && resp.status < 300) {
-            resolve(resp);
-          } else {
-            reject(new Error(`HTTP ${resp.status}: ${resp.responseText || "request failed"}`));
-          }
-        },
-        onerror: (err) => reject(err),
-        ontimeout: () => reject(new Error("Request timed out")),
-      });
+  function requestBridgeBroker(requestKey, responseKey, type, payload) {
+    const requestId = \`wmh_\${Date.now()}_\${Math.random().toString(36).slice(2, 8)}\`;
+    const queue = GM_getValue(requestKey, []);
+    queue.push({ id: requestId, type, payload, createdAt: now(), requester: "weav3r_mug_tool" });
+    GM_setValue(requestKey, queue.slice(-100));
+
+    return new Promise((resolve) => {
+      const started = now();
+      const timer = setInterval(() => {
+        const responses = GM_getValue(responseKey, []);
+        const hit = responses.find((item) => item?.requestId === requestId);
+        if (hit) {
+          clearInterval(timer);
+          resolve(hit.result || { ok: false, error: "Empty bridge response." });
+          return;
+        }
+        if ((now() - started) > 9000) {
+          clearInterval(timer);
+          resolve({ ok: false, timeout: true, error: "Bridge request timeout." });
+        }
+      }, 300);
     });
   }
 
-  async function fetchFFBatch(userIds) {
-    if (!state.cfg.ffApiKey || !userIds.length) return;
-    const url =
-      `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(state.cfg.ffApiKey)}&targets=${encodeURIComponent(userIds.join(","))}`;
-
-    try {
-      const resp = await gmGet(url);
-      const data = JSON.parse(resp.responseText);
-      if (!Array.isArray(data)) {
-        log("Unexpected FF response:", data);
-        return;
-      }
-
-      const seen = new Set();
-      for (const item of data) {
-        if (!item || !item.player_id) continue;
-        seen.add(Number(item.player_id));
-        state.ffCache.set(Number(item.player_id), {
-          bs_estimate: Number.isFinite(item.bs_estimate) ? item.bs_estimate : null,
-          bs_estimate_human: item.bs_estimate_human || null,
-          fair_fight: Number.isFinite(item.fair_fight) ? item.fair_fight : null,
-          raw: item,
-          ts: now(),
-        });
-        renderSeller(Number(item.player_id));
-      }
-
-      for (const userId of userIds) {
-        if (!seen.has(userId)) {
-          state.ffCache.set(userId, {
-            bs_estimate: null,
-            bs_estimate_human: null,
-            fair_fight: null,
-            raw: null,
-            ts: now(),
-          });
-          renderSeller(userId);
-        }
-      }
-    } catch (err) {
-      log("FF batch failed:", err);
-      for (const userId of userIds) {
-        state.pendingFF.add(userId);
-      }
-    }
+  function requestDomBridge(type, payload = {}) {
+    const id = \`wmh_dom_\${Date.now()}_\${Math.random().toString(36).slice(2, 8)}\`;
+    return new Promise((resolve) => {
+      let settled = false;
+      const onResponse = (event) => {
+        const detail = event?.detail || {};
+        if (detail.id !== id) return;
+        settled = true;
+        window.removeEventListener("torn-core-bridge-response", onResponse);
+        resolve(detail.result || { ok: false, error: "Empty DOM bridge response." });
+      };
+      window.addEventListener("torn-core-bridge-response", onResponse);
+      window.dispatchEvent(new CustomEvent("torn-core-bridge-request", {
+        detail: { id, type, payload },
+      }));
+      setTimeout(() => {
+        if (settled) return;
+        window.removeEventListener("torn-core-bridge-response", onResponse);
+        resolve({ ok: false, timeout: true, error: "DOM bridge timeout." });
+      }, 2500);
+    });
   }
 
-  async function fetchTornStatus(userId) {
-    if (!state.cfg.tornApiKey || !userId) return;
+  function collectRefreshPlan() {
+    const sellerIds = Array.from(state.sellers.keys());
+    const needFF = [];
+    const eligible = [];
+    const needTorn = [];
+    let protectedCount = 0;
 
-    // Old-style endpoint kept deliberately because it is simple and widely supported.
-    const url =
-      `https://api.torn.com/user/${userId}?selections=profile&key=${encodeURIComponent(state.cfg.tornApiKey)}`;
+    for (const userId of sellerIds) {
+      const truth = mapCoreUserToSellerTruth(userId);
 
-    try {
-      const resp = await gmGet(url);
-      const data = JSON.parse(resp.responseText);
-
-      if (data?.error) {
-        log(`Torn API error for ${userId}:`, data.error);
-        return;
+      if (truth.isProtected) {
+        protectedCount++;
+        if (state.cfg.skipProtectedTargets) continue;
       }
 
-      const status = String(getTornStatusText(data) || "").trim();
-      state.tornCache.set(userId, {
-        status,
-        raw: data,
-        ts: now(),
-      });
-      renderSeller(userId);
-    } catch (err) {
-      log(`Torn status failed for ${userId}:`, err);
-      state.pendingTorn.add(userId);
+      if (!truth.ffFresh) {
+        needFF.push(userId);
+        continue;
+      }
+
+      if (isUnderThreshold(truth)) {
+        eligible.push(userId);
+        if (!truth.tornFresh) needTorn.push(userId);
+      }
     }
+
+    return {
+      visible: sellerIds.length,
+      protected: protectedCount,
+      needFF,
+      eligible,
+      needTorn,
+    };
   }
 
   async function processQueues() {
     if (!state.cfg.enabled) return;
 
+    state.coreClient = createCoreClient();
+    state.coreMode = state.coreClient.mode;
+
     scanPage();
 
-    const batchSize = Math.max(1, Number(state.cfg.batchSize) || 10);
+    const batchSize = Math.max(1, Number(state.cfg.batchSize) || 15);
 
-    const ffIds = takeFromSet(state.pendingFF, batchSize);
-    const tornIds = takeFromSet(state.pendingTorn, batchSize);
+    let plan = collectRefreshPlan();
+    state.lastPlan = {
+      visible: plan.visible,
+      protected: plan.protected,
+      needFF: plan.needFF.length,
+      eligible: plan.eligible.length,
+      needTorn: plan.needTorn.length,
+    };
+    updateStatusLine();
 
-    if (ffIds.length) {
-      fetchFFBatch(ffIds);
+    if (plan.needFF.length) {
+      try {
+        await state.coreClient.requestUsersFFRefresh(plan.needFF.slice(0, batchSize));
+      } catch (err) {
+        log("FF refresh failed", err);
+      }
+
+      for (const userId of state.sellers.keys()) renderSeller(userId);
+
+      plan = collectRefreshPlan();
+      state.lastPlan = {
+        visible: plan.visible,
+        protected: plan.protected,
+        needFF: plan.needFF.length,
+        eligible: plan.eligible.length,
+        needTorn: plan.needTorn.length,
+      };
+      updateStatusLine();
     }
 
-    if (tornIds.length) {
-      Promise.allSettled(tornIds.map(fetchTornStatus)).then(() => {
-        for (const id of tornIds) renderSeller(id);
-      });
+    if (plan.needTorn.length) {
+      try {
+        await state.coreClient.requestUsersTornRefresh(plan.needTorn.slice(0, batchSize));
+      } catch (err) {
+        log("Torn refresh failed", err);
+      }
     }
 
+    for (const userId of state.sellers.keys()) renderSeller(userId);
+
+    plan = collectRefreshPlan();
+    state.lastPlan = {
+      visible: plan.visible,
+      protected: plan.protected,
+      needFF: plan.needFF.length,
+      eligible: plan.eligible.length,
+      needTorn: plan.needTorn.length,
+    };
     updateStatusLine();
   }
 
   function startLoop() {
     stopLoop();
-    state.tickTimer = setInterval(processQueues, Math.max(1000, Number(state.cfg.tickMs) || 8000));
-    processQueues();
+
+    state.tickTimer = setInterval(() => {
+      processQueues().catch((err) => log("Queue loop error", err));
+    }, Math.max(1000, Number(state.cfg.tickMs) || 8000));
+
+    state.scanTimer = setInterval(() => {
+      for (const userId of state.sellers.keys()) {
+        const truth = mapCoreUserToSellerTruth(userId);
+        if (truth.status === "Hospital") {
+          renderSeller(userId);
+        }
+      }
+    }, 15000);
+
+    processQueues().catch((err) => log("Initial queue error", err));
   }
 
   function stopLoop() {
     if (state.tickTimer) clearInterval(state.tickTimer);
+    if (state.scanTimer) clearInterval(state.scanTimer);
     state.tickTimer = null;
+    state.scanTimer = null;
   }
 
   function buildPanel() {
@@ -822,15 +1002,7 @@
         <span id="wmh-collapse-indicator">▾</span>
       </div>
       <div class="wmh-body">
-        <div class="wmh-row">
-          <label for="wmh-torn-key">Torn API key</label>
-          <input id="wmh-torn-key" type="password" placeholder="Your Torn API key">
-        </div>
-
-        <div class="wmh-row">
-          <label for="wmh-ff-key">FF Scouter API key</label>
-          <input id="wmh-ff-key" type="password" placeholder="Your FF Scouter key">
-        </div>
+        <div class="wmh-statusline">Backend: Torn Core client (direct or bridge)</div>
 
         <div class="wmh-row">
           <label for="wmh-threshold">Max estimated stats</label>
@@ -853,6 +1025,16 @@
           <label for="wmh-enabled" style="margin:0;">Enabled</label>
         </div>
 
+        <div class="wmh-check">
+          <input id="wmh-skip-protected" type="checkbox">
+          <label for="wmh-skip-protected" style="margin:0;">Skip protected/alliance targets</label>
+        </div>
+
+        <div class="wmh-check">
+          <input id="wmh-highlight-protected" type="checkbox">
+          <label for="wmh-highlight-protected" style="margin:0;">Highlight protected targets blue</label>
+        </div>
+
         <div class="wmh-actions">
           <button class="wmh-btn" id="wmh-save">Save</button>
           <button class="wmh-btn wmh-secondary" id="wmh-refresh">Rescan</button>
@@ -863,46 +1045,37 @@
     `;
     document.body.appendChild(panel);
 
-    const tornKey = panel.querySelector("#wmh-torn-key");
-    const ffKey = panel.querySelector("#wmh-ff-key");
     const threshold = panel.querySelector("#wmh-threshold");
     const batch = panel.querySelector("#wmh-batch");
     const tick = panel.querySelector("#wmh-tick");
     const enabled = panel.querySelector("#wmh-enabled");
+    const skipProtected = panel.querySelector("#wmh-skip-protected");
+    const highlightProtected = panel.querySelector("#wmh-highlight-protected");
 
-    tornKey.value = state.cfg.tornApiKey || "";
-    ffKey.value = state.cfg.ffApiKey || "";
     threshold.value = state.cfg.statThresholdText || "";
-    batch.value = String(state.cfg.batchSize || 10);
-    tick.value = String(state.cfg.tickMs || 8000);
+    batch.value = String(state.cfg.batchSize || 15);
+    tick.value = String(state.cfg.tickMs || 6000);
     enabled.checked = !!state.cfg.enabled;
+    skipProtected.checked = !!state.cfg.skipProtectedTargets;
+    highlightProtected.checked = !!state.cfg.highlightProtectedBlue;
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
-      state.cfg.tornApiKey = tornKey.value.trim();
-      state.cfg.ffApiKey = ffKey.value.trim();
       state.cfg.statThresholdText = threshold.value.trim();
-      state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
-      state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
+      state.cfg.batchSize = Math.max(1, Number(batch.value) || 15);
+      state.cfg.tickMs = Math.max(1000, Number(tick.value) || 6000);
       state.cfg.enabled = !!enabled.checked;
+      state.cfg.skipProtectedTargets = !!skipProtected.checked;
+      state.cfg.highlightProtectedBlue = !!highlightProtected.checked;
 
       state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
       saveConfig();
 
-      // Requeue all visible sellers after config change
-      for (const userId of state.sellers.keys()) {
-        state.pendingTorn.add(userId);
-        state.pendingFF.add(userId);
-      }
-      processQueues();
+      processQueues().catch((err) => log("Manual save refresh error", err));
       startLoop();
     });
 
     panel.querySelector("#wmh-refresh").addEventListener("click", () => {
-      for (const userId of state.sellers.keys()) {
-        state.pendingTorn.add(userId);
-        state.pendingFF.add(userId);
-      }
-      processQueues();
+      processQueues().catch((err) => log("Manual refresh error", err));
     });
 
     panel.querySelector("#wmh-head").addEventListener("click", () => {
@@ -969,6 +1142,7 @@
     const autoRefresh = panel.querySelector("#wmh-auto-refresh");
     const refreshMs = panel.querySelector("#wmh-refresh-ms");
     const refreshJitter = panel.querySelector("#wmh-refresh-jitter");
+
     trackBazaar.checked = !!state.cfg.enableBazaarTracking;
     soldThreshold.value = String(state.cfg.soldAlertUnits || 250);
     rapidJump.value = String(state.cfg.rapidJumpUnits || 40);
@@ -1027,8 +1201,6 @@
       childList: true,
       subtree: true,
     });
-
-    state.scanTimer = setInterval(scanPage, 3000);
   }
 
   function setupBazaarObserver() {
@@ -1054,6 +1226,29 @@
     runBazaarTracker();
   }
 
+  function setupCoreSubscription() {
+    state.coreClient = createCoreClient();
+    state.coreMode = state.coreClient.mode;
+    state.coreClient.subscribe(() => {
+      for (const userId of state.sellers.keys()) renderSeller(userId);
+      updateStatusLine();
+    });
+
+    if (state.domBridgeTimer) clearInterval(state.domBridgeTimer);
+    state.domBridgeTimer = setInterval(() => {
+      requestDomBridge("core.getSnapshot")
+        .then((result) => {
+          if (!result?.ok || !result?.data) return;
+          state.domBridgeSnapshot = result.data;
+          state.coreClient = createCoreClient();
+          state.coreMode = state.coreClient.mode;
+          for (const userId of state.sellers.keys()) renderSeller(userId);
+          updateStatusLine();
+        })
+        .catch(() => {});
+    }, 1500);
+  }
+
   function init() {
     if (isTornBazaarPage()) {
       loadBazaarSessionState();
@@ -1064,6 +1259,7 @@
     }
 
     buildPanel();
+    setupCoreSubscription();
     scanPage();
     setupObserver();
     startLoop();
