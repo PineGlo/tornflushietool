@@ -77,6 +77,8 @@
 
     let lastLife = null;
     let lastCash = null;
+    let lastCoreDomVersion = null;
+    let latestCoreState = null;
 
     let lifeWatcherStarted = false;
     let cashWatcherStarted = false;
@@ -185,6 +187,35 @@
         if (!cleaned) return null;
         const num = parseInt(cleaned, 10);
         return Number.isFinite(num) ? num : null;
+    }
+
+    function readCoreState() {
+        try {
+            if (window.TornCore?.getState) {
+                return window.TornCore.getState();
+            }
+        } catch {}
+
+        try {
+            if (window.__TORN_CORE_STATE__) {
+                return window.__TORN_CORE_STATE__;
+            }
+        } catch {}
+
+        return null;
+    }
+
+    function getCoreDomState() {
+        const current = readCoreState();
+        if (current?.dom) {
+            latestCoreState = current;
+            return current.dom;
+        }
+        return latestCoreState?.dom || null;
+    }
+
+    function isCoreConnected() {
+        return Boolean(getCoreDomState());
     }
 
     function isCashModeEnabled() {
@@ -343,6 +374,12 @@
     }
 
     function getCash() {
+        const coreDom = getCoreDomState();
+        const coreCash = coreDom?.cash?.onHand;
+        if (Number.isFinite(coreCash) && coreCash >= 0) {
+            return coreCash;
+        }
+
         const settings = getSettings();
 
         if (settings.exactCashSelector) {
@@ -381,6 +418,12 @@
     }
 
     function getLife() {
+        const coreDom = getCoreDomState();
+        const coreLife = coreDom?.life?.current;
+        if (Number.isFinite(coreLife) && coreLife >= 0) {
+            return coreLife;
+        }
+
         const el =
             document.querySelector('a[class*="life"] p[class*="bar-value"]') ||
             document.querySelector('[class*="life"] p[class*="bar-value"]');
@@ -829,16 +872,17 @@
             const mine = getMyLeaderPayload();
             const iAmLeader = amLeader();
             const leaderEnabled = canThisTabRunLeaderFlow();
+            const coreOnline = isCoreConnected();
 
             const role = mine.isVault ? 'Vault Tab' : (mine.isVisible ? 'Active Tab' : 'Background Tab');
 
             if (!leaderEnabled) {
-                uiStatusEl.textContent = `Leader: OFF | ${role}`;
+                uiStatusEl.textContent = `Leader: OFF | ${role} | Core: ${coreOnline ? 'LIVE' : 'FALLBACK'}`;
                 uiStatusEl.style.color = '#AAA';
             } else {
                 uiStatusEl.textContent = iAmLeader
-                    ? `Leader: YES | ${role}`
-                    : `Leader: NO | ${role}`;
+                    ? `Leader: YES | ${role} | Core: ${coreOnline ? 'LIVE' : 'FALLBACK'}`
+                    : `Leader: NO | ${role} | Core: ${coreOnline ? 'LIVE' : 'FALLBACK'}`;
                 uiStatusEl.style.color = iAmLeader ? '#7CFF9E' : '#FFC66D';
             }
 
@@ -1464,74 +1508,112 @@
         updateUIStatus();
     }
 
+    function evaluateLifeTrigger(life) {
+        const settings = getSettings();
+
+        if (!amLeader()) return;
+        if (!Number.isFinite(life)) return;
+
+        if (lastLife === null) {
+            lastLife = life;
+            return;
+        }
+
+        if (life < lastLife) {
+            const diff = lastLife - life;
+            if (diff >= settings.minLifeDrop) {
+                const cash = getCash();
+                if (!Number.isFinite(cash) || cash < settings.minCashIncrease) {
+                    lastLife = life;
+                    return;
+                }
+                maybeAutoDeposit('life_drop', diff);
+            }
+        }
+
+        lastLife = life;
+    }
+
+    function evaluateCashTrigger(cash) {
+        const settings = getSettings();
+
+        if (!amLeader()) return;
+        if (!Number.isFinite(cash)) return;
+
+        updateUIStatus();
+
+        if (lastCash === null) {
+            lastCash = cash;
+            return;
+        }
+
+        if (!isCashModeEnabled()) {
+            lastCash = cash;
+            return;
+        }
+
+        if (cash > lastCash) {
+            const diff = cash - lastCash;
+            if (diff >= settings.minCashIncrease) {
+                lastCash = cash;
+                maybeAutoDeposit('cash_spike', diff);
+                return;
+            }
+        }
+
+        lastCash = cash;
+    }
+
+    function consumeCoreSnapshot() {
+        const dom = getCoreDomState();
+        if (!dom) return false;
+
+        const domVersion = Number(dom.domVersion);
+        if (Number.isFinite(domVersion) && domVersion === lastCoreDomVersion) {
+            return false;
+        }
+
+        if (Number.isFinite(domVersion)) {
+            lastCoreDomVersion = domVersion;
+        }
+
+        evaluateLifeTrigger(dom.life?.current);
+        evaluateCashTrigger(dom.cash?.onHand);
+        updateUIStatus();
+        return true;
+    }
+
     function watchLife() {
         if (lifeWatcherStarted) return;
         lifeWatcherStarted = true;
 
-        setInterval(() => {
-            const settings = getSettings();
+        consumeCoreSnapshot();
 
-            if (!amLeader()) return;
-
-            const life = getLife();
-            if (life === null) return;
-
-            if (lastLife === null) {
-                lastLife = life;
-                return;
-            }
-
-            if (life < lastLife) {
-                const diff = lastLife - life;
-                if (diff >= settings.minLifeDrop) {
-                    const cash = getCash();
-                    if (!Number.isFinite(cash) || cash < settings.minCashIncrease) {
-                        lastLife = life;
-                        return;
+        if (window.TornCore?.subscribe) {
+            try {
+                window.TornCore.subscribe((snapshot) => {
+                    if (snapshot?.dom) {
+                        latestCoreState = snapshot;
+                        consumeCoreSnapshot();
                     }
-                    maybeAutoDeposit('life_drop', diff);
-                }
-            }
+                });
+            } catch {}
+        }
 
-            lastLife = life;
-        }, Math.max(50, getSettings().lifePollMs));
+        setInterval(() => {
+            const consumed = consumeCoreSnapshot();
+            if (consumed) return;
+
+            // Fallback for when Torn Core is not running yet.
+            evaluateLifeTrigger(getLife());
+            evaluateCashTrigger(getCash());
+            updateUIStatus();
+        }, Math.max(50, Math.min(getSettings().lifePollMs, getSettings().cashPollMs)));
     }
 
     function watchCash() {
         if (cashWatcherStarted) return;
         cashWatcherStarted = true;
-
-        setInterval(() => {
-            const settings = getSettings();
-
-            if (!amLeader()) return;
-
-            const cash = getCash();
-            updateUIStatus();
-
-            if (cash === null) return;
-
-            if (lastCash === null) {
-                lastCash = cash;
-                return;
-            }
-
-            if (!isCashModeEnabled()) {
-                lastCash = cash;
-                return;
-            }
-
-            if (cash > lastCash) {
-                const diff = cash - lastCash;
-                if (diff >= settings.minCashIncrease) {
-                    lastCash = cash;
-                    maybeAutoDeposit('cash_spike', diff);
-                    return;
-                }
-            }
-
-            lastCash = cash;
-        }, Math.max(50, getSettings().cashPollMs));
     }
 
     function watchLeadership() {
