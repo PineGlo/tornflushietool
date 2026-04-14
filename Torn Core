@@ -409,14 +409,49 @@
             getState() {
                 return state.core;
             },
+            isLeader() {
+                return !!state.isLeader;
+            },
             getDomState() {
                 return state.core.dom;
+            },
+            getTradeState() {
+                return state.core.dom.trade;
             },
             getUsers() {
                 return state.core.users;
             },
+            getVisibleUserIds() {
+                return Object.values(state.core.users.byId)
+                    .filter(user => !user?.seen?.isStale)
+                    .map(user => Number(user.userId))
+                    .filter(Number.isFinite);
+            },
             getUser(userId) {
                 return state.core.users.byId[String(userId)] || null;
+            },
+            getFreshUser(userId, opts = {}) {
+                const user = state.core.users.byId[String(userId)] || null;
+                if (!user) return null;
+
+                const maxAgeMs = Number(opts.maxAgeMs || state.cfg.visibleUserStaleMs);
+                const requireFFFresh = !!opts.requireFFFresh;
+                const requireTornFresh = !!opts.requireTornFresh;
+                const ageMs = now() - Number(user.seen?.lastSeenAt || 0);
+
+                if (Number.isFinite(maxAgeMs) && maxAgeMs >= 0 && ageMs > maxAgeMs) return null;
+                if (requireFFFresh && !user.ff?.isFresh) return null;
+                if (requireTornFresh && !user.torn?.isFresh) return null;
+                return user;
+            },
+            getAttackLoaderRecommendation(userId) {
+                return requestBroker('user.refresh.attackLoader', { userId });
+            },
+            requestVisibleUsersFFRefresh() {
+                return requestBroker('users.visible.refresh.ff', {});
+            },
+            requestVisibleUsersTornRefresh(opts = {}) {
+                return requestBroker('users.visible.refresh.torn', opts || {});
             },
             subscribe(callback) {
                 if (typeof callback !== 'function') return () => {};
@@ -679,6 +714,53 @@
                     ok: true,
                     source: 'cache',
                     data: state.core.users,
+                });
+
+            case 'users.visible.ids':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'cache',
+                    data: {
+                        ids: getVisibleUsers().map(user => user.userId),
+                    },
+                });
+
+            case 'users.visible.refresh.ff':
+                {
+                    const userIds = getVisibleUsers().map(user => user.userId);
+                    return brokerFFBatch(userIds, makeCacheKey('user.refresh.ff.batch', { userIds }));
+                }
+
+            case 'users.visible.refresh.torn':
+                {
+                    const userIds = getVisibleUsers().map(user => user.userId);
+                    const mergedPayload = {
+                        ...(payload || {}),
+                        userIds,
+                    };
+                    return brokerTornBatch(userIds, makeCacheKey('user.refresh.torn.batch', mergedPayload), mergedPayload);
+                }
+
+            case 'users.attackCandidates':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'derived',
+                    data: {
+                        users: getVisibleUsers().filter(user =>
+                            !user?.derived?.isHospitalized &&
+                            !user?.derived?.isTraveling &&
+                            !user?.seen?.isStale
+                        ),
+                    },
+                });
+
+            case 'users.hospitalized.visible':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'derived',
+                    data: {
+                        users: getVisibleUsers().filter(user => user?.derived?.isHospitalized && !user?.seen?.isStale),
+                    },
                 });
 
             case 'user.visible':
@@ -1175,6 +1257,13 @@
         return SOURCE_PRIORITY[String(source || '').trim()] || 0;
     }
 
+    function getVisibleUsers() {
+        return Object.values(state.core.users.byId)
+            .filter(user => !user?.seen?.isStale)
+            .map(user => ({ ...user, userId: Number(user.userId) }))
+            .filter(user => Number.isFinite(user.userId));
+    }
+
     function shouldTakePatch(existingSource, patchSource, existingAt = 0, patchAt = 0) {
         const existingRank = sourceRank(existingSource);
         const patchRank = sourceRank(patchSource);
@@ -1303,6 +1392,7 @@
                 visibleEstimatedStats: '',
                 estimatedStats: null,
                 estimatedStatsHuman: '',
+                isFresh: false,
                 lastRefreshAt: 0,
                 source: 'unknown',
             },
@@ -1310,6 +1400,7 @@
                 status: '',
                 hospitalUntil: 0,
                 hospitalEtaText: '',
+                isFresh: false,
                 lastRefreshAt: 0,
                 source: 'unknown',
             }
@@ -1321,6 +1412,7 @@
         merged.seen.lastSeenPageType = state.core.dom.page.type;
 
         applyUserDerivedTiming(merged);
+        updateUserFreshnessFlags(merged);
 
         state.core.users.byId[key] = merged;
         return merged;
@@ -1358,6 +1450,23 @@
         if (!user.links.attack && user.userId) {
             user.links.attack = `/page.php?sid=attack&user2ID=${user.userId}`;
         }
+    }
+
+    function updateUserFreshnessFlags(user) {
+        const t = now();
+        const ffCutoff = t - state.cfg.ffBatchTtlMs;
+        const tornCutoff = t - state.cfg.tornBatchTtlMs;
+        const attackTruthCutoff = t - state.cfg.attackTruthTtlMs;
+        const profileTruthCutoff = t - state.cfg.profileTruthTtlMs;
+
+        user.ff.isFresh = Number(user.ff?.lastRefreshAt || 0) >= ffCutoff;
+        user.torn.isFresh = Number(user.torn?.lastRefreshAt || 0) >= tornCutoff;
+        user.seen.hasRecentAttackTruth =
+            user.torn?.source === 'attack_loader' &&
+            Number(user.torn?.lastRefreshAt || 0) >= attackTruthCutoff;
+        user.seen.hasRecentProfileTruth =
+            user.torn?.source === 'profile_dom' &&
+            Number(user.torn?.lastRefreshAt || 0) >= profileTruthCutoff;
     }
 
     function scanFactionRows() {
@@ -1512,8 +1621,6 @@
     function pruneStaleUsers() {
         const staleMs = state.cfg.visibleUserStaleMs;
         const cutoff = now() - staleMs;
-        const attackTruthCutoff = now() - state.cfg.attackTruthTtlMs;
-        const profileTruthCutoff = now() - state.cfg.profileTruthTtlMs;
 
         for (const [key, user] of Object.entries(state.core.users.byId)) {
             if (Number(user.seen.lastSeenAt || 0) < cutoff) {
@@ -1523,24 +1630,51 @@
                 user.seen.isStale = false;
             }
 
-            user.seen.attackTruthStale = !(
-                user.torn?.source === 'attack_loader' &&
-                Number(user.torn?.lastRefreshAt || 0) >= attackTruthCutoff
-            );
-            user.seen.profileTruthStale = !(
-                user.torn?.source === 'profile_dom' &&
-                Number(user.torn?.lastRefreshAt || 0) >= profileTruthCutoff
-            );
+            updateUserFreshnessFlags(user);
+            user.seen.attackTruthStale = !user.seen.hasRecentAttackTruth;
+            user.seen.profileTruthStale = !user.seen.hasRecentProfileTruth;
             state.core.users.byId[key] = user;
         }
     }
 
+    const PAGE_ADAPTERS = {
+        vault: {
+            run() {
+                return;
+            },
+        },
+        faction: {
+            run() {
+                scanFactionRows();
+            },
+        },
+        profile: {
+            run() {
+                scanProfilePage();
+            },
+        },
+        attack: {
+            run() {
+                scanAttackPageTarget();
+            },
+        },
+        trade: {
+            run() {
+                return;
+            },
+        },
+    };
+
     function runPageAdapters() {
         updateDomState();
         scanGenericProfileLinks();
-        scanFactionRows();
-        scanProfilePage();
-        scanAttackPageTarget();
+
+        PAGE_ADAPTERS.vault.run();
+        PAGE_ADAPTERS.faction.run();
+        PAGE_ADAPTERS.profile.run();
+        PAGE_ADAPTERS.attack.run();
+        PAGE_ADAPTERS.trade.run();
+
         pruneStaleUsers();
 
         state.core.ts = now();
