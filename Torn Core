@@ -45,9 +45,22 @@
         tornBatchTtlMs: 60 * 1000,
         ffBatchTtlMs: 3 * 24 * 60 * 60 * 1000,
         visibleUserStaleMs: 120 * 1000,
+        attackTruthTtlMs: 60 * 1000,
+        profileTruthTtlMs: 5 * 60 * 1000,
 
         debug: false,
         showPanel: true,
+    };
+
+    const SOURCE_PRIORITY = {
+        unknown: 0,
+        dom_visible: 1,
+        profile_dom: 2,
+        ff_visible_dom: 2,
+        ff_cache_db: 3,
+        torn_batch_api: 3,
+        ff_batch_api: 4,
+        attack_loader: 5,
     };
 
     const state = {
@@ -261,6 +274,34 @@
         return m ? Number(m[1]) : null;
     }
 
+    function normalizeStatusText(text) {
+        const s = normalizeText(text).toLowerCase();
+        if (!s) return '';
+        if (s === 'okay') return 'Okay';
+        if (s.includes('hospital')) return 'Hospital';
+        if (s.includes('traveling') || s.includes('returning to torn')) return 'Traveling';
+        return '';
+    }
+
+    function parseTravelDestination(text) {
+        const normalized = normalizeText(text);
+        if (!normalized) return '';
+        const toMatch = normalized.match(/traveling to\s+(.+)$/i);
+        if (toMatch) return normalizeText(toMatch[1]);
+        const returnMatch = normalized.match(/returning to\s+(.+)$/i);
+        if (returnMatch) return normalizeText(returnMatch[1]);
+        return '';
+    }
+
+    function parseHospitalEtaText(text) {
+        const normalized = normalizeText(text);
+        if (!normalized) return '';
+        const eta = normalized.match(/Release ETA:\s*(.+?)\.?$/i);
+        if (eta) return normalizeText(eta[1]);
+        const fallback = normalized.match(/(\d+\s*h)?\s*(\d+\s*m)?\s*(\d+\s*s)?/i);
+        return fallback ? normalizeText(fallback[0]) : '';
+    }
+
     function fmtMoney(v) {
         return Number.isFinite(v) ? `$${Math.round(v).toLocaleString()}` : '-';
     }
@@ -469,6 +510,56 @@
         return !!entry && (now() - Number(entry.ts || 0)) < ttlMs;
     }
 
+    function openIndexedDb(dbName) {
+        return new Promise((resolve, reject) => {
+            try {
+                const req = indexedDB.open(dbName);
+                req.onerror = () => reject(req.error || new Error(`Failed to open DB ${dbName}`));
+                req.onsuccess = () => resolve(req.result);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    function readAllRows(db, storeName) {
+        return new Promise((resolve, reject) => {
+            try {
+                const tx = db.transaction(storeName, 'readonly');
+                const store = tx.objectStore(storeName);
+                const req = store.getAll();
+                req.onerror = () => reject(req.error || new Error('getAll failed'));
+                req.onsuccess = () => resolve(req.result || []);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+
+    async function loadFFRowsByUserIds(userIds) {
+        const wanted = new Set((userIds || []).map(Number).filter(Number.isFinite));
+        if (!wanted.size) return {};
+
+        let db = null;
+        try {
+            db = await openIndexedDb('ffscouter-cache');
+            const rows = await readAllRows(db, 'cache');
+            const out = {};
+
+            for (const row of rows) {
+                const id = Number(row?.player_id);
+                if (!Number.isFinite(id) || !wanted.has(id)) continue;
+                out[String(id)] = row;
+            }
+            return out;
+        } catch (err) {
+            log('FF cache read failed', err);
+            return {};
+        } finally {
+            try { db?.close(); } catch (_) {}
+        }
+    }
+
     function handleBrokerRequest(req) {
         const { type, payload } = req;
         const cacheKey = makeCacheKey(type, payload);
@@ -499,16 +590,29 @@
                 return brokerFFBatch(payload.userIds || [], cacheKey);
 
             case 'user.refresh.torn.batch':
-                return brokerTornBatch(payload.userIds || [], cacheKey);
+                return brokerTornBatch(payload.userIds || [], cacheKey, payload);
 
             case 'user.refresh.attackLoader':
-                return Promise.resolve({
-                    ok: true,
-                    source: 'scaffold',
-                    data: {
-                        recommendedUrl: `/page.php?sid=attack&user2ID=${Number(payload.userId) || 0}`,
-                    }
-                });
+                {
+                    const userId = Number(payload.userId);
+                    const cachedUser = Number.isFinite(userId) ? (state.core.users.byId[String(userId)] || null) : null;
+                    const hasRecentAttackTruth =
+                        !!cachedUser &&
+                        cachedUser.torn?.source === 'attack_loader' &&
+                        (now() - Number(cachedUser.torn?.lastRefreshAt || 0)) <= state.cfg.attackTruthTtlMs;
+
+                    return Promise.resolve({
+                        ok: true,
+                        source: 'attack_loader_recommendation',
+                        data: {
+                            userId: Number.isFinite(userId) ? userId : null,
+                            recommendedUrl: `/page.php?sid=attack&user2ID=${Number(payload.userId) || 0}`,
+                            cachedUser,
+                            hasRecentAttackTruth,
+                            preferredSingleRefreshPath: 'attack_loader',
+                        }
+                    });
+                }
 
             default:
                 return Promise.resolve({
@@ -534,12 +638,33 @@
             return state.core.api.inFlight[cacheKey];
         }
 
-        const promise = new Promise((resolve) => {
-            // scaffold only
+        const promise = new Promise(async (resolve) => {
+            const ffRows = await loadFFRowsByUserIds(uniqueIds);
+            const mergedUsers = [];
+
+            for (const id of uniqueIds) {
+                const row = ffRows[String(id)];
+                if (!row) continue;
+
+                ensureUserRecord(id, {
+                    ff: {
+                        estimatedStats: row.bs_estimate ?? null,
+                        estimatedStatsHuman: row.bs_estimate_human || '',
+                        visibleFairFight: row.ff_visible || '',
+                        visibleEstimatedStats: row.ff_estimate_visible || '',
+                        lastRefreshAt: now(),
+                        source: 'ff_batch_api',
+                    }
+                });
+                mergedUsers.push(id);
+            }
+
             const data = {
                 userIds: uniqueIds,
-                status: 'stub',
-                message: 'FF batch broker scaffold ready. Wire actual batch request next.',
+                mergedUserIds: mergedUsers,
+                found: mergedUsers.length,
+                missing: uniqueIds.length - mergedUsers.length,
+                status: 'ok',
             };
 
             state.core.api.cache.ff[cacheKey] = {
@@ -552,7 +677,7 @@
 
             resolve({
                 ok: true,
-                source: 'stub',
+                source: 'ff_batch_api',
                 data,
             });
         });
@@ -561,8 +686,24 @@
         return promise;
     }
 
-    function brokerTornBatch(userIds, cacheKey) {
+    function brokerTornBatch(userIds, cacheKey, payload = {}) {
         const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+        if (uniqueIds.length === 1 && !payload.forceSingleApi) {
+            const singleUserId = uniqueIds[0];
+            const cachedUser = state.core.users.byId[String(singleUserId)] || null;
+            return Promise.resolve({
+                ok: true,
+                source: 'policy',
+                data: {
+                    userIds: uniqueIds,
+                    usedApi: false,
+                    reason: 'Single-user refresh prefers attack loader/profile/visible DOM before API.',
+                    recommendation: `/page.php?sid=attack&user2ID=${singleUserId}`,
+                    cachedUser,
+                }
+            });
+        }
+
         const cached = state.core.api.cache.torn[cacheKey];
 
         if (isFresh(cached, state.cfg.tornBatchTtlMs)) {
@@ -870,6 +1011,89 @@
         if (Number.isFinite(vault.cash)) state.prev.vaultCash = vault.cash;
     }
 
+    function sourceRank(source) {
+        return SOURCE_PRIORITY[String(source || '').trim()] || 0;
+    }
+
+    function shouldTakePatch(existingSource, patchSource, existingAt = 0, patchAt = 0) {
+        const existingRank = sourceRank(existingSource);
+        const patchRank = sourceRank(patchSource);
+        if (patchRank > existingRank) return true;
+        if (patchRank < existingRank) return false;
+        return Number(patchAt || 0) >= Number(existingAt || 0);
+    }
+
+    function mergeTruthyText(currentValue, nextValue) {
+        const next = normalizeText(nextValue);
+        return next || currentValue || '';
+    }
+
+    function mergeUserRecord(existing, patch = {}) {
+        const merged = JSON.parse(JSON.stringify(existing));
+
+        merged.name = mergeTruthyText(merged.name, patch.name);
+        merged.links = {
+            ...merged.links,
+            ...(patch.links || {}),
+        };
+
+        if (patch.dom) {
+            const dom = patch.dom;
+            merged.dom.statusText = mergeTruthyText(merged.dom.statusText, normalizeStatusText(dom.statusText));
+            merged.dom.statusClass = mergeTruthyText(merged.dom.statusClass, dom.statusClass);
+            merged.dom.hospitalText = mergeTruthyText(merged.dom.hospitalText, dom.hospitalText);
+            merged.dom.hospitalReason = mergeTruthyText(merged.dom.hospitalReason, dom.hospitalReason);
+            merged.dom.travelText = mergeTruthyText(merged.dom.travelText, dom.travelText);
+            merged.dom.travelDestination = mergeTruthyText(merged.dom.travelDestination, dom.travelDestination || parseTravelDestination(dom.travelText));
+            merged.dom.roleText = mergeTruthyText(merged.dom.roleText, dom.roleText);
+            merged.dom.levelText = mergeTruthyText(merged.dom.levelText, dom.levelText);
+        }
+
+        if (patch.ff) {
+            const patchSource = patch.ff.source || merged.ff.source || 'unknown';
+            const patchAt = Number(patch.ff.lastRefreshAt || 0);
+            const existingAt = Number(merged.ff.lastRefreshAt || 0);
+
+            merged.ff.visibleFairFight = mergeTruthyText(merged.ff.visibleFairFight, patch.ff.visibleFairFight);
+            merged.ff.visibleEstimatedStats = mergeTruthyText(merged.ff.visibleEstimatedStats, patch.ff.visibleEstimatedStats);
+
+            const hasPatchEstimate = patch.ff.estimatedStats != null || patch.ff.estimatedStatsHuman;
+            if (hasPatchEstimate && shouldTakePatch(merged.ff.source, patchSource, existingAt, patchAt)) {
+                if (patch.ff.estimatedStats != null) merged.ff.estimatedStats = patch.ff.estimatedStats;
+                merged.ff.estimatedStatsHuman = mergeTruthyText(merged.ff.estimatedStatsHuman, patch.ff.estimatedStatsHuman);
+                merged.ff.lastRefreshAt = patchAt || now();
+                merged.ff.source = patchSource;
+            } else if (!merged.ff.source && patchSource) {
+                merged.ff.source = patchSource;
+            }
+        }
+
+        if (patch.torn) {
+            const patchSource = patch.torn.source || merged.torn.source || 'unknown';
+            const patchAt = Number(patch.torn.lastRefreshAt || 0);
+            const existingAt = Number(merged.torn.lastRefreshAt || 0);
+            const canReplace = shouldTakePatch(merged.torn.source, patchSource, existingAt, patchAt);
+
+            if (canReplace) {
+                merged.torn.status = mergeTruthyText(merged.torn.status, normalizeStatusText(patch.torn.status));
+                const nextUntil = Number(patch.torn.hospitalUntil || 0);
+                if (Number.isFinite(nextUntil) && nextUntil > 0) {
+                    merged.torn.hospitalUntil = nextUntil;
+                }
+                merged.torn.hospitalEtaText = mergeTruthyText(
+                    merged.torn.hospitalEtaText,
+                    patch.torn.hospitalEtaText || parseHospitalEtaText(patch.dom?.hospitalText)
+                );
+                merged.torn.lastRefreshAt = patchAt || now();
+                merged.torn.source = patchSource;
+            } else if (!merged.torn.source && patchSource) {
+                merged.torn.source = patchSource;
+            }
+        }
+
+        return merged;
+    }
+
     function ensureUserRecord(userId, patch = {}) {
         const key = String(userId);
         const existing = state.core.users.byId[key] || {
@@ -920,16 +1144,18 @@
                 estimatedStats: null,
                 estimatedStatsHuman: '',
                 lastRefreshAt: 0,
+                source: 'unknown',
             },
             torn: {
                 status: '',
                 hospitalUntil: 0,
                 hospitalEtaText: '',
                 lastRefreshAt: 0,
+                source: 'unknown',
             }
         };
 
-        const merged = deepMerge(existing, patch);
+        const merged = mergeUserRecord(existing, patch);
         merged.seen.lastSeenAt = now();
         merged.seen.lastSeenHref = location.href;
         merged.seen.lastSeenPageType = state.core.dom.page.type;
@@ -974,18 +1200,6 @@
         }
     }
 
-    function deepMerge(base, patch) {
-        const out = Array.isArray(base) ? base.slice() : { ...base };
-        for (const [k, v] of Object.entries(patch || {})) {
-            if (v && typeof v === 'object' && !Array.isArray(v) && out[k] && typeof out[k] === 'object' && !Array.isArray(out[k])) {
-                out[k] = deepMerge(out[k], v);
-            } else {
-                out[k] = v;
-            }
-        }
-        return out;
-    }
-
     function scanFactionRows() {
         if (!state.core.dom.page.isFactionPage) return;
 
@@ -1026,6 +1240,13 @@
                 ff: {
                     visibleFairFight: ffVisible,
                     visibleEstimatedStats: ffEstimateVisible,
+                    source: 'ff_visible_dom',
+                    lastRefreshAt: now(),
+                },
+                torn: {
+                    status: normalizeStatusText(statusText),
+                    source: 'dom_visible',
+                    lastRefreshAt: now(),
                 },
             });
         }
@@ -1051,6 +1272,12 @@
             patch.dom.hospitalText = mainDesc;
             patch.dom.hospitalReason = subDesc;
             patch.dom.statusText = 'Hospital';
+            patch.torn = {
+                status: 'Hospital',
+                hospitalEtaText: parseHospitalEtaText(mainDesc),
+                source: 'profile_dom',
+                lastRefreshAt: now(),
+            };
         } else if (/traveling to/i.test(mainDesc) || /returning to torn/i.test(mainDesc)) {
             patch.dom.travelText = mainDesc;
             patch.dom.statusText = 'Traveling';
@@ -1059,6 +1286,18 @@
             if (m) {
                 patch.dom.travelDestination = normalizeText(m[1]);
             }
+            patch.torn = {
+                status: 'Traveling',
+                source: 'profile_dom',
+                lastRefreshAt: now(),
+            };
+        } else if (/okay/i.test(mainDesc)) {
+            patch.dom.statusText = 'Okay';
+            patch.torn = {
+                status: 'Okay',
+                source: 'profile_dom',
+                lastRefreshAt: now(),
+            };
         }
 
         ensureUserRecord(userId, patch);
@@ -1080,8 +1319,10 @@
                     statusText: 'Hospital',
                 },
                 torn: {
+                    status: 'Hospital',
                     hospitalEtaText: etaText || '',
                     lastRefreshAt: now(),
+                    source: 'attack_loader',
                 },
             });
         }
@@ -1111,6 +1352,8 @@
     function pruneStaleUsers() {
         const staleMs = state.cfg.visibleUserStaleMs;
         const cutoff = now() - staleMs;
+        const attackTruthCutoff = now() - state.cfg.attackTruthTtlMs;
+        const profileTruthCutoff = now() - state.cfg.profileTruthTtlMs;
 
         for (const [key, user] of Object.entries(state.core.users.byId)) {
             if (Number(user.seen.lastSeenAt || 0) < cutoff) {
@@ -1119,6 +1362,16 @@
             } else {
                 user.seen.isStale = false;
             }
+
+            user.seen.attackTruthStale = !(
+                user.torn?.source === 'attack_loader' &&
+                Number(user.torn?.lastRefreshAt || 0) >= attackTruthCutoff
+            );
+            user.seen.profileTruthStale = !(
+                user.torn?.source === 'profile_dom' &&
+                Number(user.torn?.lastRefreshAt || 0) >= profileTruthCutoff
+            );
+            state.core.users.byId[key] = user;
         }
     }
 
