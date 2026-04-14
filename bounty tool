@@ -6,8 +6,6 @@
 // @author       Pineglow
 // @match        https://www.torn.com/bounties.php*
 // @match        https://www.torn.com/page.php?sid=attack*
-// @grant        GM_xmlhttpRequest
-// @connect      api.torn.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -36,9 +34,7 @@
         apiBurstSize: 10,
         apiBurstWindowMs: 2000,
         apiBurstCooldownMs: 8000,
-        apiLoopTickMs: 100,
-
-        apiBase: 'https://api.torn.com/user'
+        apiLoopTickMs: 100
     };
 
     /******************************************************************
@@ -58,7 +54,6 @@
 
             apiEnabled: false,
             useCoreBroker: true,
-            apiKey: '',
             forceFreshApi: false,
             hospSoonEnabled: false,
             hospSoonMaxMinutes: 3,
@@ -261,12 +256,35 @@
         ).trim();
     }
 
-    function getCoreHospitalUntilMs(playerId) {
+    function normalizeCoreContract(playerId, tornRecord) {
+        if (!tornRecord || typeof tornRecord !== 'object') return null;
+
+        const status = normalizeStatusText(tornRecord.status || '');
+        const until = Number(tornRecord.hospitalUntil);
+        const untilMs = Number.isFinite(until) && until > 0 ? (until < 1e12 ? until * 1000 : until) : null;
+        const lastRefreshAt = Number(tornRecord.lastRefreshAt || 0);
+        const source = String(tornRecord.source || '');
+
+        if (!status && !Number.isFinite(untilMs)) return null;
+        if (!lastRefreshAt) return null;
+
+        return {
+            playerId: Number(playerId),
+            ok: true,
+            state: status || '',
+            untilMs,
+            fetchedAt: lastRefreshAt,
+            source: source || 'core'
+        };
+    }
+
+    function getCoreContractForUser(playerId) {
         const user = getCoreUser(playerId);
-        if (!user) return null;
-        const until = Number(user.torn?.hospitalUntil);
-        if (!Number.isFinite(until) || until <= 0) return null;
-        return until < 1e12 ? until * 1000 : until;
+        return normalizeCoreContract(playerId, user?.torn || null);
+    }
+
+    function isApiRowFresh(apiRow) {
+        return !!apiRow && (nowMs() - Number(apiRow.fetchedAt || 0)) <= CONFIG.apiStaleMs;
     }
 
     function createEl(tag, props = {}, children = []) {
@@ -539,24 +557,6 @@
             ])
         ]);
 
-        const apiKeyRow = createEl('div', { className: 'bha-row' }, [
-            createEl('label', {}, [
-                document.createTextNode('Torn API key (legacy)'),
-                createEl('input', {
-                    type: 'password',
-                    value: state.settings.apiKey || '',
-                    placeholder: 'key',
-                    onchange: (e) => {
-                        state.settings.apiKey = String(e.target.value || '').trim();
-                        saveSettings();
-                        clearApiCache();
-                        queueCurrentPageHospitalTargets(true);
-                        scheduleScan();
-                    }
-                })
-            ])
-        ]);
-
         const btnRow = createEl('div', { className: 'bha-btn-row' }, [
             createEl('button', {
                 className: 'bha-btn',
@@ -615,7 +615,7 @@
 
         const help = createEl('div', {
             className: 'bha-help',
-            text: 'Recommended for near-release bounty hunting: Status = Hospital only, Enable Torn API = on, Hosp soon = on.'
+            text: 'Recommended: Status = Hospital only, Enable Torn API = on, Use Torn Core broker/cache = on, Hosp soon = on.'
         });
 
         body.append(
@@ -632,7 +632,6 @@
             createEl('div', { className: 'bha-subhead', text: 'Hospital API timing' }),
             checkboxRow('Enable Torn API', 'apiEnabled'),
             checkboxRow('Use Torn Core broker/cache', 'useCoreBroker'),
-            apiKeyRow,
             checkboxRow('Force fresh API', 'forceFreshApi'),
             checkboxRow('Hosp soon enabled', 'hospSoonEnabled'),
             numberRow('Hosp soon max minutes', 'hospSoonMaxMinutes', 1, 0),
@@ -753,10 +752,6 @@
         return state.apiCache.get(Number(playerId)) || null;
     }
 
-    function hasUsableLocalApiKey() {
-        return false;
-    }
-
     function canUseCoreBroker() {
         return !!(
             state.settings.apiEnabled &&
@@ -768,13 +763,6 @@
 
     function hasAnyApiSource() {
         return canUseCoreBroker();
-    }
-
-    function convertUntilToMs(until) {
-        if (until == null) return null;
-        const n = Number(until);
-        if (!Number.isFinite(n) || n <= 0) return null;
-        return n < 1e12 ? n * 1000 : n;
     }
 
     function queueApiPlayer(playerId, force = false) {
@@ -796,31 +784,34 @@
             return { ok: false, error: 'Core broker unavailable', playerId };
         }
 
+        let brokerResult = null;
         try {
-            await window.TornCore.request('user.refresh.torn.batch', {
+            brokerResult = await window.TornCore.request('user.refresh.torn.batch', {
                 userIds: [Number(playerId)],
                 forceFresh: !!forceFresh,
                 forceSingleApi: !!forceFresh
             });
         } catch {}
 
-        const untilMs = getCoreHospitalUntilMs(playerId);
-        const statusText = getCoreStatusTextForUser(playerId);
+        const resultRow = brokerResult?.data?.results?.[String(Number(playerId))] || null;
+        const fromBrokerContract = normalizeCoreContract(playerId, resultRow?.torn || null);
+        const fromUserCacheContract = getCoreContractForUser(playerId);
+        const contract = fromBrokerContract || fromUserCacheContract;
 
-        if (Number.isFinite(untilMs) || statusText) {
+        if (contract) {
             return {
                 ok: true,
                 playerId,
-                state: statusText || '',
-                untilMs: untilMs ?? null,
-                fetchedAt: nowMs(),
-                source: 'core'
+                state: contract.state || '',
+                untilMs: contract.untilMs ?? null,
+                fetchedAt: contract.fetchedAt || nowMs(),
+                source: contract.source || 'core'
             };
         }
 
         return {
             ok: false,
-            error: 'Core had no fresh data',
+            error: brokerResult?.data?.reason || 'Core had no contract data',
             playerId,
             source: 'core'
         };
@@ -861,71 +852,6 @@
         for (const c of candidates.slice(0, CONFIG.maxQueuedPerSweep)) {
             queueApiPlayer(c.playerId, force);
         }
-    }
-
-    function requestTornProfile(playerId, forceFresh = false) {
-        return new Promise((resolve) => {
-            const key = encodeURIComponent(String(state.settings.apiKey || '').trim());
-            let url = `${CONFIG.apiBase}/${playerId}?selections=profile&key=${key}&comment=bha_hosp`;
-            if (forceFresh || state.settings.forceFreshApi) {
-                url += `&timestamp=${Date.now()}`;
-            }
-
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url,
-                onload: (response) => {
-                    try {
-                        const data = JSON.parse(response.responseText || '{}');
-
-                        if (data.error) {
-                            const errCode = Number(data.error.code);
-                            const errMsg = data.error.error || data.error.code || 'API error';
-
-                            if (errCode === 5) {
-                                state.rateLimitedUntil = Date.now() + 15000;
-                            }
-
-                            resolve({
-                                ok: false,
-                                error: errMsg,
-                                errorCode: errCode,
-                                playerId
-                            });
-                            return;
-                        }
-
-                        const statusObj = data.status || {};
-                        const stateText = statusObj.state || statusObj.description || '';
-                        const untilMs = convertUntilToMs(statusObj.until);
-
-                        resolve({
-                            ok: true,
-                            playerId,
-                            state: String(stateText || ''),
-                            untilMs,
-                            fetchedAt: nowMs()
-                        });
-                    } catch (err) {
-                        resolve({
-                            ok: false,
-                            error: 'Parse error',
-                            playerId
-                        });
-                    }
-                },
-                onerror: () => resolve({
-                    ok: false,
-                    error: 'Network error',
-                    playerId
-                }),
-                ontimeout: () => resolve({
-                    ok: false,
-                    error: 'Timeout',
-                    playerId
-                })
-            });
-        });
     }
 
     async function processApiQueue() {
@@ -1085,20 +1011,11 @@
         if (flags.isHospital && state.settings.apiEnabled) {
             apiRow = getApiRow(item.playerId);
             if (!apiRow) {
-                const coreUntilMs = getCoreHospitalUntilMs(item.playerId);
-                const coreStatusText = getCoreStatusTextForUser(item.playerId);
-                if (coreUntilMs || coreStatusText) {
-                    apiRow = {
-                        ok: true,
-                        state: coreStatusText || 'Hospital',
-                        untilMs: coreUntilMs,
-                        fetchedAt: nowMs(),
-                        source: 'core-cache'
-                    };
-                }
+                const coreContract = getCoreContractForUser(item.playerId);
+                if (coreContract) apiRow = coreContract;
             }
 
-            const stale = !apiRow || (nowMs() - apiRow.fetchedAt) > CONFIG.apiStaleMs;
+            const stale = !isApiRowFresh(apiRow);
             if (stale) queueApiPlayer(item.playerId, false);
 
             if (state.settings.hospSoonEnabled) {
