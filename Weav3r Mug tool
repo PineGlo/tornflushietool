@@ -244,6 +244,10 @@
       outline: 1px solid rgba(74, 222, 128, 0.6) !important;
       box-shadow: inset 0 0 0 9999px rgba(22, 101, 52, 0.15);
     }
+    .wmh-row-bad {
+      outline: 1px solid rgba(248, 113, 113, 0.55) !important;
+      box-shadow: inset 0 0 0 9999px rgba(127, 29, 29, 0.12);
+    }
   `);
 
   function loadConfig() {
@@ -631,32 +635,25 @@
     const okay = statusText === "Okay";
     const underCap = Number.isFinite(bs) && bs <= threshold;
     const good = okay && underCap;
+    const evaluable = !!truth.status && Number.isFinite(bs);
+    const bad = evaluable && !good;
+    const bsText = truth.estimatedStatsHuman || (Number.isFinite(bs) ? humanizeNumber(bs) : "?");
 
     if (seller.badgeEl) {
       seller.badgeEl.className = "wmh-badge neutral";
-
-      if (!truth.status && !Number.isFinite(bs)) {
-        seller.badgeEl.textContent = "Checking...";
-      } else if (truth.status && !Number.isFinite(bs)) {
-        seller.badgeEl.textContent = `${statusText} | FF...`;
-        seller.badgeEl.classList.add(statusText === "Okay" ? "ok" : "bad");
-      } else if (!truth.status && Number.isFinite(bs)) {
-        seller.badgeEl.textContent = `...? | ${truth.estimatedStatsHuman || humanizeNumber(bs)}`;
+      seller.badgeEl.textContent = `${truth.status || "Unknown"} | ${bsText}`;
+      if (good) {
+        seller.badgeEl.classList.add("ok");
+      } else if (bad) {
+        seller.badgeEl.classList.add("bad");
       } else {
-        const bsText = truth.estimatedStatsHuman || humanizeNumber(bs);
-        seller.badgeEl.textContent = `${statusText} | ${bsText}`;
-        if (good) {
-          seller.badgeEl.classList.add("ok");
-        } else if (statusText !== "Okay" || (Number.isFinite(bs) && bs > threshold)) {
-          seller.badgeEl.classList.add("bad");
-        } else {
-          seller.badgeEl.classList.add("neutral");
-        }
+        seller.badgeEl.classList.add("neutral");
       }
     }
 
     if (seller.row) {
       seller.row.classList.toggle("wmh-row-good", good);
+      seller.row.classList.toggle("wmh-row-bad", bad);
     }
   }
 
