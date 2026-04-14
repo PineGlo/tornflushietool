@@ -23,7 +23,9 @@
         panelY: 'ttap_panelY',
         manualLeaderId: 'ttap_manualLeaderId',
         jitterMin: 'ttap_jitterMin',
-        jitterMax: 'ttap_jitterMax'
+        jitterMax: 'ttap_jitterMax',
+        lastPostTs: 'ttap_lastPostTs',
+        nextDueAt: 'ttap_nextDueAt'
     };
 
     const SESSION_KEYS = {
@@ -57,12 +59,17 @@
         jitterMin: Math.max(MIN_INTERVAL_SEC, Number(GM_getValue(STORAGE_KEYS.jitterMin, 61)) || 61),
         jitterMax: Math.max(MIN_INTERVAL_SEC, Number(GM_getValue(STORAGE_KEYS.jitterMax, 75)) || 75),
         nextDelayMs: 0,
-        lastPostTs: 0,
+        nextDueAt: Number(GM_getValue(STORAGE_KEYS.nextDueAt, 0)) || 0,
+        lastPostTs: Number(GM_getValue(STORAGE_KEYS.lastPostTs, 0)) || 0,
         postingNow: false
     };
 
     if (state.jitterMax < state.jitterMin) {
         state.jitterMax = state.jitterMin;
+    }
+
+    if (state.nextDueAt > 0 && state.lastPostTs > 0) {
+        state.nextDelayMs = Math.max(0, state.nextDueAt - state.lastPostTs);
     }
 
     /**********************************************************************
@@ -298,6 +305,23 @@
         return Math.floor((Math.random() * (max - min) + min) * 1000);
     }
 
+    function persistSchedule() {
+        setValue(STORAGE_KEYS.lastPostTs, Number(state.lastPostTs) || 0);
+        setValue(STORAGE_KEYS.nextDueAt, Number(state.nextDueAt) || 0);
+    }
+
+    function scheduleNextPost(anchorTs = now()) {
+        state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+        state.nextDueAt = Number(anchorTs) + state.nextDelayMs;
+        persistSchedule();
+    }
+
+    function clearSchedule() {
+        state.nextDelayMs = 0;
+        state.nextDueAt = 0;
+        persistSchedule();
+    }
+
     /**********************************************************************
      * Manual leader system
      **********************************************************************/
@@ -482,10 +506,14 @@
         if (!msg) return;
 
         if (!state.nextDelayMs) {
-            state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+            if (state.nextDueAt > now()) {
+                state.nextDelayMs = Math.max(0, state.nextDueAt - state.lastPostTs);
+            } else {
+                scheduleNextPost(state.lastPostTs || now());
+            }
         }
 
-        const dueAt = state.lastPostTs + state.nextDelayMs;
+        const dueAt = state.nextDueAt || (state.lastPostTs + state.nextDelayMs);
         if (now() < dueAt) return;
 
         state.postingNow = true;
@@ -495,7 +523,7 @@
             const result = await postMessageOnce(msg);
             if (result.ok) {
                 state.lastPostTs = now();
-                state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+                scheduleNextPost(state.lastPostTs);
             } else {
                 console.warn('[TTAP] Post failed:', result.reason);
             }
@@ -579,7 +607,7 @@
 
     function updatePanel() {
         const leader = isLeader();
-        const dueAt = state.lastPostTs + (state.nextDelayMs || 0);
+        const dueAt = state.nextDueAt || (state.lastPostTs + (state.nextDelayMs || 0));
         const remaining = Math.max(0, dueAt - now());
 
         leaderCheckbox.checked = leader;
@@ -617,7 +645,7 @@
         setValue(STORAGE_KEYS.jitterMin, state.jitterMin);
         setValue(STORAGE_KEYS.jitterMax, state.jitterMax);
 
-        state.nextDelayMs = 0;
+        clearSchedule();
         updatePanel();
     });
 
@@ -628,7 +656,7 @@
 
         setValue(STORAGE_KEYS.jitterMax, state.jitterMax);
 
-        state.nextDelayMs = 0;
+        clearSchedule();
         updatePanel();
     });
 
@@ -646,6 +674,9 @@
     toggleBtn.addEventListener('click', () => {
         state.enabled = !state.enabled;
         setValue(STORAGE_KEYS.enabled, state.enabled);
+        if (state.enabled && !state.nextDueAt) {
+            scheduleNextPost(state.lastPostTs || now());
+        }
         updatePanel();
     });
 
@@ -668,7 +699,7 @@
             const result = await postMessageOnce(msg);
             if (result.ok) {
                 state.lastPostTs = now();
-                state.nextDelayMs = randomDelayMs(state.jitterMin, state.jitterMax);
+                scheduleNextPost(state.lastPostTs);
             } else {
                 alert(`Post failed: ${result.reason}`);
             }
