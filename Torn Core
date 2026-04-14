@@ -4,6 +4,7 @@
 // @version      2.0.0
 // @description  Shared Torn runtime core: page adapters, DOM state, visible-user cache, API broker scaffold, and request bus.
 // @match        https://www.torn.com/*
+// @match        https://weav3r.dev/item/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
@@ -226,6 +227,10 @@
         const created = `core_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
         sessionStorage.setItem(STORAGE_KEYS.tabId, created);
         return created;
+    }
+
+    function isWeav3rPage() {
+        return location.hostname === 'weav3r.dev' && location.pathname.startsWith('/item/');
     }
 
     function loadSettings() {
@@ -1956,7 +1961,107 @@
         });
     }
 
+    function requestBridgeBroker(type, payload = {}) {
+        const requestId = `bridge_req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const raw = GM_getValue(BRIDGE_KEYS.requests, []);
+        const queue = Array.isArray(raw) ? raw : [];
+        queue.push({
+            id: requestId,
+            type,
+            payload,
+            requester: state.tabId,
+            createdAt: now(),
+        });
+        GM_setValue(BRIDGE_KEYS.requests, queue.slice(-200));
+
+        return new Promise((resolve) => {
+            const started = now();
+            const poll = setInterval(() => {
+                const rawResponses = GM_getValue(BRIDGE_KEYS.responses, []);
+                const responses = Array.isArray(rawResponses) ? rawResponses : [];
+                const hit = responses.find((r) => r?.requestId === requestId);
+                if (hit) {
+                    clearInterval(poll);
+                    resolve(hit.result || { ok: false, error: 'Empty bridge response.' });
+                    return;
+                }
+                if ((now() - started) > 9000) {
+                    clearInterval(poll);
+                    resolve({ ok: false, timeout: true, error: 'Bridge response timeout.' });
+                }
+            }, 300);
+        });
+    }
+
+    function exposeBridgeWindowApi(snapshot) {
+        const current = snapshot || GM_getValue(BRIDGE_KEYS.snapshot, null) || {};
+        window.__TORN_CORE_STATE__ = current;
+        window.TornCore = {
+            getState() {
+                return GM_getValue(BRIDGE_KEYS.snapshot, null) || current || null;
+            },
+            getDomState() {
+                return (GM_getValue(BRIDGE_KEYS.snapshot, null) || current || {}).dom || null;
+            },
+            getUsers() {
+                return (GM_getValue(BRIDGE_KEYS.snapshot, null) || current || {}).users || { byId: {} };
+            },
+            getUser(userId) {
+                const snap = GM_getValue(BRIDGE_KEYS.snapshot, null) || current || {};
+                return snap?.users?.byId?.[String(userId)] || null;
+            },
+            async getFreshUser(userId, opts = {}) {
+                const id = Number(userId);
+                if (!Number.isFinite(id)) return null;
+                if (opts.ff) {
+                    await requestBridgeBroker('user.refresh.ff.batch', { userIds: [id] });
+                }
+                if (opts.torn !== false) {
+                    await requestBridgeBroker('user.refresh.torn.batch', {
+                        userIds: [id],
+                        forceFresh: !!opts.forceFresh,
+                        forceSingleApi: !!opts.forceSingleApi,
+                    });
+                }
+                const freshSnap = GM_getValue(BRIDGE_KEYS.snapshot, null) || current || {};
+                return freshSnap?.users?.byId?.[String(id)] || null;
+            },
+            requestUsersFFRefresh(userIds = []) {
+                return requestBridgeBroker('user.refresh.ff.batch', { userIds });
+            },
+            requestUsersTornRefresh(userIds = [], opts = {}) {
+                return requestBridgeBroker('user.refresh.torn.batch', { userIds, ...opts });
+            },
+            request(type, payload = {}) {
+                return requestBridgeBroker(type, payload);
+            },
+            subscribe(callback) {
+                if (typeof callback !== 'function') return () => {};
+                let lastTs = Number((GM_getValue(BRIDGE_KEYS.snapshot, null) || current || {}).ts || 0);
+                const timer = setInterval(() => {
+                    const snap = GM_getValue(BRIDGE_KEYS.snapshot, null) || {};
+                    const ts = Number(snap?.ts || 0);
+                    if (ts && ts !== lastTs) {
+                        lastTs = ts;
+                        callback(snap);
+                    }
+                }, 1200);
+                return () => clearInterval(timer);
+            },
+        };
+    }
+
+    function initBridgeClientMode() {
+        const snap = GM_getValue(BRIDGE_KEYS.snapshot, null);
+        exposeBridgeWindowApi(snap);
+    }
+
     function init() {
+        if (isWeav3rPage()) {
+            initBridgeClientMode();
+            return;
+        }
+
         setupBroadcastChannel();
         ensureCoreShape();
 
