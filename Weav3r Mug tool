@@ -2,9 +2,13 @@
 // @name         Weav3r Mugging Helper
 // @namespace    Violentmonkey Scripts
 // @version      1.1.0
-// @description  Highlights Bazaar sellers on Torn when status is Okay and FF estimated stats are under your threshold. Uses Torn Core as backend.
+// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links.
+// @match        https://weav3r.dev/item/*
 // @match        https://www.torn.com/bazaar.php*
+// @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @connect      api.torn.com
+// @connect      ffscouter.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -21,9 +25,13 @@
     bazaarRefreshJitterPct: 20,
     soldAlertUnits: 250,
     rapidJumpUnits: 40,
+    tornApiKey: "",
+    ffApiKey: "",
     statThresholdText: "500m",
     batchSize: 10,
     tickMs: 8000,
+    tornTtlMs: 60 * 1000,
+    ffTtlMs: 60 * 60 * 1000,
     debug: false,
   };
 
@@ -490,6 +498,10 @@
     return Date.now();
   }
 
+  function isFresh(entry, ttlMs) {
+    return !!entry && (now() - entry.ts) < ttlMs;
+  }
+
   function debounce(fn, wait) {
     let t = null;
     return (...args) => {
@@ -578,8 +590,17 @@
   }
 
   function queueIfNeeded(userId) {
-    state.pendingTorn.add(userId);
-    state.pendingFF.add(userId);
+    if (state.coreMode) {
+      state.pendingTorn.add(userId);
+      state.pendingFF.add(userId);
+      return;
+    }
+
+    const torn = state.tornCache.get(userId);
+    const ff = state.ffCache.get(userId);
+
+    if (!isFresh(torn, state.cfg.tornTtlMs)) state.pendingTorn.add(userId);
+    if (!isFresh(ff, state.cfg.ffTtlMs)) state.pendingFF.add(userId);
   }
 
   function scanPage() {
@@ -593,6 +614,16 @@
     }
     runBazaarTracker();
     updateStatusLine();
+  }
+
+  function getTornStatusText(json) {
+    return (
+      json?.status?.description ||
+      json?.status?.details ||
+      json?.status?.state ||
+      json?.status ||
+      ""
+    );
   }
 
   function renderSeller(userId) {
@@ -645,7 +676,7 @@
     const visible = state.sellers.size;
     const queuedTorn = state.pendingTorn.size;
     const queuedFF = state.pendingFF.size;
-    const backend = state.coreMode ? "TornCore" : "Unavailable";
+    const backend = state.coreMode ? "TornCore" : "Direct API";
     line.textContent =
       `Visible sellers: ${visible} | Torn queue: ${queuedTorn} | FF queue: ${queuedFF} | Threshold: ${state.cfg.statThresholdText} | Backend: ${backend}`;
   }
@@ -658,6 +689,25 @@
     }
     out.forEach(v => setObj.delete(v));
     return out;
+  }
+
+  function gmGet(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        timeout: 20000,
+        onload: (resp) => {
+          if (resp.status >= 200 && resp.status < 300) {
+            resolve(resp);
+          } else {
+            reject(new Error(`HTTP ${resp.status}: ${resp.responseText || "request failed"}`));
+          }
+        },
+        onerror: (err) => reject(err),
+        ontimeout: () => reject(new Error("Request timed out")),
+      });
+    });
   }
 
   function getTornCore() {
@@ -731,6 +781,82 @@
     }
   }
 
+  async function fetchFFBatch(userIds) {
+    if (!state.cfg.ffApiKey || !userIds.length) return;
+    const url =
+      `https://ffscouter.com/api/v1/get-stats?key=${encodeURIComponent(state.cfg.ffApiKey)}&targets=${encodeURIComponent(userIds.join(","))}`;
+
+    try {
+      const resp = await gmGet(url);
+      const data = JSON.parse(resp.responseText);
+      if (!Array.isArray(data)) {
+        log("Unexpected FF response:", data);
+        return;
+      }
+
+      const seen = new Set();
+      for (const item of data) {
+        if (!item || !item.player_id) continue;
+        seen.add(Number(item.player_id));
+        state.ffCache.set(Number(item.player_id), {
+          bs_estimate: Number.isFinite(item.bs_estimate) ? item.bs_estimate : null,
+          bs_estimate_human: item.bs_estimate_human || null,
+          fair_fight: Number.isFinite(item.fair_fight) ? item.fair_fight : null,
+          raw: item,
+          ts: now(),
+        });
+        renderSeller(Number(item.player_id));
+      }
+
+      for (const userId of userIds) {
+        if (!seen.has(userId)) {
+          state.ffCache.set(userId, {
+            bs_estimate: null,
+            bs_estimate_human: null,
+            fair_fight: null,
+            raw: null,
+            ts: now(),
+          });
+          renderSeller(userId);
+        }
+      }
+    } catch (err) {
+      log("FF batch failed:", err);
+      for (const userId of userIds) {
+        state.pendingFF.add(userId);
+      }
+    }
+  }
+
+  async function fetchTornStatus(userId) {
+    if (!state.cfg.tornApiKey || !userId) return;
+
+    // Old-style endpoint kept deliberately because it is simple and widely supported.
+    const url =
+      `https://api.torn.com/user/${userId}?selections=profile&key=${encodeURIComponent(state.cfg.tornApiKey)}`;
+
+    try {
+      const resp = await gmGet(url);
+      const data = JSON.parse(resp.responseText);
+
+      if (data?.error) {
+        log(`Torn API error for ${userId}:`, data.error);
+        return;
+      }
+
+      const status = String(getTornStatusText(data) || "").trim();
+      state.tornCache.set(userId, {
+        status,
+        raw: data,
+        ts: now(),
+      });
+      renderSeller(userId);
+    } catch (err) {
+      log(`Torn status failed for ${userId}:`, err);
+      state.pendingTorn.add(userId);
+    }
+  }
+
   async function processQueues() {
     if (!state.cfg.enabled) return;
 
@@ -741,17 +867,18 @@
     const ffIds = takeFromSet(state.pendingFF, batchSize);
     const tornIds = takeFromSet(state.pendingTorn, batchSize);
 
-    if (!state.coreMode) {
-      updateStatusLine();
-      return;
-    }
-
-    if (ffIds.length) {
+    if (ffIds.length && state.coreMode) {
       fetchFFBatchFromCore(ffIds);
+    } else if (ffIds.length) {
+      fetchFFBatch(ffIds);
     }
 
-    if (tornIds.length) {
+    if (tornIds.length && state.coreMode) {
       fetchTornBatchFromCore(tornIds);
+    } else if (tornIds.length) {
+      Promise.allSettled(tornIds.map(fetchTornStatus)).then(() => {
+        for (const id of tornIds) renderSeller(id);
+      });
     }
 
     updateStatusLine();
@@ -778,7 +905,15 @@
         <span id="wmh-collapse-indicator">▾</span>
       </div>
       <div class="wmh-body">
-        <div class="wmh-row" id="wmh-core-note"></div>
+        <div class="wmh-row">
+          <label for="wmh-torn-key">Torn API key</label>
+          <input id="wmh-torn-key" type="password" placeholder="Your Torn API key">
+        </div>
+
+        <div class="wmh-row">
+          <label for="wmh-ff-key">FF Scouter API key</label>
+          <input id="wmh-ff-key" type="password" placeholder="Your FF Scouter key">
+        </div>
 
         <div class="wmh-row">
           <label for="wmh-threshold">Max estimated stats</label>
@@ -811,21 +946,23 @@
     `;
     document.body.appendChild(panel);
 
-    const coreNote = panel.querySelector("#wmh-core-note");
+    const tornKey = panel.querySelector("#wmh-torn-key");
+    const ffKey = panel.querySelector("#wmh-ff-key");
     const threshold = panel.querySelector("#wmh-threshold");
     const batch = panel.querySelector("#wmh-batch");
     const tick = panel.querySelector("#wmh-tick");
     const enabled = panel.querySelector("#wmh-enabled");
 
-    coreNote.textContent = state.coreMode
-      ? "Connected to Torn Core backend."
-      : "Torn Core backend unavailable on this page.";
+    tornKey.value = state.cfg.tornApiKey || "";
+    ffKey.value = state.cfg.ffApiKey || "";
     threshold.value = state.cfg.statThresholdText || "";
     batch.value = String(state.cfg.batchSize || 10);
     tick.value = String(state.cfg.tickMs || 8000);
     enabled.checked = !!state.cfg.enabled;
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
+      state.cfg.tornApiKey = tornKey.value.trim();
+      state.cfg.ffApiKey = ffKey.value.trim();
       state.cfg.statThresholdText = threshold.value.trim();
       state.cfg.batchSize = Math.max(1, Number(batch.value) || 10);
       state.cfg.tickMs = Math.max(1000, Number(tick.value) || 8000);
@@ -1008,16 +1145,13 @@
       buildBazaarPanel();
       setupBazaarObserver();
       startBazaarLoop();
+      return;
     }
 
     buildPanel();
     scanPage();
     setupObserver();
-    if (state.coreMode) {
-      startLoop();
-    } else {
-      updateStatusLine();
-    }
+    startLoop();
   }
 
   init();
