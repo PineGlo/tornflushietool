@@ -25,6 +25,7 @@
 
         pageScanDebounceMs: 250,
         uiRefreshMs: 2500,
+        coreScanRefreshMs: 1000,
 
         // API caching
         apiCacheMs: 30000,
@@ -56,6 +57,7 @@
             statusMode: 'okay_only', // okay_only | hospital_only | okay_or_hospital
 
             apiEnabled: false,
+            useCoreBroker: true,
             apiKey: '',
             forceFreshApi: false,
             hospSoonEnabled: false,
@@ -103,6 +105,11 @@
             autoAttackArmed: false,
             autoAttackTriggered: false,
             uiStatus: null
+        },
+
+        core: {
+            state: null,
+            lastSnapshotAt: 0
         }
     };
 
@@ -210,6 +217,56 @@
     function isAttackPage() {
         const params = new URLSearchParams(location.search);
         return /\/page\.php/i.test(location.pathname) && params.get('sid') === 'attack';
+    }
+
+    function readCoreState() {
+        try {
+            if (window.TornCore?.getState) {
+                return window.TornCore.getState();
+            }
+        } catch {}
+
+        try {
+            if (window.__TORN_CORE_STATE__) {
+                return window.__TORN_CORE_STATE__;
+            }
+        } catch {}
+
+        return null;
+    }
+
+    function refreshCoreSnapshot() {
+        const snapshot = readCoreState();
+        if (snapshot && typeof snapshot === 'object') {
+            state.core.state = snapshot;
+            state.core.lastSnapshotAt = nowMs();
+        }
+        return state.core.state;
+    }
+
+    function getCoreUser(playerId) {
+        const core = refreshCoreSnapshot();
+        if (!core?.users?.byId) return null;
+        return core.users.byId[String(Number(playerId))] || null;
+    }
+
+    function getCoreStatusTextForUser(playerId) {
+        const user = getCoreUser(playerId);
+        if (!user) return '';
+        return String(
+            user.dom?.statusText ||
+            user.torn?.status ||
+            user.dom?.hospitalText ||
+            ''
+        ).trim();
+    }
+
+    function getCoreHospitalUntilMs(playerId) {
+        const user = getCoreUser(playerId);
+        if (!user) return null;
+        const until = Number(user.torn?.hospitalUntil);
+        if (!Number.isFinite(until) || until <= 0) return null;
+        return until < 1e12 ? until * 1000 : until;
     }
 
     function createEl(tag, props = {}, children = []) {
@@ -553,7 +610,7 @@
 
         const disclosure = createEl('div', {
             className: 'bha-disclosure',
-            text: 'This stores your API key only in your browser for Torn API calls. API polling only targets hospital players visible on the current page.'
+            text: 'This prefers Torn Core shared cache/broker first. Local API key stays in your browser and is used as fallback.'
         });
 
         const help = createEl('div', {
@@ -574,6 +631,7 @@
 
             createEl('div', { className: 'bha-subhead', text: 'Hospital API timing' }),
             checkboxRow('Enable Torn API', 'apiEnabled'),
+            checkboxRow('Use Torn Core broker/cache', 'useCoreBroker'),
             apiKeyRow,
             checkboxRow('Force fresh API', 'forceFreshApi'),
             checkboxRow('Hosp soon enabled', 'hospSoonEnabled'),
@@ -695,8 +753,21 @@
         return state.apiCache.get(Number(playerId)) || null;
     }
 
-    function hasUsableApiKey() {
+    function hasUsableLocalApiKey() {
         return state.settings.apiEnabled && String(state.settings.apiKey || '').trim().length >= 8;
+    }
+
+    function canUseCoreBroker() {
+        return !!(
+            state.settings.apiEnabled &&
+            state.settings.useCoreBroker &&
+            window.TornCore &&
+            typeof window.TornCore.request === 'function'
+        );
+    }
+
+    function hasAnyApiSource() {
+        return hasUsableLocalApiKey() || canUseCoreBroker();
     }
 
     function convertUntilToMs(until) {
@@ -708,7 +779,7 @@
 
     function queueApiPlayer(playerId, force = false) {
         playerId = Number(playerId);
-        if (!playerId || !hasUsableApiKey()) return;
+        if (!playerId || !hasAnyApiSource()) return;
 
         const cached = getApiRow(playerId);
         const freshEnough = cached && (nowMs() - cached.fetchedAt) < CONFIG.apiCacheMs;
@@ -718,6 +789,40 @@
 
         state.apiQueue.push({ playerId, force: !!force });
         state.apiQueuedSet.add(playerId);
+    }
+
+    async function requestTornProfileViaCore(playerId, forceFresh = false) {
+        if (!canUseCoreBroker()) {
+            return { ok: false, error: 'Core broker unavailable', playerId };
+        }
+
+        try {
+            await window.TornCore.request('user.refresh.torn.batch', {
+                userIds: [Number(playerId)],
+                forceFresh: !!forceFresh
+            });
+        } catch {}
+
+        const untilMs = getCoreHospitalUntilMs(playerId);
+        const statusText = getCoreStatusTextForUser(playerId);
+
+        if (Number.isFinite(untilMs) || statusText) {
+            return {
+                ok: true,
+                playerId,
+                state: statusText || '',
+                untilMs: untilMs ?? null,
+                fetchedAt: nowMs(),
+                source: 'core'
+            };
+        }
+
+        return {
+            ok: false,
+            error: 'Core had no fresh data',
+            playerId,
+            source: 'core'
+        };
     }
 
     function queueCurrentPageHospitalTargets(force = false) {
@@ -824,7 +929,7 @@
 
     async function processApiQueue() {
         if (state.apiInFlight) return;
-        if (!hasUsableApiKey()) return;
+        if (!hasAnyApiSource()) return;
         if (!state.apiQueue.length) return;
 
         const now = Date.now();
@@ -851,7 +956,15 @@
         state.apiQueuedSet.delete(next.playerId);
         state.apiInFlight = true;
 
-        const result = await requestTornProfile(next.playerId, next.force);
+        let result;
+        if (canUseCoreBroker()) {
+            result = await requestTornProfileViaCore(next.playerId, next.force);
+            if (!result?.ok && hasUsableLocalApiKey()) {
+                result = await requestTornProfile(next.playerId, next.force);
+            }
+        } else {
+            result = await requestTornProfile(next.playerId, next.force);
+        }
 
         state.apiCache.set(Number(next.playerId), {
             ok: !!result.ok,
@@ -900,7 +1013,9 @@
 
         const playerId = extractPlayerIdFromHref(targetLink.getAttribute('href') || targetLink.href);
         const reward = parseMoney(rewardEl ? rewardEl.textContent : '');
-        const statusText = statusEl ? statusEl.textContent.trim() : '';
+        const domStatusText = statusEl ? statusEl.textContent.trim() : '';
+        const coreStatusText = getCoreStatusTextForUser(playerId);
+        const statusText = domStatusText || coreStatusText;
 
         return {
             card,
@@ -909,6 +1024,8 @@
             playerId,
             targetName: targetLink.textContent.trim(),
             statusText,
+            domStatusText,
+            coreStatusText,
             targetWrap
         };
     }
@@ -917,7 +1034,7 @@
         const s = normalizeStatusText(statusText);
         return {
             isOkay: s === 'okay',
-            isHospital: s === 'hospital'
+            isHospital: s === 'hospital' || s.includes('in hospital') || s.includes('hospital')
         };
     }
 
@@ -969,6 +1086,19 @@
 
         if (flags.isHospital && state.settings.apiEnabled) {
             apiRow = getApiRow(item.playerId);
+            if (!apiRow) {
+                const coreUntilMs = getCoreHospitalUntilMs(item.playerId);
+                const coreStatusText = getCoreStatusTextForUser(item.playerId);
+                if (coreUntilMs || coreStatusText) {
+                    apiRow = {
+                        ok: true,
+                        state: coreStatusText || 'Hospital',
+                        untilMs: coreUntilMs,
+                        fetchedAt: nowMs(),
+                        source: 'core-cache'
+                    };
+                }
+            }
 
             const stale = !apiRow || (nowMs() - apiRow.fetchedAt) > CONFIG.apiStaleMs;
             if (stale) queueApiPlayer(item.playerId, false);
@@ -1066,7 +1196,7 @@
         const items = cards.map(parseCard).filter(Boolean);
         let matched = 0;
 
-        if (hasUsableApiKey()) {
+        if (hasAnyApiSource()) {
             queueCurrentPageHospitalTargets(false);
         }
 
@@ -1232,10 +1362,18 @@
 
     async function refreshAttackHospitalStatus() {
         const playerId = getAttackTargetIdFromUrl();
-        if (!playerId || !hasUsableApiKey()) return;
+        if (!playerId || !hasAnyApiSource()) return;
         if (state.attackHospital.refreshInFlight) return;
         state.attackHospital.refreshInFlight = true;
-        const result = await requestTornProfile(playerId, true);
+        let result;
+        if (canUseCoreBroker()) {
+            result = await requestTornProfileViaCore(playerId, true);
+            if (!result?.ok && hasUsableLocalApiKey()) {
+                result = await requestTornProfile(playerId, true);
+            }
+        } else {
+            result = await requestTornProfile(playerId, true);
+        }
         state.attackHospital.refreshInFlight = false;
         if (!result || !result.ok) return;
         state.attackHospital.untilMs = result.untilMs || null;
@@ -1271,13 +1409,37 @@
         });
     }
 
+    function startCoreSync() {
+        refreshCoreSnapshot();
+
+        if (window.TornCore?.subscribe) {
+            try {
+                window.TornCore.subscribe((snapshot) => {
+                    if (snapshot && typeof snapshot === 'object') {
+                        state.core.state = snapshot;
+                        state.core.lastSnapshotAt = nowMs();
+                        scheduleScan();
+                    }
+                });
+            } catch {}
+        }
+
+        setInterval(() => {
+            const previousTs = state.core.lastSnapshotAt;
+            refreshCoreSnapshot();
+            if (state.core.lastSnapshotAt !== previousTs) {
+                scheduleScan();
+            }
+        }, CONFIG.coreScanRefreshMs);
+    }
+
     function restartRefreshLoop() {
         clearInterval(state.timers.refresh);
         if (!state.settings.autoRefresh) return;
 
         state.timers.refresh = setInterval(async () => {
             await hydrateFFCache();
-            if (hasUsableApiKey()) {
+            if (hasAnyApiSource()) {
                 queueCurrentPageHospitalTargets(false);
             }
             scanAndRender();
@@ -1298,6 +1460,7 @@
         loadSettings();
         injectStyles();
         if (isBountiesPage()) {
+            startCoreSync();
             buildUI();
             observePage();
             startApiQueueLoop();
