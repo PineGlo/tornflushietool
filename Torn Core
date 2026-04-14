@@ -1,0 +1,1427 @@
+// ==UserScript==
+// @name         Torn Core v2 Scaffold
+// @namespace    pineglow.torn.core
+// @version      2.0.0
+// @description  Shared Torn runtime core: page adapters, DOM state, visible-user cache, API broker scaffold, and request bus.
+// @match        https://www.torn.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
+// @connect      ffscouter.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const CORE_NAME = 'torn_core_v2';
+    const CHANNEL_NAME = 'torn_core_v2_channel';
+    const EVENT_NAME = 'torn_core_v2_update';
+
+    const STORAGE_KEYS = {
+        settings: 'torn_core_v2_settings',
+        leader: 'torn_core_v2_leader',
+        snapshot: 'torn_core_v2_snapshot',
+        panelCollapsed: 'torn_core_v2_panel_collapsed',
+        panelX: 'torn_core_v2_panel_x',
+        panelY: 'torn_core_v2_panel_y',
+        tabId: 'torn_core_v2_tab_id',
+    };
+
+    const DEFAULTS = {
+        enabled: true,
+        domPollFastMs: 250,
+        domPollMediumMs: 1000,
+        domPollSlowMs: 2000,
+        leaderHeartbeatMs: 1500,
+        leaderStaleMs: 5000,
+        heartbeatPublishMs: 5000,
+
+        tornApiKey: '',
+        ffApiKey: '',
+
+        tornBatchTtlMs: 60 * 1000,
+        ffBatchTtlMs: 3 * 24 * 60 * 60 * 1000,
+        visibleUserStaleMs: 120 * 1000,
+
+        debug: false,
+        showPanel: true,
+    };
+
+    const state = {
+        tabId: getOrCreateTabId(),
+        bc: typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(CHANNEL_NAME) : null,
+        cfg: loadSettings(),
+        isLeader: false,
+
+        loops: {
+            dom: null,
+            leader: null,
+            ui: null,
+        },
+
+        panel: null,
+        panelBody: null,
+        dragging: null,
+
+        version: 0,
+        lastPublishedJson: '',
+        lastPublishedAt: 0,
+
+        prev: {
+            href: location.href,
+            path: location.pathname,
+            hash: location.hash,
+            lifeCurrent: null,
+            cashOnHand: null,
+            vaultCash: null,
+        },
+
+        core: {
+            ts: 0,
+            schemaVersion: 2,
+            coreVersion: '2.0.0',
+            leaderTabId: null,
+
+            dom: {
+                ts: 0,
+                domVersion: 0,
+
+                url: {
+                    href: location.href,
+                    path: location.pathname,
+                    hash: location.hash,
+                    changed: false,
+                    pathChanged: false,
+                    hashChanged: false,
+                },
+
+                page: {
+                    type: 'other',
+                    isPropertiesPage: false,
+                    isVaultPage: false,
+                    isAttackPage: false,
+                    isTradePage: false,
+                    isBazaarPage: false,
+                    isFactionPage: false,
+                    isProfilePage: false,
+                },
+
+                life: {
+                    current: null,
+                    max: null,
+                    pct: null,
+                    delta: null,
+                    drop: 0,
+                    rise: 0,
+                    changed: false,
+                    source: '',
+                },
+
+                cash: {
+                    onHand: null,
+                    delta: null,
+                    increase: 0,
+                    changed: false,
+                    source: '',
+                },
+
+                vault: {
+                    cash: null,
+                    delta: null,
+                    changed: false,
+                    title: '',
+                    input: {
+                        value: null,
+                        dataMoney: null,
+                        dataDeposit: null,
+                        dataMax: null,
+                    },
+                },
+
+                actions: {
+                    hasVaultMaxButton: false,
+                    hasVaultDepositButton: false,
+                    hasFactionDepositButton: false,
+                    hasFactionDepositConfirmYes: false,
+                },
+
+                trade: {
+                    hasTradeTab: false,
+                    hasTradeTextbox: false,
+                    hasTradeSendButton: false,
+                },
+
+                hospital: {
+                    hasGlobalHospitalIcon: false,
+                    label: '',
+                },
+
+                combat: {
+                    attackDetected: false,
+                    onAttackPage: false,
+                    targetHospitalDialog: '',
+                    targetReleaseEtaText: '',
+                    targetUserId: null,
+                },
+            },
+
+            users: {
+                byId: {},
+            },
+
+            api: {
+                cache: {
+                    torn: {},
+                    ff: {},
+                },
+                inFlight: {},
+                stats: {
+                    lastBatchTornAt: 0,
+                    lastBatchFFAt: 0,
+                }
+            },
+
+            requests: {
+                pending: [],
+            }
+        }
+    };
+
+    function getOrCreateTabId() {
+        const existing = sessionStorage.getItem(STORAGE_KEYS.tabId);
+        if (existing) return existing;
+        const created = `core_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        sessionStorage.setItem(STORAGE_KEYS.tabId, created);
+        return created;
+    }
+
+    function loadSettings() {
+        const raw = GM_getValue(STORAGE_KEYS.settings, {}) || {};
+        return {
+            ...DEFAULTS,
+            ...raw,
+        };
+    }
+
+    function saveSettings() {
+        GM_setValue(STORAGE_KEYS.settings, state.cfg);
+    }
+
+    function log(...args) {
+        if (state.cfg.debug) {
+            console.log('[TORN CORE]', ...args);
+        }
+    }
+
+    function now() {
+        return Date.now();
+    }
+
+    function clamp(n, min, max) {
+        return Math.max(min, Math.min(max, n));
+    }
+
+    function safeJsonParse(text, fallback = null) {
+        try {
+            return JSON.parse(text);
+        } catch {
+            return fallback;
+        }
+    }
+
+    function normalizeText(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function toNumber(v) {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    function parseMoney(text) {
+        if (!text) return null;
+        const cleaned = String(text).replace(/[^0-9.-]/g, '');
+        if (!cleaned) return null;
+        const n = Number(cleaned.replace(/,/g, ''));
+        return Number.isFinite(n) ? n : null;
+    }
+
+    function parseXidFromHref(href) {
+        if (!href) return null;
+        const m = String(href).match(/[?&]XID=(\d+)/i);
+        return m ? Number(m[1]) : null;
+    }
+
+    function parseUser2IdFromHref(href) {
+        if (!href) return null;
+        const m = String(href).match(/[?&]user2ID=(\d+)/i);
+        return m ? Number(m[1]) : null;
+    }
+
+    function fmtMoney(v) {
+        return Number.isFinite(v) ? `$${Math.round(v).toLocaleString()}` : '-';
+    }
+
+    function fmtPct(v, digits = 1) {
+        return Number.isFinite(v) ? `${v.toFixed(digits)}%` : '-';
+    }
+
+    function getLeaderRecord() {
+        return GM_getValue(STORAGE_KEYS.leader, null);
+    }
+
+    function setLeaderRecord() {
+        GM_setValue(STORAGE_KEYS.leader, {
+            tabId: state.tabId,
+            heartbeatAt: now(),
+        });
+    }
+
+    function clearLeaderRecord() {
+        const rec = getLeaderRecord();
+        if (rec && rec.tabId === state.tabId) {
+            GM_setValue(STORAGE_KEYS.leader, null);
+        }
+    }
+
+    function maybeBecomeLeader() {
+        const rec = getLeaderRecord();
+        const t = now();
+
+        if (!rec || !rec.tabId || (t - Number(rec.heartbeatAt || 0)) > state.cfg.leaderStaleMs) {
+            state.isLeader = true;
+            state.core.leaderTabId = state.tabId;
+            setLeaderRecord();
+            return;
+        }
+
+        state.isLeader = rec.tabId === state.tabId;
+        state.core.leaderTabId = rec.tabId || null;
+    }
+
+    function heartbeatLeader() {
+        if (!state.isLeader) return;
+        setLeaderRecord();
+        broadcast({
+            type: 'leader-heartbeat',
+            leaderTabId: state.tabId,
+        });
+    }
+
+    function broadcast(payload) {
+        try {
+            if (state.bc) {
+                state.bc.postMessage({
+                    sender: state.tabId,
+                    at: now(),
+                    ...payload,
+                });
+            }
+        } catch (_) {}
+    }
+
+    function setupBroadcastChannel() {
+        if (!state.bc) return;
+        state.bc.onmessage = (event) => {
+            const msg = event.data || {};
+            if (msg.sender === state.tabId) return;
+
+            if (msg.type === 'leader-heartbeat') {
+                state.core.leaderTabId = msg.leaderTabId || state.core.leaderTabId;
+                return;
+            }
+
+            if (msg.type === 'core-update' && msg.snapshot && !state.isLeader) {
+                applySnapshot(msg.snapshot);
+                renderPanel();
+                exposeWindowApi();
+                return;
+            }
+
+            if (msg.type === 'request-broker' && state.isLeader) {
+                // scaffold hook
+                handleBrokerMessage(msg);
+                return;
+            }
+        };
+    }
+
+    function exposeWindowApi() {
+        window.__TORN_CORE_STATE__ = state.core;
+
+        window.TornCore = {
+            getState() {
+                return state.core;
+            },
+            getDomState() {
+                return state.core.dom;
+            },
+            getUsers() {
+                return state.core.users;
+            },
+            getUser(userId) {
+                return state.core.users.byId[String(userId)] || null;
+            },
+            subscribe(callback) {
+                if (typeof callback !== 'function') return () => {};
+                const handler = (event) => callback(event.detail);
+                window.addEventListener(EVENT_NAME, handler);
+                return () => window.removeEventListener(EVENT_NAME, handler);
+            },
+            request(type, payload = {}) {
+                return requestBroker(type, payload);
+            },
+        };
+    }
+
+    function dispatchWindowUpdate() {
+        try {
+            window.dispatchEvent(new CustomEvent(EVENT_NAME, {
+                detail: state.core,
+            }));
+        } catch (_) {}
+    }
+
+    function snapshotCore() {
+        return JSON.parse(JSON.stringify(state.core));
+    }
+
+    function applySnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== 'object') return;
+        state.core = snapshot;
+    }
+
+    function persistSnapshot(snapshot) {
+        try {
+            localStorage.setItem(STORAGE_KEYS.snapshot, JSON.stringify(snapshot));
+        } catch (_) {}
+    }
+
+    function loadSnapshot() {
+        const raw = localStorage.getItem(STORAGE_KEYS.snapshot);
+        return safeJsonParse(raw, null);
+    }
+
+    function publishCore(force = false) {
+        const snapshot = snapshotCore();
+        const json = JSON.stringify(snapshot);
+        const heartbeatDue = (now() - state.lastPublishedAt) >= state.cfg.heartbeatPublishMs;
+
+        if (!force && json === state.lastPublishedJson && !heartbeatDue) {
+            return false;
+        }
+
+        state.lastPublishedJson = json;
+        state.lastPublishedAt = now();
+
+        persistSnapshot(snapshot);
+        broadcast({
+            type: 'core-update',
+            snapshot,
+        });
+
+        exposeWindowApi();
+        dispatchWindowUpdate();
+        renderPanel();
+        return true;
+    }
+
+    function requestBroker(type, payload = {}) {
+        const req = {
+            id: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            type,
+            payload,
+            requesterTabId: state.tabId,
+            requestedAt: now(),
+        };
+
+        if (state.isLeader) {
+            return handleBrokerRequest(req);
+        }
+
+        broadcast({
+            type: 'request-broker',
+            request: req,
+        });
+
+        return Promise.resolve({
+            ok: false,
+            brokered: true,
+            message: 'Broker request queued to leader. Async response wiring not yet implemented in scaffold.',
+            request: req,
+        });
+    }
+
+    function handleBrokerMessage(msg) {
+        const req = msg.request;
+        if (!req) return;
+        handleBrokerRequest(req);
+    }
+
+    function makeCacheKey(type, payload) {
+        return `${type}:${JSON.stringify(payload || {})}`;
+    }
+
+    function isFresh(entry, ttlMs) {
+        return !!entry && (now() - Number(entry.ts || 0)) < ttlMs;
+    }
+
+    function handleBrokerRequest(req) {
+        const { type, payload } = req;
+        const cacheKey = makeCacheKey(type, payload);
+
+        switch (type) {
+            case 'dom.state':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'dom',
+                    data: state.core.dom,
+                });
+
+            case 'users.visible':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'cache',
+                    data: state.core.users,
+                });
+
+            case 'user.visible':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'cache',
+                    data: state.core.users.byId[String(payload.userId)] || null,
+                });
+
+            case 'user.refresh.ff.batch':
+                return brokerFFBatch(payload.userIds || [], cacheKey);
+
+            case 'user.refresh.torn.batch':
+                return brokerTornBatch(payload.userIds || [], cacheKey);
+
+            case 'user.refresh.attackLoader':
+                return Promise.resolve({
+                    ok: true,
+                    source: 'scaffold',
+                    data: {
+                        recommendedUrl: `/page.php?sid=attack&user2ID=${Number(payload.userId) || 0}`,
+                    }
+                });
+
+            default:
+                return Promise.resolve({
+                    ok: false,
+                    error: `Unknown broker request type: ${type}`,
+                });
+        }
+    }
+
+    function brokerFFBatch(userIds, cacheKey) {
+        const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+        const cached = state.core.api.cache.ff[cacheKey];
+
+        if (isFresh(cached, state.cfg.ffBatchTtlMs)) {
+            return Promise.resolve({
+                ok: true,
+                source: 'cache',
+                data: cached.data,
+            });
+        }
+
+        if (state.core.api.inFlight[cacheKey]) {
+            return state.core.api.inFlight[cacheKey];
+        }
+
+        const promise = new Promise((resolve) => {
+            // scaffold only
+            const data = {
+                userIds: uniqueIds,
+                status: 'stub',
+                message: 'FF batch broker scaffold ready. Wire actual batch request next.',
+            };
+
+            state.core.api.cache.ff[cacheKey] = {
+                ts: now(),
+                data,
+            };
+            state.core.api.stats.lastBatchFFAt = now();
+            delete state.core.api.inFlight[cacheKey];
+            publishCore(true);
+
+            resolve({
+                ok: true,
+                source: 'stub',
+                data,
+            });
+        });
+
+        state.core.api.inFlight[cacheKey] = promise;
+        return promise;
+    }
+
+    function brokerTornBatch(userIds, cacheKey) {
+        const uniqueIds = Array.from(new Set((userIds || []).map(Number).filter(Number.isFinite)));
+        const cached = state.core.api.cache.torn[cacheKey];
+
+        if (isFresh(cached, state.cfg.tornBatchTtlMs)) {
+            return Promise.resolve({
+                ok: true,
+                source: 'cache',
+                data: cached.data,
+            });
+        }
+
+        if (state.core.api.inFlight[cacheKey]) {
+            return state.core.api.inFlight[cacheKey];
+        }
+
+        const promise = new Promise((resolve) => {
+            // scaffold only
+            const data = {
+                userIds: uniqueIds,
+                status: 'stub',
+                message: 'Torn batch broker scaffold ready. Wire actual batch request next.',
+            };
+
+            state.core.api.cache.torn[cacheKey] = {
+                ts: now(),
+                data,
+            };
+            state.core.api.stats.lastBatchTornAt = now();
+            delete state.core.api.inFlight[cacheKey];
+            publishCore(true);
+
+            resolve({
+                ok: true,
+                source: 'stub',
+                data,
+            });
+        });
+
+        state.core.api.inFlight[cacheKey] = promise;
+        return promise;
+    }
+
+    function parseLifeBox() {
+        const lifeRegions = Array.from(document.querySelectorAll('[role="region"]')).slice(0, 20);
+
+        for (const region of lifeRegions) {
+            const txt = normalizeText(region.innerText || region.textContent || '');
+            if (!txt.includes('Life')) continue;
+
+            const valueEl = region.querySelector('p[class*="bar-value"]');
+            const valueTxt = normalizeText(valueEl?.innerText || valueEl?.textContent || '');
+            const m = valueTxt.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+
+            if (m) {
+                const current = Number(m[1].replace(/,/g, ''));
+                const max = Number(m[2].replace(/,/g, ''));
+                if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
+                    return {
+                        current,
+                        max,
+                        source: 'life-region',
+                    };
+                }
+            }
+        }
+
+        const fallbackEls = Array.from(document.querySelectorAll('p[class*="bar-value"]')).slice(0, 20);
+        for (const el of fallbackEls) {
+            const parentTxt = normalizeText(el.parentElement?.innerText || '');
+            if (!parentTxt.includes('Life')) continue;
+
+            const txt = normalizeText(el.innerText || el.textContent || '');
+            const m = txt.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+            if (m) {
+                const current = Number(m[1].replace(/,/g, ''));
+                const max = Number(m[2].replace(/,/g, ''));
+                if (Number.isFinite(current) && Number.isFinite(max) && max > 0) {
+                    return {
+                        current,
+                        max,
+                        source: 'life-value-fallback',
+                    };
+                }
+            }
+        }
+
+        return {
+            current: null,
+            max: null,
+            source: '',
+        };
+    }
+
+    function parseCashBox() {
+        const el = document.querySelector('#user-money');
+        if (el) {
+            const dataMoney = toNumber(el.getAttribute('data-money'));
+            const txtValue = parseMoney(el.innerText || el.textContent || '');
+            return {
+                onHand: dataMoney ?? txtValue,
+                source: '#user-money',
+            };
+        }
+
+        return {
+            onHand: null,
+            source: '',
+        };
+    }
+
+    function parseVaultSection() {
+        const titleEl = Array.from(document.querySelectorAll('.title-black, .title, h4, p'))
+            .find(el => normalizeText(el.innerText || el.textContent || '').toLowerCase().includes('vault'));
+
+        const vaultCashEl = document.querySelector('#vault-wvalue');
+        const inputEl = document.querySelector('input.input-money, input.amount.input-money');
+        const maxBtn = Array.from(document.querySelectorAll('input.wai-btn'))
+            .find(el => (el.getAttribute('aria-label') || '').toLowerCase().includes('maximum amount'));
+        const depositBtn = Array.from(document.querySelectorAll('input.torn-btn, button.torn-btn'))
+            .find(el => normalizeText(el.value || el.innerText || el.textContent || '').toUpperCase() === 'DEPOSIT');
+
+        const factionDepositBtn = Array.from(document.querySelectorAll('button.torn-btn'))
+            .find(el => normalizeText(el.innerText || el.textContent || '').toUpperCase() === 'DEPOSIT MONEY');
+
+        const factionConfirmYes = document.querySelector('a.yes[aria-label="Yes, I want to deposit"]');
+
+        return {
+            title: normalizeText(titleEl?.innerText || titleEl?.textContent || ''),
+            cash: parseMoney(vaultCashEl?.innerText || vaultCashEl?.textContent || ''),
+            input: {
+                value: inputEl ? (inputEl.value || null) : null,
+                dataMoney: inputEl ? toNumber(inputEl.getAttribute('data-money')) : null,
+                dataDeposit: inputEl ? toNumber(inputEl.getAttribute('data-deposit')) : null,
+                dataMax: inputEl ? toNumber(inputEl.getAttribute('data-max')) : null,
+            },
+            actions: {
+                hasVaultMaxButton: !!maxBtn,
+                hasVaultDepositButton: !!depositBtn,
+                hasFactionDepositButton: !!factionDepositBtn,
+                hasFactionDepositConfirmYes: !!factionConfirmYes,
+            }
+        };
+    }
+
+    function parseTradeSection() {
+        const tradeTab =
+            document.querySelector('#channel_panel_button\\:public_trade') ||
+            Array.from(document.querySelectorAll('button[title]')).find(el => normalizeText(el.getAttribute('title')).toLowerCase() === 'trade');
+
+        const tradeTextbox =
+            document.querySelector('textarea[placeholder="Type your message here..."]') ||
+            document.querySelector('textarea');
+
+        const sendButton = tradeTextbox?.parentElement?.querySelector('button') || null;
+
+        return {
+            hasTradeTab: !!tradeTab,
+            hasTradeTextbox: !!tradeTextbox,
+            hasTradeSendButton: !!sendButton,
+        };
+    }
+
+    function parseHospitalGlobal() {
+        const icon = document.querySelector('a[aria-label^="Hospital:"]');
+        return {
+            hasGlobalHospitalIcon: !!icon,
+            label: icon?.getAttribute('aria-label') || '',
+        };
+    }
+
+    function getPageType() {
+        const href = location.href.toLowerCase();
+        const path = location.pathname.toLowerCase();
+        const bodyText = normalizeText(document.body?.innerText || '');
+
+        const hasVaultTitle = bodyText.toLowerCase().includes('extra large vault');
+        const hasPropertiesTitle = normalizeText(document.querySelector('#skip-to-content')?.innerText || '').toLowerCase() === 'all properties';
+        const hasAttackTitle = normalizeText(document.querySelector('h4')?.innerText || '').toLowerCase() === 'attacking';
+
+        if (href.includes('sid=attack') || hasAttackTitle) return 'attack';
+        if (hasVaultTitle || (path.includes('/properties.php') && bodyText.toLowerCase().includes('stored in the vault'))) return 'vault';
+        if (hasPropertiesTitle || path.includes('/properties.php')) return 'properties';
+        if (path.includes('/factions.php')) return 'faction';
+        if (path.includes('/profiles.php')) return 'profile';
+        if (path.includes('/bazaar.php')) return 'bazaar';
+        if (path.includes('/trade.php')) return 'trade';
+        return 'other';
+    }
+
+    function parseAttackPage() {
+        const title = Array.from(document.querySelectorAll('h4')).find(el => normalizeText(el.innerText || el.textContent || '').toLowerCase() === 'attacking');
+        const dialog = Array.from(document.querySelectorAll('div')).find(el => {
+            const txt = normalizeText(el.innerText || el.textContent || '');
+            return txt.includes('currently in hospital and cannot be attacked') || txt.includes('Release ETA:');
+        });
+
+        const dialogText = normalizeText(dialog?.innerText || dialog?.textContent || '');
+        const etaMatch = dialogText.match(/Release ETA:\s*(.+?)\.?$/i);
+        const targetUserId = parseUser2IdFromHref(location.href);
+
+        return {
+            onAttackPage: !!title || location.href.toLowerCase().includes('sid=attack'),
+            targetHospitalDialog: dialogText || '',
+            targetReleaseEtaText: etaMatch ? etaMatch[1].trim() : '',
+            targetUserId: Number.isFinite(targetUserId) ? targetUserId : null,
+        };
+    }
+
+    function updateDomState() {
+        const t = now();
+        const pageType = getPageType();
+
+        const life = parseLifeBox();
+        const cash = parseCashBox();
+        const vault = parseVaultSection();
+        const trade = parseTradeSection();
+        const hospital = parseHospitalGlobal();
+        const combat = parseAttackPage();
+
+        const prevLife = state.prev.lifeCurrent;
+        const prevCash = state.prev.cashOnHand;
+        const prevVault = state.prev.vaultCash;
+
+        const lifeDelta = (Number.isFinite(life.current) && Number.isFinite(prevLife)) ? life.current - prevLife : null;
+        const lifeDrop = (Number.isFinite(lifeDelta) && lifeDelta < 0) ? Math.abs(lifeDelta) : 0;
+        const lifeRise = (Number.isFinite(lifeDelta) && lifeDelta > 0) ? lifeDelta : 0;
+
+        const cashDelta = (Number.isFinite(cash.onHand) && Number.isFinite(prevCash)) ? cash.onHand - prevCash : null;
+        const cashIncrease = (Number.isFinite(cashDelta) && cashDelta > 0) ? cashDelta : 0;
+
+        const vaultDelta = (Number.isFinite(vault.cash) && Number.isFinite(prevVault)) ? vault.cash - prevVault : null;
+
+        const lifePct = (Number.isFinite(life.current) && Number.isFinite(life.max) && life.max > 0)
+            ? (life.current / life.max) * 100
+            : null;
+
+        const href = location.href;
+        const path = location.pathname;
+        const hash = location.hash;
+
+        state.core.dom.ts = t;
+        state.core.dom.domVersion = ++state.version;
+        state.core.dom.url = {
+            href,
+            path,
+            hash,
+            changed: href !== state.prev.href,
+            pathChanged: path !== state.prev.path,
+            hashChanged: hash !== state.prev.hash,
+        };
+
+        state.core.dom.page = {
+            type: pageType,
+            isPropertiesPage: pageType === 'properties' || pageType === 'vault',
+            isVaultPage: pageType === 'vault',
+            isAttackPage: pageType === 'attack',
+            isTradePage: pageType === 'trade',
+            isBazaarPage: pageType === 'bazaar',
+            isFactionPage: pageType === 'faction',
+            isProfilePage: pageType === 'profile',
+        };
+
+        state.core.dom.life = {
+            current: life.current,
+            max: life.max,
+            pct: lifePct,
+            delta: lifeDelta,
+            drop: lifeDrop,
+            rise: lifeRise,
+            changed: Number.isFinite(lifeDelta) && lifeDelta !== 0,
+            source: life.source,
+        };
+
+        state.core.dom.cash = {
+            onHand: cash.onHand,
+            delta: cashDelta,
+            increase: cashIncrease,
+            changed: Number.isFinite(cashDelta) && cashDelta !== 0,
+            source: cash.source,
+        };
+
+        state.core.dom.vault = {
+            cash: vault.cash,
+            delta: vaultDelta,
+            changed: Number.isFinite(vaultDelta) && vaultDelta !== 0,
+            title: vault.title,
+            input: vault.input,
+        };
+
+        state.core.dom.actions = vault.actions;
+        state.core.dom.trade = trade;
+        state.core.dom.hospital = hospital;
+        state.core.dom.combat = {
+            attackDetected: !!combat.onAttackPage || lifeDrop > 0,
+            onAttackPage: !!combat.onAttackPage,
+            targetHospitalDialog: combat.targetHospitalDialog,
+            targetReleaseEtaText: combat.targetReleaseEtaText,
+            targetUserId: combat.targetUserId,
+        };
+
+        state.prev.href = href;
+        state.prev.path = path;
+        state.prev.hash = hash;
+        if (Number.isFinite(life.current)) state.prev.lifeCurrent = life.current;
+        if (Number.isFinite(cash.onHand)) state.prev.cashOnHand = cash.onHand;
+        if (Number.isFinite(vault.cash)) state.prev.vaultCash = vault.cash;
+    }
+
+    function ensureUserRecord(userId, patch = {}) {
+        const key = String(userId);
+        const existing = state.core.users.byId[key] || {
+            userId,
+            name: '',
+            links: {
+                profile: '',
+                attack: '',
+                faction: '',
+                bazaar: '',
+            },
+            seen: {
+                firstSeenAt: now(),
+                lastSeenAt: now(),
+                lastSeenPageType: '',
+                lastSeenHref: '',
+            },
+            dom: {
+                statusText: '',
+                statusClass: '',
+                hospitalText: '',
+                hospitalReason: '',
+                travelText: '',
+                travelDestination: '',
+                roleText: '',
+                levelText: '',
+            },
+            derived: {
+                isOkay: false,
+                isHospitalized: false,
+                isTraveling: false,
+                isReturning: false,
+                isAbroad: false,
+            },
+            timing: {
+                firstSeenOkayAt: 0,
+                lastSeenOkayAt: 0,
+                firstSeenHospitalAt: 0,
+                lastSeenHospitalAt: 0,
+                firstSeenTravelingAt: 0,
+                lastSeenTravelingAt: 0,
+                firstSeenReturningAt: 0,
+                lastSeenReturningAt: 0,
+            },
+            ff: {
+                visibleFairFight: '',
+                visibleEstimatedStats: '',
+                estimatedStats: null,
+                estimatedStatsHuman: '',
+                lastRefreshAt: 0,
+            },
+            torn: {
+                status: '',
+                hospitalUntil: 0,
+                hospitalEtaText: '',
+                lastRefreshAt: 0,
+            }
+        };
+
+        const merged = deepMerge(existing, patch);
+        merged.seen.lastSeenAt = now();
+        merged.seen.lastSeenHref = location.href;
+        merged.seen.lastSeenPageType = state.core.dom.page.type;
+
+        applyUserDerivedTiming(merged);
+
+        state.core.users.byId[key] = merged;
+        return merged;
+    }
+
+    function applyUserDerivedTiming(user) {
+        const t = now();
+        const status = (user.dom.statusText || '').toLowerCase();
+        const hospitalText = (user.dom.hospitalText || '').toLowerCase();
+        const travelText = (user.dom.travelText || '').toLowerCase();
+
+        user.derived.isOkay = status === 'okay';
+        user.derived.isHospitalized = status === 'hospital' || hospitalText.includes('hospital');
+        user.derived.isTraveling = status === 'traveling' || travelText.includes('traveling');
+        user.derived.isReturning = travelText.includes('returning to torn');
+        user.derived.isAbroad = user.derived.isTraveling || /traveling to|returning to|in [a-z]/i.test(user.dom.travelText || '');
+
+        if (user.derived.isOkay) {
+            if (!user.timing.firstSeenOkayAt) user.timing.firstSeenOkayAt = t;
+            user.timing.lastSeenOkayAt = t;
+        }
+        if (user.derived.isHospitalized) {
+            if (!user.timing.firstSeenHospitalAt) user.timing.firstSeenHospitalAt = t;
+            user.timing.lastSeenHospitalAt = t;
+        }
+        if (user.derived.isTraveling) {
+            if (!user.timing.firstSeenTravelingAt) user.timing.firstSeenTravelingAt = t;
+            user.timing.lastSeenTravelingAt = t;
+        }
+        if (user.derived.isReturning) {
+            if (!user.timing.firstSeenReturningAt) user.timing.firstSeenReturningAt = t;
+            user.timing.lastSeenReturningAt = t;
+        }
+
+        if (!user.links.attack && user.userId) {
+            user.links.attack = `/page.php?sid=attack&user2ID=${user.userId}`;
+        }
+    }
+
+    function deepMerge(base, patch) {
+        const out = Array.isArray(base) ? base.slice() : { ...base };
+        for (const [k, v] of Object.entries(patch || {})) {
+            if (v && typeof v === 'object' && !Array.isArray(v) && out[k] && typeof out[k] === 'object' && !Array.isArray(out[k])) {
+                out[k] = deepMerge(out[k], v);
+            } else {
+                out[k] = v;
+            }
+        }
+        return out;
+    }
+
+    function scanFactionRows() {
+        if (!state.core.dom.page.isFactionPage) return;
+
+        const rows = Array.from(document.querySelectorAll('li.table-row'));
+        for (const row of rows) {
+            const profileAnchor = row.querySelector('a[href*="/profiles.php?XID="], a[href*="profiles.php?XID="]');
+            if (!profileAnchor) continue;
+
+            const userId = parseXidFromHref(profileAnchor.getAttribute('href'));
+            if (!Number.isFinite(userId)) continue;
+
+            const name =
+                normalizeText(profileAnchor.querySelector('.honor-text')?.textContent || '') ||
+                normalizeText(profileAnchor.getAttribute('aria-label') || '').replace(/^View profile of\s+/i, '') ||
+                normalizeText(profileAnchor.textContent || '');
+
+            const statusEl = row.querySelector('.table-cell.status .ellipsis, .table-cell.status span');
+            const statusText = normalizeText(statusEl?.innerText || statusEl?.textContent || '');
+            const statusClass = normalizeText(statusEl?.className || '');
+
+            const roleText = normalizeText(row.querySelector('.position .ellipsis')?.innerText || row.querySelector('.position')?.innerText || '');
+            const levelText = normalizeText(row.querySelector('.lvlCol___NAW6T, .table-cell.lvl')?.innerText || '');
+
+            const ffVisible = normalizeText(row.querySelector('.ff-scouter-ff-visible')?.innerText || '');
+            const ffEstimateVisible = normalizeText(row.querySelector('.ff-scouter-est-hidden')?.innerText || '');
+
+            ensureUserRecord(userId, {
+                name,
+                links: {
+                    profile: profileAnchor.getAttribute('href') || '',
+                },
+                dom: {
+                    statusText,
+                    statusClass,
+                    roleText,
+                    levelText,
+                },
+                ff: {
+                    visibleFairFight: ffVisible,
+                    visibleEstimatedStats: ffEstimateVisible,
+                },
+            });
+        }
+    }
+
+    function scanProfilePage() {
+        if (!state.core.dom.page.isProfilePage) return;
+
+        const userId = parseXidFromHref(location.href);
+        if (!Number.isFinite(userId)) return;
+
+        const mainDesc = normalizeText(document.querySelector('.main-desc')?.innerText || '');
+        const subDesc = normalizeText(document.querySelector('.sub-desc')?.innerText || '');
+
+        const patch = {
+            links: {
+                profile: location.pathname + location.search,
+            },
+            dom: {},
+        };
+
+        if (/in hospital/i.test(mainDesc)) {
+            patch.dom.hospitalText = mainDesc;
+            patch.dom.hospitalReason = subDesc;
+            patch.dom.statusText = 'Hospital';
+        } else if (/traveling to/i.test(mainDesc) || /returning to torn/i.test(mainDesc)) {
+            patch.dom.travelText = mainDesc;
+            patch.dom.statusText = 'Traveling';
+
+            const m = mainDesc.match(/traveling to\s+(.+)$/i);
+            if (m) {
+                patch.dom.travelDestination = normalizeText(m[1]);
+            }
+        }
+
+        ensureUserRecord(userId, patch);
+    }
+
+    function scanAttackPageTarget() {
+        if (!state.core.dom.page.isAttackPage) return;
+
+        const targetUserId = state.core.dom.combat.targetUserId;
+        if (!Number.isFinite(targetUserId)) return;
+
+        const dialogText = state.core.dom.combat.targetHospitalDialog;
+        const etaText = state.core.dom.combat.targetReleaseEtaText;
+
+        if (dialogText) {
+            ensureUserRecord(targetUserId, {
+                dom: {
+                    hospitalText: dialogText,
+                    statusText: 'Hospital',
+                },
+                torn: {
+                    hospitalEtaText: etaText || '',
+                    lastRefreshAt: now(),
+                },
+            });
+        }
+    }
+
+    function scanGenericProfileLinks() {
+        const anchors = Array.from(document.querySelectorAll('a[href*="/profiles.php?XID="], a[href*="profiles.php?XID="]')).slice(0, 200);
+
+        for (const anchor of anchors) {
+            const userId = parseXidFromHref(anchor.getAttribute('href'));
+            if (!Number.isFinite(userId)) continue;
+
+            const name =
+                normalizeText(anchor.querySelector('.honor-text')?.textContent || '') ||
+                normalizeText(anchor.getAttribute('aria-label') || '').replace(/^View profile of\s+/i, '') ||
+                normalizeText(anchor.textContent || '');
+
+            ensureUserRecord(userId, {
+                name,
+                links: {
+                    profile: anchor.getAttribute('href') || '',
+                },
+            });
+        }
+    }
+
+    function pruneStaleUsers() {
+        const staleMs = state.cfg.visibleUserStaleMs;
+        const cutoff = now() - staleMs;
+
+        for (const [key, user] of Object.entries(state.core.users.byId)) {
+            if (Number(user.seen.lastSeenAt || 0) < cutoff) {
+                // Keep cached but mark stale instead of deleting for now.
+                user.seen.isStale = true;
+            } else {
+                user.seen.isStale = false;
+            }
+        }
+    }
+
+    function runPageAdapters() {
+        updateDomState();
+        scanGenericProfileLinks();
+        scanFactionRows();
+        scanProfilePage();
+        scanAttackPageTarget();
+        pruneStaleUsers();
+
+        state.core.ts = now();
+    }
+
+    function computeDomPollMs() {
+        const dom = state.core.dom;
+        if (dom.page.isVaultPage || dom.page.isAttackPage) return state.cfg.domPollFastMs;
+        if (dom.page.isFactionPage || dom.page.isTradePage || dom.page.isProfilePage) return state.cfg.domPollMediumMs;
+        return state.cfg.domPollSlowMs;
+    }
+
+    function restartDomLoop() {
+        if (state.loops.dom) clearInterval(state.loops.dom);
+        const delay = clamp(Number(computeDomPollMs()) || state.cfg.domPollMediumMs, 100, 10000);
+        state.loops.dom = setInterval(domTick, delay);
+    }
+
+    function domTick(force = false) {
+        if (!state.cfg.enabled) return;
+
+        maybeBecomeLeader();
+        runPageAdapters();
+
+        if (state.isLeader) {
+            publishCore(force);
+        } else {
+            renderPanel();
+            exposeWindowApi();
+        }
+
+        restartDomLoop();
+    }
+
+    function createPanel() {
+        if (!state.cfg.showPanel) return;
+
+        GM_addStyle(`
+            #torn-core-panel {
+                position: fixed;
+                left: ${Number(GM_getValue(STORAGE_KEYS.panelX, 18)) || 18}px;
+                top: ${Number(GM_getValue(STORAGE_KEYS.panelY, 80)) || 80}px;
+                width: 340px;
+                z-index: 999999;
+                background: rgba(14,18,28,0.96);
+                color: #eef3ff;
+                border: 1px solid rgba(120,150,255,0.28);
+                border-radius: 12px;
+                box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+                font: 12px/1.4 Arial, sans-serif;
+            }
+            #torn-core-panel * { box-sizing: border-box; }
+            #torn-core-head {
+                padding: 8px 10px;
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                cursor:move;
+                border-bottom:1px solid rgba(120,150,255,0.15);
+                user-select:none;
+                font-weight:700;
+            }
+            #torn-core-panel.collapsed #torn-core-body { display:none; }
+            #torn-core-body { padding: 10px; }
+            .tc-row {
+                display:flex;
+                justify-content:space-between;
+                gap:8px;
+                margin:4px 0;
+            }
+            .tc-actions {
+                display:flex;
+                gap:6px;
+            }
+            .tc-btn {
+                border:0;
+                background:#445;
+                color:white;
+                border-radius:6px;
+                padding:4px 8px;
+                cursor:pointer;
+            }
+            .tc-btn.primary { background:#356dff; }
+            .tc-good { color:#7CFF9B; font-weight:700; }
+            .tc-warn { color:#FFD76C; font-weight:700; }
+            .tc-bad { color:#FF9090; font-weight:700; }
+            .tc-section {
+                margin-bottom:8px;
+                padding:8px;
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius:8px;
+            }
+            .tc-small {
+                font-size:11px;
+                color:#c7d2ff;
+            }
+            .tc-label {
+                display:block;
+                margin:6px 0 2px;
+                font-size:11px;
+                color:#c7d2ff;
+            }
+            .tc-input {
+                width:100%;
+                border:1px solid rgba(255,255,255,0.12);
+                background:#1d2335;
+                color:white;
+                border-radius:6px;
+                padding:6px;
+            }
+        `);
+
+        const panel = document.createElement('div');
+        panel.id = 'torn-core-panel';
+        if (GM_getValue(STORAGE_KEYS.panelCollapsed, false)) {
+            panel.classList.add('collapsed');
+        }
+
+        panel.innerHTML = `
+            <div id="torn-core-head">
+                <span>Torn Core v2</span>
+                <div class="tc-actions">
+                    <button class="tc-btn" id="tc-toggle">${panel.classList.contains('collapsed') ? '▸' : '▾'}</button>
+                    <button class="tc-btn" id="tc-enable">${state.cfg.enabled ? 'On' : 'Off'}</button>
+                    <button class="tc-btn primary" id="tc-push">Push</button>
+                </div>
+            </div>
+            <div id="torn-core-body"></div>
+        `;
+
+        document.body.appendChild(panel);
+        state.panel = panel;
+        state.panelBody = panel.querySelector('#torn-core-body');
+
+        panel.querySelector('#tc-toggle').addEventListener('click', (e) => {
+            e.stopPropagation();
+            panel.classList.toggle('collapsed');
+            GM_setValue(STORAGE_KEYS.panelCollapsed, panel.classList.contains('collapsed'));
+            panel.querySelector('#tc-toggle').textContent = panel.classList.contains('collapsed') ? '▸' : '▾';
+        });
+
+        panel.querySelector('#tc-enable').addEventListener('click', (e) => {
+            e.stopPropagation();
+            state.cfg.enabled = !state.cfg.enabled;
+            saveSettings();
+            panel.querySelector('#tc-enable').textContent = state.cfg.enabled ? 'On' : 'Off';
+            if (state.cfg.enabled) domTick(true);
+        });
+
+        panel.querySelector('#tc-push').addEventListener('click', (e) => {
+            e.stopPropagation();
+            domTick(true);
+        });
+
+        const head = panel.querySelector('#torn-core-head');
+        head.addEventListener('mousedown', (e) => {
+            state.dragging = {
+                x: e.clientX,
+                y: e.clientY,
+                left: panel.offsetLeft,
+                top: panel.offsetTop,
+            };
+        });
+
+        window.addEventListener('mouseup', () => {
+            state.dragging = null;
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (!state.dragging) return;
+            const dx = e.clientX - state.dragging.x;
+            const dy = e.clientY - state.dragging.y;
+            const left = Math.max(0, state.dragging.left + dx);
+            const top = Math.max(0, state.dragging.top + dy);
+            panel.style.left = `${left}px`;
+            panel.style.top = `${top}px`;
+            panel.style.right = 'auto';
+            GM_setValue(STORAGE_KEYS.panelX, left);
+            GM_setValue(STORAGE_KEYS.panelY, top);
+        });
+
+        renderPanel();
+    }
+
+    function renderPanel() {
+        if (!state.panelBody) return;
+
+        const dom = state.core.dom;
+        const userCount = Object.keys(state.core.users.byId).length;
+        const roleClass = state.isLeader ? 'tc-good' : 'tc-warn';
+
+        state.panelBody.innerHTML = `
+            <div class="tc-section">
+                <div class="tc-row"><span>Role</span><strong class="${roleClass}">${state.isLeader ? 'Leader' : 'Follower'}</strong></div>
+                <div class="tc-row"><span>Page</span><strong>${dom.page.type}</strong></div>
+                <div class="tc-row"><span>Users cached</span><strong>${userCount}</strong></div>
+                <div class="tc-row"><span>Attack page</span><strong>${dom.page.isAttackPage ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Vault page</span><strong>${dom.page.isVaultPage ? 'Yes' : 'No'}</strong></div>
+            </div>
+
+            <div class="tc-section">
+                <div class="tc-row"><span>Life</span><strong>${dom.life.current ?? '-'} / ${dom.life.max ?? '-'}</strong></div>
+                <div class="tc-row"><span>Life %</span><strong>${fmtPct(dom.life.pct)}</strong></div>
+                <div class="tc-row"><span>Life delta</span><strong>${dom.life.delta ?? '-'}</strong></div>
+                <div class="tc-row"><span>Cash</span><strong>${fmtMoney(dom.cash.onHand)}</strong></div>
+                <div class="tc-row"><span>Vault cash</span><strong>${fmtMoney(dom.vault.cash)}</strong></div>
+            </div>
+
+            <div class="tc-section">
+                <div class="tc-row"><span>Vault max btn</span><strong>${dom.actions.hasVaultMaxButton ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Vault deposit</span><strong>${dom.actions.hasVaultDepositButton ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Faction deposit</span><strong>${dom.actions.hasFactionDepositButton ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Faction confirm</span><strong>${dom.actions.hasFactionDepositConfirmYes ? 'Yes' : 'No'}</strong></div>
+            </div>
+
+            <div class="tc-section">
+                <div class="tc-row"><span>Trade tab</span><strong>${dom.trade.hasTradeTab ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Trade box</span><strong>${dom.trade.hasTradeTextbox ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Hosp icon</span><strong>${dom.hospital.hasGlobalHospitalIcon ? 'Yes' : 'No'}</strong></div>
+                <div class="tc-row"><span>Attack detected</span><strong>${dom.combat.attackDetected ? 'Yes' : 'No'}</strong></div>
+            </div>
+
+            <div class="tc-section">
+                <label class="tc-label">Torn API key</label>
+                <input class="tc-input" id="tc-torn-key" type="password" value="${escapeHtml(state.cfg.tornApiKey)}" />
+                <label class="tc-label">FF API key</label>
+                <input class="tc-input" id="tc-ff-key" type="password" value="${escapeHtml(state.cfg.ffApiKey)}" />
+                <div class="tc-actions" style="margin-top:8px;">
+                    <button class="tc-btn primary" id="tc-save-settings">Save keys</button>
+                </div>
+            </div>
+
+            <div class="tc-small">
+                domVersion ${dom.domVersion} • ${new Date(dom.ts || now()).toLocaleTimeString()}
+            </div>
+        `;
+
+        const saveBtn = state.panelBody.querySelector('#tc-save-settings');
+        if (saveBtn) {
+            saveBtn.addEventListener('click', () => {
+                const tornKey = state.panelBody.querySelector('#tc-torn-key')?.value?.trim() || '';
+                const ffKey = state.panelBody.querySelector('#tc-ff-key')?.value?.trim() || '';
+                state.cfg.tornApiKey = tornKey;
+                state.cfg.ffApiKey = ffKey;
+                saveSettings();
+            });
+        }
+    }
+
+    function escapeHtml(str) {
+        return String(str || '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#39;');
+    }
+
+    function installUnloadHandler() {
+        window.addEventListener('beforeunload', () => {
+            if (state.isLeader) clearLeaderRecord();
+            try {
+                if (state.bc) state.bc.close();
+            } catch (_) {}
+        });
+    }
+
+    function init() {
+        setupBroadcastChannel();
+
+        const snap = loadSnapshot();
+        if (snap && !state.isLeader) {
+            applySnapshot(snap);
+        }
+
+        maybeBecomeLeader();
+        exposeWindowApi();
+        createPanel();
+        installUnloadHandler();
+
+        domTick(true);
+
+        state.loops.leader = setInterval(() => {
+            maybeBecomeLeader();
+            if (state.isLeader) {
+                heartbeatLeader();
+            }
+        }, Math.max(500, Number(state.cfg.leaderHeartbeatMs) || 1500));
+
+        state.loops.ui = setInterval(() => {
+            renderPanel();
+        }, 1000);
+    }
+
+    init();
+})();
