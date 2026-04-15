@@ -91,6 +91,7 @@
     let uiFlowEl = null;
     let uiLeaderCheckbox = null;
     let uiPauseToggleBtn = null;
+    let uiPanelEl = null;
 
     let settingsInputs = {};
     let depositing = false;
@@ -267,12 +268,9 @@
                location.hash.includes('/tab=armoury');
     }
 
-    function isHospitalAreaUnavailable(scope = document) {
-        const notice = Array.from(scope.querySelectorAll('.msg.right-round')).find(el => {
-            const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-            return text.includes("this area is unavailable while you're in hospital");
-        });
-        return Boolean(notice);
+    function isUserInHospital(scope = document) {
+        const hospitalLink = scope.querySelector('a[aria-label^="Hospital:"]');
+        return Boolean(hospitalLink);
     }
 
     function findMoneyLabelCash(scope = document) {
@@ -760,11 +758,7 @@
         try {
             lastHandledRequestId = request.requestId;
 
-            if (isHospitalAreaUnavailable() && request.target !== 'faction') {
-                setDepositRequest({ ...request, target: 'faction' });
-                if (!isFactionArmoryPage()) {
-                    goToFactionArmoryPage();
-                }
+            if (isUserInHospital()) {
                 return;
             }
 
@@ -811,6 +805,19 @@
             await sleep(rand(10, 25));
             const success = await doDeposit();
             if (success) {
+                await sleep(rand(80, 140));
+
+                const vaultAfterDeposit = getVaultTotal();
+                const onHandAfterDeposit = getCash();
+                const vaultIsFull = Number.isFinite(vaultAfterDeposit) && vaultAfterDeposit >= VAULT_CAP;
+                const hasCashRemaining = Number.isFinite(onHandAfterDeposit) && onHandAfterDeposit > 0;
+
+                if (vaultIsFull && hasCashRemaining) {
+                    setDepositRequest({ ...request, target: 'faction' });
+                    goToFactionArmoryPage();
+                    return;
+                }
+
                 clearDepositRequest();
                 await sleep(rand(80, 140));
             }
@@ -853,6 +860,22 @@
         const paused = isPaused();
         uiPauseToggleBtn.textContent = `Paused: ${paused ? 'ON' : 'OFF'}`;
         uiPauseToggleBtn.style.background = paused ? '#5C1F2A' : '#2a2a2a';
+        refreshPanelPausedAppearance();
+    }
+
+    function refreshPanelPausedAppearance() {
+        if (!uiPanelEl) return;
+        const paused = isPaused();
+        const collapsed = localStorage.getItem(UI_KEYS.collapsed) === '1';
+
+        if (paused && collapsed) {
+            uiPanelEl.style.background = 'rgba(92,31,42,0.95)';
+            uiPanelEl.style.border = '1px solid rgba(255,142,161,0.75)';
+            return;
+        }
+
+        uiPanelEl.style.background = 'rgba(10,10,10,0.92)';
+        uiPanelEl.style.border = '1px solid rgba(255,255,255,0.15)';
     }
 
     function setPausedState(paused) {
@@ -1174,6 +1197,7 @@
 
         const panel = document.createElement('div');
         panel.id = 'panic-panel';
+        uiPanelEl = panel;
 
         Object.assign(panel.style, {
             position: 'fixed',
@@ -1492,6 +1516,7 @@
             collapseBtn.textContent = collapsed ? '+' : '−';
             panel.style.minWidth = collapsed ? '100px' : '240px';
             localStorage.setItem(UI_KEYS.collapsed, collapsed ? '1' : '0');
+            refreshPanelPausedAppearance();
         }
 
         collapseBtn.onclick = (e) => {
