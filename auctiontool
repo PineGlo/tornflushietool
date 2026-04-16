@@ -1282,6 +1282,11 @@
             font-size: 12px;
         }
 
+        .twx-input option {
+            color: #111827;
+            background: #f8fafc;
+        }
+
         .twx-checkbox-row {
             display: flex;
             gap: 14px;
