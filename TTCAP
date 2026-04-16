@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trade Chat Auto Poster
 // @namespace    torn.trade.autoposter
-// @version      3.0.0
+// @version      3.0.2
 // @description  Auto-post a trade message in Torn Trade chat with manual leader tab selection, refresh-persistent leader, jittered timing, and minimize after post.
 // @match        https://www.torn.com/*
 // @grant        GM_getValue
@@ -38,6 +38,10 @@
     const POST_AFTER_FILL_MS = 180;
     const POST_AFTER_SEND_MS = 400;
     const POST_AFTER_MINIMIZE_MS = 250;
+    const SEND_BTN_WAIT_MS = 600;
+    const SEND_BTN_WAIT_STEP_MS = 60;
+    const SEND_ATTEMPTS = 3;
+    const SEND_RETRY_MS = 220;
 
     function getOrCreateSessionTabId() {
         let id = sessionStorage.getItem(SESSION_KEYS.tabId);
@@ -271,8 +275,62 @@
     }
 
     function fireInputEvents(el) {
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        const inputEvt = typeof InputEvent === 'function'
+            ? new InputEvent('input', {
+                bubbles: true,
+                cancelable: false,
+                data: el.value,
+                inputType: 'insertText'
+            })
+            : new Event('input', { bubbles: true });
+        el.dispatchEvent(inputEvt);
         el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function clickLikeUser(el) {
+        if (!el) return;
+        const opts = { bubbles: true, cancelable: true, composed: true, view: window };
+        if (typeof PointerEvent === 'function') {
+            el.dispatchEvent(new PointerEvent('pointerdown', opts));
+            el.dispatchEvent(new PointerEvent('pointerup', opts));
+        }
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+    }
+
+    async function sendTradeMessage(tradePanel, textarea) {
+        const originalMessage = textarea.value;
+        for (let attempt = 1; attempt <= SEND_ATTEMPTS; attempt += 1) {
+            let sendBtn = findTradeSendButtonWithin(tradePanel);
+            const waitUntil = now() + SEND_BTN_WAIT_MS;
+            while (sendBtn && sendBtn.disabled && now() < waitUntil) {
+                await sleep(SEND_BTN_WAIT_STEP_MS);
+                sendBtn = findTradeSendButtonWithin(tradePanel);
+            }
+
+            if (sendBtn && !sendBtn.disabled) {
+                clickLikeUser(sendBtn);
+            } else {
+                fireEnter(textarea);
+                textarea.closest('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            }
+
+            await sleep(POST_AFTER_SEND_MS);
+
+            const currentValue = String(textarea.value || '').trim();
+            if (!currentValue || currentValue !== String(originalMessage || '').trim()) {
+                return true;
+            }
+
+            if (attempt < SEND_ATTEMPTS) {
+                setNativeValue(textarea, originalMessage);
+                fireInputEvents(textarea);
+                await sleep(SEND_RETRY_MS);
+            }
+        }
+
+        return false;
     }
 
     function fireEnter(el) {
@@ -475,21 +533,18 @@
         const textarea = findTradeTextareaWithin(tradePanel);
         if (!textarea) return { ok: false, reason: 'Trade textarea not found.' };
 
-        textarea.focus();
-        await sleep(100);
+        if (document.visibilityState === 'visible') {
+            textarea.focus();
+            await sleep(100);
+        }
 
         setNativeValue(textarea, message);
         fireInputEvents(textarea);
         await sleep(POST_AFTER_FILL_MS);
 
-        const sendBtn = findTradeSendButtonWithin(tradePanel);
-
-        if (sendBtn && !sendBtn.disabled) {
-            sendBtn.click();
-            await sleep(POST_AFTER_SEND_MS);
-        } else {
-            fireEnter(textarea);
-            await sleep(POST_AFTER_SEND_MS);
+        const sent = await sendTradeMessage(tradePanel, textarea);
+        if (!sent) {
+            return { ok: false, reason: 'Trade send action did not clear textarea.' };
         }
 
         await minimizeTradePanel(tradePanel);
