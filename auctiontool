@@ -371,6 +371,10 @@
             if (filters.bonus2Max !== '') body.bonus2_value_max = Number(filters.bonus2Max);
             if (filters.qualityMin !== '') body.quality_min = Number(filters.qualityMin);
             if (filters.qualityMax !== '') body.quality_max = Number(filters.qualityMax);
+            if (filters.itemCategory) body.item_category = filters.itemCategory;
+            if (filters.weaponClass) body.weapon_class = filters.weaponClass;
+            if (filters.armorSet) body.armor_set = filters.armorSet;
+            if (filters.armorPiece) body.armor_piece = filters.armorPiece;
 
             const data = await Transport.request(
                 'POST',
@@ -867,6 +871,10 @@
                 bonus2Max: '',
                 qualityMin: '',
                 qualityMax: '',
+                itemCategory: 'weapon',
+                weaponClass: '',
+                armorSet: '',
+                armorPiece: '',
                 includeBazaar: true,
                 includeMarket: true,
             },
@@ -1642,10 +1650,20 @@ ensurePill(item, index) {
             const lastRunText = AppState.search.lastRunAt
                 ? new Date(AppState.search.lastRunAt).toLocaleString()
                 : 'Never';
+            const weaponClassOptions = [
+                { value: '', label: 'All' },
+                { value: 'Primary', label: 'Primary' },
+                { value: 'Secondary', label: 'Secondary' },
+                { value: 'Melee', label: 'Melee' },
+            ];
 
             return `
                 <div class="twx-card">
                     <div class="twx-card-title">Search Filters</div>
+                    <div class="twx-btn-row" style="margin-bottom:10px;">
+                        <button class="twx-btn ${f.itemCategory === 'weapon' ? 'twx-tab active' : ''}" id="twx-search-cat-weapon">Weapons</button>
+                        <button class="twx-btn ${f.itemCategory === 'armor' ? 'twx-tab active' : ''}" id="twx-search-cat-armor">Armor</button>
+                    </div>
                     <div class="twx-grid-2">
                         <label class="twx-field">
                             <span class="twx-label">Item Name</span>
@@ -1659,6 +1677,29 @@ ensurePill(item, index) {
                             </div>
                         </div>
                     </div>
+
+                    ${f.itemCategory === 'weapon' ? `
+                        <div class="twx-grid-2" style="margin-top:10px;">
+                            <label class="twx-field">
+                                <span class="twx-label">Weapon Class</span>
+                                <select class="twx-input" id="twx-search-weapon-class">
+                                    ${weaponClassOptions.map(o => `<option value="${o.value}" ${String(f.weaponClass) === String(o.value) ? 'selected' : ''}>${o.label}</option>`).join('')}
+                                </select>
+                            </label>
+                            <div></div>
+                        </div>
+                    ` : `
+                        <div class="twx-grid-2" style="margin-top:10px;">
+                            <label class="twx-field">
+                                <span class="twx-label">Armor Set</span>
+                                <input class="twx-input" id="twx-search-armor-set" value="${Util.escapeHtml(String(f.armorSet || ''))}" placeholder="e.g. Riot">
+                            </label>
+                            <label class="twx-field">
+                                <span class="twx-label">Armor Piece</span>
+                                <input class="twx-input" id="twx-search-armor-piece" value="${Util.escapeHtml(String(f.armorPiece || ''))}" placeholder="e.g. Helmet">
+                            </label>
+                        </div>
+                    `}
 
                     <div class="twx-grid-2" style="margin-top:10px;">
                         <label class="twx-field">
@@ -1735,6 +1776,7 @@ ensurePill(item, index) {
                                     <div class="twx-row-right">
                                         <div class="twx-price">${Util.money(Number(r.price || 0))}</div>
                                         <div class="twx-meta">${r.timestamp ? new Date(r.timestamp * 1000).toLocaleString() : '—'}</div>
+                                        ${this.getSearchRowLink(r, f) ? `<a class="twx-meta" href="${Util.escapeHtml(this.getSearchRowLink(r, f))}" target="_blank" rel="noopener noreferrer">Open listing</a>` : ''}
                                     </div>
                                 </div>
                             `).join('')}
@@ -1755,9 +1797,22 @@ ensurePill(item, index) {
                 AppState.search.filters.bonus2Max = (document.getElementById('twx-search-bonus2-max')?.value || '').trim();
                 AppState.search.filters.qualityMin = (document.getElementById('twx-search-quality-min')?.value || '').trim();
                 AppState.search.filters.qualityMax = (document.getElementById('twx-search-quality-max')?.value || '').trim();
+                AppState.search.filters.weaponClass = document.getElementById('twx-search-weapon-class')?.value || '';
+                AppState.search.filters.armorSet = (document.getElementById('twx-search-armor-set')?.value || '').trim();
+                AppState.search.filters.armorPiece = (document.getElementById('twx-search-armor-piece')?.value || '').trim();
                 AppState.search.filters.includeBazaar = !!document.getElementById('twx-search-include-bazaar')?.checked;
                 AppState.search.filters.includeMarket = !!document.getElementById('twx-search-include-market')?.checked;
             };
+
+            document.getElementById('twx-search-cat-weapon')?.addEventListener('click', () => {
+                AppState.search.filters.itemCategory = 'weapon';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            document.getElementById('twx-search-cat-armor')?.addEventListener('click', () => {
+                AppState.search.filters.itemCategory = 'armor';
+                this.renderActiveItem(AppState.activeItem);
+            });
 
             document.getElementById('twx-search-run')?.addEventListener('click', async () => {
                 saveFiltersFromDom();
@@ -1786,6 +1841,10 @@ ensurePill(item, index) {
                     bonus2Max: '',
                     qualityMin: '',
                     qualityMax: '',
+                    itemCategory: 'weapon',
+                    weaponClass: '',
+                    armorSet: '',
+                    armorPiece: '',
                     includeBazaar: true,
                     includeMarket: true,
                 };
@@ -1813,6 +1872,38 @@ ensurePill(item, index) {
             const p1 = b1Name ? `${b1Name}${b1v != null ? ` ${b1v}%` : ''}` : null;
             const p2 = b2Name ? `${b2Name}${b2v != null ? ` ${b2v}%` : ''}` : null;
             return [p1, p2].filter(Boolean).join(' • ') || 'No bonuses';
+        },
+
+        getSearchRowLink(row, filters) {
+            const source = String(row?.listing_source || row?.source || row?.origin || '').toLowerCase();
+            if (source.includes('bazaar')) {
+                const userId = row?.seller_id || row?.user_id || row?.owner_id;
+                if (!userId) return '';
+                return `https://www.torn.com/bazaar.php?userId=${Number(userId)}`;
+            }
+
+            if (source.includes('market')) {
+                const categoryName = filters?.itemCategory === 'armor'
+                    ? 'Armor'
+                    : (filters?.weaponClass || 'Primary');
+                const params = [
+                    `categoryName=${encodeURIComponent(categoryName)}`,
+                    'sortField=price',
+                    'sortOrder=ASC',
+                ];
+
+                const bonus1Id = row?.bonus1_id || filters?.bonus1Id;
+                if (bonus1Id) params.push(`bonuses[0]=${encodeURIComponent(String(bonus1Id))}`);
+
+                const damageFrom = row?.stat_damage ?? filters?.damageMin;
+                const damageTo = row?.stat_damage ?? filters?.damageMax;
+                if (damageFrom != null && damageFrom !== '') params.push(`damageFrom=${encodeURIComponent(String(damageFrom))}`);
+                if (damageTo != null && damageTo !== '') params.push(`damageTo=${encodeURIComponent(String(damageTo))}`);
+
+                return `https://www.torn.com/page.php?sid=ItemMarket#/market/view=category&${params.join('&')}`;
+            }
+
+            return '';
         },
 
         filterSearchRowsBySource(rows, filters) {
