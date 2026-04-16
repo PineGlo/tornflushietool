@@ -234,11 +234,27 @@
         return localStorage.getItem(KEYS.leaderLockedTab) || '';
     }
 
+    function pruneStaleLockedLeader() {
+        const lockedTabId = getLockedLeaderTabId();
+        if (!lockedTabId || lockedTabId === TAB_ID) return;
+
+        const leader = readLeaderState();
+        const lockLooksStale =
+            !leader ||
+            leader.tabId !== lockedTabId ||
+            isLeaderStale(leader);
+
+        if (lockLooksStale) {
+            localStorage.removeItem(KEYS.leaderLockedTab);
+        }
+    }
+
     function isThisTabLockedLeader() {
         return getLockedLeaderTabId() === TAB_ID;
     }
 
     function canThisTabRunLeaderFlow() {
+        pruneStaleLockedLeader();
         if (!isLeaderModeEnabled()) return false;
         const lockedTabId = getLockedLeaderTabId();
         if (lockedTabId && lockedTabId !== TAB_ID) return false;
@@ -470,34 +486,25 @@
         return !!leader && leader.tabId === TAB_ID && !isLeaderStale(leader);
     }
 
-    function shouldTakeLeadership(currentLeader) {
-        if (!canThisTabRunLeaderFlow()) return false;
-
-        const mine = getMyLeaderPayload();
-
-        if (!currentLeader) return true;
-        if (isLeaderStale(currentLeader)) return true;
-        if (currentLeader.tabId === TAB_ID) return true;
-
-        if (mine.isVault && !currentLeader.isVault) return true;
-
-        return false;
+    function hasActiveLeader() {
+        const leader = readLeaderState();
+        return !!leader && !isLeaderStale(leader);
     }
 
     function maybeClaimLeadership(force = false) {
-        if (!force && !canThisTabRunLeaderFlow()) {
+        if (!force) {
             updateUIStatus();
             return false;
         }
 
-        const currentLeader = readLeaderState();
-        if ((force && canThisTabRunLeaderFlow()) || shouldTakeLeadership(currentLeader)) {
-            writeLeaderState(getMyLeaderPayload());
+        if (!canThisTabRunLeaderFlow()) {
             updateUIStatus();
-            return true;
+            return false;
         }
+
+        writeLeaderState(getMyLeaderPayload());
         updateUIStatus();
-        return false;
+        return true;
     }
 
     function heartbeatLeadership() {
@@ -507,11 +514,7 @@
             return;
         }
 
-        if (amLeader()) {
-            writeLeaderState(getMyLeaderPayload());
-        } else {
-            maybeClaimLeadership(false);
-        }
+        if (amLeader()) writeLeaderState(getMyLeaderPayload());
         updateUIStatus();
     }
 
@@ -525,6 +528,20 @@
                 } catch {}
             }
         }
+    }
+
+    function forceResetAllLeaderState(claimAfter = true) {
+        localStorage.removeItem(KEYS.leaderState);
+        localStorage.removeItem(KEYS.leaderLockedTab);
+        if (bc) {
+            try {
+                bc.postMessage({ type: 'leader-released', tabId: TAB_ID, forced: true });
+            } catch {}
+        }
+        if (claimAfter) {
+            maybeClaimLeadership(true);
+        }
+        updateUIStatus();
     }
 
     function buildDepositRequest(source = 'manual') {
@@ -559,26 +576,42 @@
         }
     }
 
+    function findActionControl(root, matcher) {
+        if (!root) return null;
+        const controls = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
+        return controls.find(ctrl => {
+            const txt = ((ctrl.textContent || '') + ' ' + (ctrl.value || '')).replace(/\s+/g, ' ').trim();
+            return matcher.test(txt);
+        }) || null;
+    }
+
     function getDepositForm() {
-        return document.querySelector('form.vault-cont.right.deposit-box');
+        return document.querySelector('form.vault-cont.right.deposit-box')
+            || document.querySelector('form[class*="deposit"]')
+            || document.querySelector('.vault-cont.right.deposit-box')
+            || document.querySelector('[class*="deposit-box"]');
     }
 
     function getMaxBtn() {
         const form = getDepositForm();
-        return form?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+        return findActionControl(form, /^(max|all)$/i)
+            || form?.querySelector('span.input-money-symbol input.wai-btn[type="button"]')
+            || null;
     }
 
     function getDepositBtn() {
         const form = getDepositForm();
-        return Array.from(form?.querySelectorAll('input.torn-btn[type="submit"]') || [])
-            .find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT') || null;
+        return findActionControl(form, /^deposit$/i)
+            || Array.from(form?.querySelectorAll('input.torn-btn[type="submit"]') || [])
+                .find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT')
+            || null;
     }
 
     function getDepositAmountInput() {
         const form = getDepositForm();
         if (!form) return null;
 
-        return form.querySelector('input[name="money"], input[name="amount"], input[type="text"], input[type="number"]') || null;
+        return form.querySelector('input[name="money"], input[name="amount"], input[class*="input-money"], input[type="text"], input[type="number"]') || null;
     }
 
     function getFactionMoneyGroup() {
@@ -587,7 +620,9 @@
 
     function getFactionMaxBtn() {
         const group = getFactionMoneyGroup();
-        return group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+        return findActionControl(group, /^(max|all)$/i)
+            || group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]')
+            || null;
     }
 
     function getFactionAmountInput() {
@@ -597,8 +632,10 @@
     }
 
     function getFactionDepositBtn() {
-        return Array.from(document.querySelectorAll('button.torn-btn'))
-            .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY') || null;
+        return findActionControl(document, /deposit money|deposit/i)
+            || Array.from(document.querySelectorAll('button.torn-btn'))
+                .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY')
+            || null;
     }
 
     function getFactionConfirmYesBtn() {
@@ -820,11 +857,19 @@
         }
     }
 
-    async function requestDeposit(source = 'manual') {
-        if (isPaused()) return;
+    async function requestDeposit(source = 'manual', opts = {}) {
+        const forceWhenPaused = !!opts.forceWhenPaused;
+        if (isPaused()) {
+            if (!forceWhenPaused) return;
+            setPausedState(false);
+        }
 
         const payload = buildDepositRequest(source);
         setDepositRequest(payload);
+
+        if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+            maybeClaimLeadership(true);
+        }
 
         if (amLeader()) {
             await sleep(rand());
@@ -836,6 +881,9 @@
         const settings = getSettings();
 
         if (isPaused()) return;
+        if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+            maybeClaimLeadership(true);
+        }
         if (!amLeader()) return;
         if (!isAutoModeEnabled()) return;
 
@@ -1248,19 +1296,20 @@
             fontWeight: '700',
             cursor: 'pointer'
         });
-        depositBtn.onclick = () => requestDeposit('manual');
+        depositBtn.onclick = () => requestDeposit('manual', { forceWhenPaused: true });
 
         const autoToggle = document.createElement('button');
         const cashToggle = document.createElement('button');
         const pauseToggle = document.createElement('button');
         const testBtn = document.createElement('button');
         const testFactionBtn = document.createElement('button');
+        const fixLeaderBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, fixLeaderBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1348,23 +1397,26 @@
         testBtn.textContent = 'Test Trigger';
         testBtn.style.background = '#2a2a2a';
         testBtn.onclick = async () => {
-            if (!amLeader()) {
-                maybeClaimLeadership(true);
-            }
-            await maybeAutoDeposit('test', 999);
+            await requestDeposit('manual:test-trigger', { forceWhenPaused: true });
         };
 
         testFactionBtn.textContent = 'Test Faction Fallback';
         testFactionBtn.style.background = '#2a2a2a';
         testFactionBtn.onclick = async () => {
-            if (!amLeader()) {
-                maybeClaimLeadership(true);
+            if (isPaused()) {
+                setPausedState(false);
             }
             const payload = buildDepositRequest('manual:faction-test');
             payload.target = 'faction';
             setDepositRequest(payload);
             await sleep(rand());
             processDepositFlow();
+        };
+
+        fixLeaderBtn.textContent = 'Fix Leader (Reset)';
+        fixLeaderBtn.style.background = '#5C1F2A';
+        fixLeaderBtn.onclick = () => {
+            forceResetAllLeaderState(true);
         };
 
         settingsToggle.onclick = () => {
@@ -1477,6 +1529,7 @@
         body.appendChild(pauseToggle);
         body.appendChild(testBtn);
         body.appendChild(testFactionBtn);
+        body.appendChild(fixLeaderBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
@@ -1620,25 +1673,20 @@
         if (leaderWatcherStarted) return;
         leaderWatcherStarted = true;
 
-        maybeClaimLeadership(true);
-
         setInterval(() => {
             heartbeatLeadership();
         }, getSettings().leaderHeartbeatMs);
 
         document.addEventListener('visibilitychange', () => {
-            maybeClaimLeadership(false);
             updateUIStatus();
         });
 
         window.addEventListener('focus', () => {
-            maybeClaimLeadership(false);
             updateUIStatus();
         });
 
         window.addEventListener('hashchange', () => {
             setTimeout(() => {
-                maybeClaimLeadership(false);
                 processDepositFlow();
                 updateUIStatus();
             }, 100);
@@ -1689,7 +1737,7 @@
                 }
 
                 if (msg.type === 'leader-released') {
-                    maybeClaimLeadership(false);
+                    updateUIStatus();
                 }
 
                 if (msg.type === 'leader-heartbeat') {
@@ -1704,6 +1752,9 @@
         flowWatcherStarted = true;
 
         setInterval(() => {
+            if (!amLeader() && !hasActiveLeader() && canThisTabRunLeaderFlow()) {
+                maybeClaimLeadership(true);
+            }
             if (!amLeader()) return;
             processDepositFlow();
         }, 1000);
