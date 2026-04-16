@@ -813,6 +813,15 @@
     return hospitalEtaText || "Unknown";
   }
 
+  function readAttackHospitalFromDom() {
+    const text = normalizeText(document.body?.innerText || "");
+    if (!text) return null;
+    const etaMatch = text.match(/leave hospital in\s*([0-9hms\s]+)/i);
+    const etaText = etaMatch ? normalizeText(etaMatch[1]) : "";
+    const isHospital = /\bhospital\b/i.test(text) || !!etaText;
+    return { isHospital, etaText };
+  }
+
   function beepAttackAlarm() {
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -927,14 +936,26 @@
 
     const coreUser = state.coreClient?.getUser?.(userId) || null;
     const torn = coreUser?.torn || null;
-    const status = String(torn?.status || "").trim();
-    const isHospital = status === "Hospital";
-    const timerText = getAttackHospitalTimerText(userId);
+    let status = String(torn?.status || "").trim();
+    let isHospital = status === "Hospital";
+    let timerText = getAttackHospitalTimerText(userId);
+
+    if (!status) {
+      const domState = readAttackHospitalFromDom();
+      if (domState) {
+        isHospital = !!domState.isHospital;
+        status = isHospital ? "Hospital" : "Unknown";
+        if (isHospital && domState.etaText) {
+          const etaMs = parseEtaTextToMs(domState.etaText);
+          timerText = etaMs != null ? formatCountdownMs(etaMs) : domState.etaText;
+        }
+      }
+    }
 
     if (!status) {
       ui.box.classList.remove("released");
       ui.status.textContent = `Target ${userId}: waiting for status...`;
-      ui.sub.textContent = "Waiting for Torn Core updates.";
+      ui.sub.textContent = "Waiting for attack-page DOM status.";
       return;
     }
 
@@ -970,7 +991,6 @@
     if (!Number.isFinite(userId)) return;
     state.coreClient = createCoreClient();
     state.coreMode = state.coreClient.mode;
-    await state.coreClient.requestUsersTornRefresh([userId], { sourceHint: "attack_loader" });
     renderAttackMonitor();
   }
 
