@@ -311,6 +311,7 @@
 
             if (sendBtn && !sendBtn.disabled) {
                 clickLikeUser(sendBtn);
+                sendBtn.click?.();
             } else {
                 fireEnter(textarea);
                 textarea.closest('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
@@ -460,14 +461,30 @@
         if (!panel) return null;
 
         const textarea = findTradeTextareaWithin(panel);
-        if (textarea?.parentElement) {
-            const btn = textarea.parentElement.querySelector('button.iconWrapper___tyRRU');
-            if (btn) return btn;
+        const form = textarea?.closest('form') || null;
+        const sendLabelRe = /\b(send|post)\b/i;
+        const candidateRoots = [textarea?.parentElement, form, panel].filter(Boolean);
+
+        for (const root of candidateRoots) {
+            const buttons = [...root.querySelectorAll('button')];
+            for (const btn of buttons) {
+                const aria = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.trim();
+                const className = String(btn.className || '');
+                if (sendLabelRe.test(aria)) return btn;
+                if (className.includes('iconWrapper') && btn.querySelector('svg')) return btn;
+            }
         }
 
-        const buttons = [...panel.querySelectorAll('button')];
+        const buttons = [...panel.querySelectorAll('button, [role="button"]')];
         for (const btn of buttons) {
-            if (btn.querySelector('svg') && String(btn.className || '').includes('iconWrapper')) {
+            const aria = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.trim();
+            const text = safeText(btn);
+            if (sendLabelRe.test(aria) || sendLabelRe.test(text)) {
+                return btn;
+            }
+
+            const className = String(btn.className || '');
+            if (btn.querySelector?.('svg') && className.includes('iconWrapper')) {
                 return btn;
             }
         }
