@@ -314,7 +314,9 @@
                 sendBtn.click?.();
             } else {
                 fireEnter(textarea);
-                textarea.closest('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                const form = textarea.closest('form');
+                form?.requestSubmit?.();
+                form?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
             }
 
             await sleep(POST_AFTER_SEND_MS);
@@ -463,28 +465,35 @@
         const textarea = findTradeTextareaWithin(panel);
         const form = textarea?.closest('form') || null;
         const sendLabelRe = /\b(send|post)\b/i;
+        const isLikelySendButton = (btn) => {
+            if (!btn) return false;
+            const aria = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.trim();
+            const text = safeText(btn);
+            const className = String(btn.className || '');
+            if (sendLabelRe.test(aria) || sendLabelRe.test(text)) return true;
+            return className.includes('iconWrapper') && !!btn.querySelector('svg');
+        };
         const candidateRoots = [textarea?.parentElement, form, panel].filter(Boolean);
 
         for (const root of candidateRoots) {
             const buttons = [...root.querySelectorAll('button')];
-            for (const btn of buttons) {
-                const aria = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.trim();
-                const className = String(btn.className || '');
-                if (sendLabelRe.test(aria)) return btn;
-                if (className.includes('iconWrapper') && btn.querySelector('svg')) return btn;
+            const filtered = buttons.filter((btn) => !btn.disabled && isLikelySendButton(btn));
+            if (filtered.length) return filtered[filtered.length - 1];
+        }
+
+        if (textarea) {
+            let ancestor = textarea.parentElement;
+            for (let depth = 0; ancestor && depth < 8 && ancestor !== panel; depth += 1) {
+                const btns = [...ancestor.querySelectorAll('button.iconWrapper___tyRRU[type="button"], button.iconWrapper___tyRRU, button[type="button"]')]
+                    .filter((btn) => !btn.disabled && isLikelySendButton(btn));
+                if (btns.length) return btns[btns.length - 1];
+                ancestor = ancestor.parentElement;
             }
         }
 
         const buttons = [...panel.querySelectorAll('button, [role="button"]')];
         for (const btn of buttons) {
-            const aria = `${btn.getAttribute('aria-label') || ''} ${btn.getAttribute('title') || ''}`.trim();
-            const text = safeText(btn);
-            if (sendLabelRe.test(aria) || sendLabelRe.test(text)) {
-                return btn;
-            }
-
-            const className = String(btn.className || '');
-            if (btn.querySelector?.('svg') && className.includes('iconWrapper')) {
+            if (!btn.disabled && isLikelySendButton(btn)) {
                 return btn;
             }
         }
