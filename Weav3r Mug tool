@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Weav3r Mugging Helper
 // @namespace    Violentmonkey Scripts
-// @version      1.3.2
-// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links, skips protected/alliance members, and shows hospital countdowns.
+// @version      1.4.0
+// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links, skips protected/alliance members, and shows hospital countdowns. Includes attack-page hospital timer + release alarm.
 // @match        https://weav3r.dev/item/*
 // @match        https://www.torn.com/bazaar.php*
+// @match        https://www.torn.com/loader.php?sid=attack*
+// @match        https://www.torn.com/page.php?sid=attack*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
@@ -37,6 +39,8 @@
     bazaarRefreshJitterPct: 20,
     soldAlertUnits: 250,
     rapidJumpUnits: 40,
+    attackAlarmEnabled: true,
+    attackAutoStartEnabled: false,
   };
 
   const CORE_STALE = {
@@ -57,6 +61,15 @@
     scanTimer: null,
     tickTimer: null,
     trackerEls: null,
+    attackMonitor: {
+      targetUserId: null,
+      previousHospital: null,
+      alarmedAt: 0,
+      autoAttackStarted: false,
+      ui: null,
+      loopTimer: null,
+      audioCtx: null,
+    },
     lastPlan: {
       visible: 0,
       protected: 0,
@@ -258,6 +271,47 @@
       filter: brightness(1.08);
       text-decoration: none !important;
     }
+    .wmh-attack-monitor {
+      position: fixed;
+      top: 88px;
+      right: 18px;
+      z-index: 999999;
+      min-width: 250px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(15, 23, 42, 0.96);
+      color: #e5e7eb;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+      line-height: 1.35;
+      backdrop-filter: blur(8px);
+    }
+    .wmh-attack-monitor-title {
+      font-weight: 700;
+      margin-bottom: 5px;
+      color: #bfdbfe;
+    }
+    .wmh-attack-monitor-status {
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+    .wmh-attack-monitor-sub {
+      color: #cbd5e1;
+      font-size: 11px;
+    }
+    .wmh-attack-monitor-opt {
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: #dbeafe;
+      font-size: 11px;
+    }
+    .wmh-attack-monitor.released .wmh-attack-monitor-status {
+      color: #86efac;
+    }
 
     .wmh-row-good {
       outline: 1px solid rgba(74, 222, 128, 0.6) !important;
@@ -292,6 +346,10 @@
 
   function now() {
     return Date.now();
+  }
+
+  function normalizeText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
   }
 
   function debounce(fn, wait) {
@@ -353,9 +411,21 @@
     return location.hostname === "www.torn.com" && location.pathname.includes("bazaar.php");
   }
 
+  function isTornAttackPage() {
+    if (location.hostname !== "www.torn.com") return false;
+    const href = location.href.toLowerCase();
+    return href.includes("sid=attack");
+  }
+
   function parseUserIdFromHref(href) {
     if (!href) return null;
     const match = href.match(/(?:userId=|XID=)(\d+)/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  function parseAttackTargetUserIdFromHref(href) {
+    if (!href) return null;
+    const match = String(href).match(/user2id=(\d+)/i);
     return match ? Number(match[1]) : null;
   }
 
@@ -696,12 +766,212 @@
     const coreUser = state.coreClient?.getUser?.(userId) || null;
     const torn = coreUser?.torn || null;
     const hospitalUntil = Number(torn?.hospitalUntil) || 0;
+    const hospitalEtaText = String(torn?.hospitalEtaText || "").trim();
 
-    if (!hospitalUntil) return "";
+    if (!hospitalUntil) {
+      return hospitalEtaText ? `Hosp ${hospitalEtaText}` : "";
+    }
     const remainingMs = hospitalUntil - now();
     if (remainingMs <= 0) return "Hosp 0m";
 
     return `Hosp ${formatCountdownMs(remainingMs)}`;
+  }
+
+  function parseEtaTextToMs(etaText) {
+    const raw = String(etaText || "").toLowerCase();
+    if (!raw) return null;
+
+    let totalMs = 0;
+    const hMatch = raw.match(/(\d+)\s*h/);
+    const mMatch = raw.match(/(\d+)\s*m/);
+    const sMatch = raw.match(/(\d+)\s*s/);
+    if (hMatch) totalMs += Number(hMatch[1]) * 60 * 60 * 1000;
+    if (mMatch) totalMs += Number(mMatch[1]) * 60 * 1000;
+    if (sMatch) totalMs += Number(sMatch[1]) * 1000;
+
+    if (totalMs > 0) return totalMs;
+    return null;
+  }
+
+  function getAttackHospitalTimerText(userId) {
+    const coreUser = state.coreClient?.getUser?.(userId) || null;
+    const torn = coreUser?.torn || null;
+    const hospitalUntil = Number(torn?.hospitalUntil) || 0;
+    const hospitalEtaText = String(torn?.hospitalEtaText || "").trim();
+    const refreshedAt = Number(torn?.lastRefreshAt) || now();
+
+    if (hospitalUntil > 0) {
+      return formatCountdownMs(hospitalUntil - now());
+    }
+
+    const etaMs = parseEtaTextToMs(hospitalEtaText);
+    if (etaMs != null) {
+      const estUntil = refreshedAt + etaMs;
+      return formatCountdownMs(estUntil - now());
+    }
+
+    return hospitalEtaText || "Unknown";
+  }
+
+  function beepAttackAlarm() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!state.attackMonitor.audioCtx || state.attackMonitor.audioCtx.state === "closed") {
+        state.attackMonitor.audioCtx = new Ctx();
+      }
+      const ctx = state.attackMonitor.audioCtx;
+      const pattern = [1046.5, 1318.5, 1568];
+      const start = ctx.currentTime + 0.03;
+      pattern.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.value = 0.0001;
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        const t0 = start + (idx * 0.18);
+        gain.gain.exponentialRampToValueAtTime(0.15, t0 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.16);
+        osc.start(t0);
+        osc.stop(t0 + 0.17);
+      });
+    } catch (err) {
+      log("Alarm beep failed", err);
+    }
+  }
+
+  function tryAutoStartAttack() {
+    const candidates = Array.from(document.querySelectorAll("button, input[type='button'], input[type='submit'], a"));
+    const scoreFor = (el) => {
+      if (!el || typeof el !== "object") return 0;
+      const txt = normalizeText(el.innerText || el.textContent || el.value || "").toLowerCase();
+      const cls = String(el.className || "").toLowerCase();
+      const aria = String(el.getAttribute?.("aria-label") || "").toLowerCase();
+      const href = String(el.getAttribute?.("href") || "").toLowerCase();
+      let score = 0;
+      if (txt === "attack" || txt === "start fight" || txt === "start attack") score += 100;
+      if (txt.includes("attack")) score += 30;
+      if (txt.includes("start fight")) score += 30;
+      if (aria.includes("attack")) score += 20;
+      if (cls.includes("attack")) score += 15;
+      if (href.includes("sid=attack")) score -= 25;
+      if (el.disabled) score -= 100;
+      if (el.offsetParent == null) score -= 20;
+      return score;
+    };
+
+    const best = candidates
+      .map((el) => ({ el, score: scoreFor(el) }))
+      .sort((a, b) => b.score - a.score)[0];
+
+    if (!best || best.score < 30) return false;
+    best.el.click();
+    return true;
+  }
+
+  function handleAttackReleaseTransition(userId, isHospital) {
+    const prev = state.attackMonitor.previousHospital;
+    const changedToReleased = prev === true && isHospital === false;
+    state.attackMonitor.previousHospital = isHospital;
+    if (!changedToReleased) return;
+
+    const nowMs = now();
+    if (state.cfg.attackAlarmEnabled && (nowMs - state.attackMonitor.alarmedAt) >= 5000) {
+      state.attackMonitor.alarmedAt = nowMs;
+      beepAttackAlarm();
+      alert(`Target ${userId} is out of hospital.`);
+    }
+
+    if (state.cfg.attackAutoStartEnabled && !state.attackMonitor.autoAttackStarted) {
+      const clicked = tryAutoStartAttack();
+      if (clicked) {
+        state.attackMonitor.autoAttackStarted = true;
+      }
+    }
+  }
+
+  function buildAttackMonitorUi() {
+    const box = document.createElement("div");
+    box.className = "wmh-attack-monitor";
+    box.id = "wmh-attack-monitor";
+    box.innerHTML = `
+      <div class="wmh-attack-monitor-title">Hospital Monitor</div>
+      <div class="wmh-attack-monitor-status" id="wmh-attack-monitor-status">Loading target status...</div>
+      <div class="wmh-attack-monitor-sub" id="wmh-attack-monitor-sub"></div>
+      <label class="wmh-attack-monitor-opt" for="wmh-attack-auto-start">
+        <input id="wmh-attack-auto-start" type="checkbox">
+        Auto start attack when released
+      </label>
+    `;
+    document.body.appendChild(box);
+    state.attackMonitor.ui = {
+      box,
+      status: box.querySelector("#wmh-attack-monitor-status"),
+      sub: box.querySelector("#wmh-attack-monitor-sub"),
+      autoStart: box.querySelector("#wmh-attack-auto-start"),
+    };
+
+    state.attackMonitor.ui.autoStart.checked = !!state.cfg.attackAutoStartEnabled;
+    state.attackMonitor.ui.autoStart.addEventListener("change", () => {
+      state.cfg.attackAutoStartEnabled = !!state.attackMonitor.ui.autoStart.checked;
+      saveConfig();
+    });
+  }
+
+  function renderAttackMonitor() {
+    const ui = state.attackMonitor.ui;
+    const userId = state.attackMonitor.targetUserId;
+    if (!ui || !userId) return;
+
+    const coreUser = state.coreClient?.getUser?.(userId) || null;
+    const torn = coreUser?.torn || null;
+    const status = String(torn?.status || "").trim();
+    const isHospital = status === "Hospital";
+    const timerText = getAttackHospitalTimerText(userId);
+
+    if (!status) {
+      ui.box.classList.remove("released");
+      ui.status.textContent = `Target ${userId}: waiting for status...`;
+      ui.sub.textContent = "Waiting for Torn Core updates.";
+      return;
+    }
+
+    if (isHospital) {
+      ui.box.classList.remove("released");
+      ui.status.textContent = `Target ${userId}: Hosp ${timerText}`;
+      ui.sub.textContent = "Alarm will trigger when this target leaves hospital.";
+      state.attackMonitor.autoAttackStarted = false;
+    } else {
+      ui.box.classList.add("released");
+      ui.status.textContent = `Target ${userId}: ${status}`;
+      ui.sub.textContent = "Target appears to be out of hospital.";
+    }
+
+    handleAttackReleaseTransition(userId, isHospital);
+  }
+
+  function startAttackMonitorLoop() {
+    const userId = parseAttackTargetUserIdFromHref(location.href);
+    if (!Number.isFinite(userId)) return;
+    state.attackMonitor.targetUserId = userId;
+    buildAttackMonitorUi();
+    setupCoreSubscription();
+
+    processAttackMonitorTick().catch((err) => log("Initial attack monitor tick failed", err));
+    state.attackMonitor.loopTimer = setInterval(() => {
+      processAttackMonitorTick().catch((err) => log("Attack monitor tick failed", err));
+    }, 3000);
+  }
+
+  async function processAttackMonitorTick() {
+    const userId = state.attackMonitor.targetUserId;
+    if (!Number.isFinite(userId)) return;
+    state.coreClient = createCoreClient();
+    state.coreMode = state.coreClient.mode;
+    await state.coreClient.requestUsersTornRefresh([userId], { sourceHint: "attack_loader" });
+    renderAttackMonitor();
   }
 
   function renderSeller(userId) {
@@ -1250,6 +1520,11 @@
   }
 
   function init() {
+    if (isTornAttackPage()) {
+      startAttackMonitorLoop();
+      return;
+    }
+
     if (isTornBazaarPage()) {
       loadBazaarSessionState();
       buildBazaarPanel();

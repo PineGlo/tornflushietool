@@ -59,6 +59,9 @@
 
     tornApiKey: "",
     ffApiKey: "",
+    tornApiHardLimitEnabled: true,
+    tornApiCallLimit: 90,
+    tornApiLimitWindowMs: 60 * 1000,
 
     tornBatchTtlMs: 60 * 1000,
     ffBatchTtlMs: 3 * 24 * 60 * 60 * 1000,
@@ -195,6 +198,13 @@
           ffRateLimitLimit: null,
           ffRateLimitRemaining: null,
           ffRateLimitResetAt: null,
+          tornApiCallsInWindow: 0,
+          tornApiLimit: 0,
+          tornApiWindowMs: 0,
+          tornApiWindowStartedAt: 0,
+          tornApiWindowResetAt: 0,
+          tornApiHardLimitHitCount: 0,
+          tornApiTotalCalls: 0,
         },
         stats: {
           lastBatchTornAt: 0,
@@ -317,6 +327,16 @@
     return `${Math.floor(ms / 86400000)}d ago`;
   }
 
+  function fmtIn(ts) {
+    if (!ts) return "-";
+    const ms = Number(ts) - now();
+    if (ms <= 0) return "now";
+    if (ms < 60 * 1000) return `${Math.ceil(ms / 1000)}s`;
+    if (ms < 60 * 60 * 1000) return `${Math.ceil(ms / 60000)}m`;
+    if (ms < 24 * 60 * 60 * 1000) return `${Math.ceil(ms / 3600000)}h`;
+    return `${Math.ceil(ms / 86400000)}d`;
+  }
+
   function sourceRank(source) {
     return SOURCE_PRIORITY[String(source || "").trim()] || 0;
   }
@@ -357,6 +377,16 @@
     if (!state.core.api) state.core.api = {};
     if (!state.core.api.cache) state.core.api.cache = { torn: {}, ff: {} };
     if (!state.core.api.inFlight) state.core.api.inFlight = {};
+    if (!state.core.api.tornRateTracker) {
+      state.core.api.tornRateTracker = {
+        windowStartedAt: now(),
+        callsInWindow: 0,
+        totalCalls: 0,
+        blockedCount: 0,
+        lastBlockedAt: 0,
+        lastCallAt: 0,
+      };
+    }
     if (!state.core.api.stats) state.core.api.stats = { lastBatchTornAt: 0, lastBatchFFAt: 0 };
     if (!state.core.api.status) {
       state.core.api.status = {
@@ -370,6 +400,13 @@
         ffRateLimitLimit: null,
         ffRateLimitRemaining: null,
         ffRateLimitResetAt: null,
+        tornApiCallsInWindow: 0,
+        tornApiLimit: 0,
+        tornApiWindowMs: 0,
+        tornApiWindowStartedAt: 0,
+        tornApiWindowResetAt: 0,
+        tornApiHardLimitHitCount: 0,
+        tornApiTotalCalls: 0,
       };
     }
     if (!state.core.protectedMembers) {
@@ -380,6 +417,56 @@
         lastError: "",
       };
     }
+    if (!Number.isFinite(Number(state.core.api.tornRateTracker.windowStartedAt))) {
+      state.core.api.tornRateTracker.windowStartedAt = now();
+    }
+  }
+
+  function syncTornRateStatus() {
+    ensureCoreShape();
+
+    const tracker = state.core.api.tornRateTracker;
+    const status = state.core.api.status;
+    const limit = clamp(Number(state.cfg.tornApiCallLimit) || 90, 1, 10000);
+    const windowMs = Math.max(1000, Number(state.cfg.tornApiLimitWindowMs) || (60 * 1000));
+
+    status.tornApiCallsInWindow = Number(tracker.callsInWindow || 0);
+    status.tornApiTotalCalls = Number(tracker.totalCalls || 0);
+    status.tornApiHardLimitHitCount = Number(tracker.blockedCount || 0);
+    status.tornApiLimit = limit;
+    status.tornApiWindowMs = windowMs;
+    status.tornApiWindowStartedAt = Number(tracker.windowStartedAt || 0);
+    status.tornApiWindowResetAt = Number(tracker.windowStartedAt || 0) + windowMs;
+  }
+
+  function reserveTornApiCall() {
+    ensureCoreShape();
+    const tracker = state.core.api.tornRateTracker;
+    const hardLimitEnabled = !!state.cfg.tornApiHardLimitEnabled;
+    const limit = clamp(Number(state.cfg.tornApiCallLimit) || 90, 1, 10000);
+    const windowMs = Math.max(1000, Number(state.cfg.tornApiLimitWindowMs) || (60 * 1000));
+    const ts = now();
+
+    if (!tracker.windowStartedAt || (ts - Number(tracker.windowStartedAt)) >= windowMs) {
+      tracker.windowStartedAt = ts;
+      tracker.callsInWindow = 0;
+    }
+
+    if (hardLimitEnabled && Number(tracker.callsInWindow || 0) >= limit) {
+      tracker.blockedCount = Number(tracker.blockedCount || 0) + 1;
+      tracker.lastBlockedAt = ts;
+      syncTornRateStatus();
+      return {
+        ok: false,
+        error: `Torn API hard limit reached (${limit}/${limit} calls per ${Math.round(windowMs / 1000)}s window).`,
+      };
+    }
+
+    tracker.callsInWindow = Number(tracker.callsInWindow || 0) + 1;
+    tracker.totalCalls = Number(tracker.totalCalls || 0) + 1;
+    tracker.lastCallAt = ts;
+    syncTornRateStatus();
+    return { ok: true };
   }
 
   function makeEmptyUserRecord(userId) {
@@ -845,6 +932,7 @@
     ensureCoreShape();
     state.core.api.status.tornApiKeyConfigured = !!String(state.cfg.tornApiKey || "").trim();
     state.core.api.status.ffApiKeyConfigured = !!String(state.cfg.ffApiKey || "").trim();
+    syncTornRateStatus();
     state.core.api.status.updatedAt = now();
   }
 
@@ -853,6 +941,12 @@
       const key = String(state.cfg.tornApiKey || "").trim();
       if (!key) {
         resolve({ ok: false, userId, error: "Missing Torn API key in Torn Core settings." });
+        return;
+      }
+
+      const allowance = reserveTornApiCall();
+      if (!allowance.ok) {
+        resolve({ ok: false, userId, error: allowance.error, errorCode: "hard_limit" });
         return;
       }
 
@@ -1001,6 +1095,12 @@
       const key = String(state.cfg.tornApiKey || "").trim();
       if (!key) {
         resolve({ ok: false, factionId, error: "Missing Torn API key in Torn Core settings." });
+        return;
+      }
+
+      const allowance = reserveTornApiCall();
+      if (!allowance.ok) {
+        resolve({ ok: false, factionId, error: allowance.error, errorCode: "hard_limit" });
         return;
       }
 
@@ -1774,6 +1874,12 @@
     const status = state.core.api.status || {};
     const apiStats = state.core.api.stats || {};
     const protectedCount = Object.keys(state.core.protectedMembers.byUserId || {}).length;
+    const tornLimitEnabled = !!state.cfg.tornApiHardLimitEnabled;
+    const tornLimit = clamp(Number(state.cfg.tornApiCallLimit) || 90, 1, 10000);
+    const tornWindowMs = Math.max(1000, Number(state.cfg.tornApiLimitWindowMs) || (60 * 1000));
+    const tornCalls = Number(status.tornApiCallsInWindow || 0);
+    const tornWindowResetAt = Number(status.tornApiWindowResetAt || 0);
+    const tornRemaining = tornLimitEnabled ? Math.max(0, tornLimit - tornCalls) : "-";
 
     return `
       <div id="torn-core-head">
@@ -1787,6 +1893,8 @@
         <div class="tc-row"><strong>Users cached:</strong> ${Object.keys(state.core.users.byId).length}</div>
         <div class="tc-row"><strong>Torn last:</strong> ${fmtAgo(status.tornLastSuccessAt)} | <strong>FF last:</strong> ${fmtAgo(status.ffLastSuccessAt)}</div>
         <div class="tc-row"><strong>Torn batch:</strong> ${fmtAgo(apiStats.lastBatchTornAt)} | <strong>FF batch:</strong> ${fmtAgo(apiStats.lastBatchFFAt)}</div>
+        <div class="tc-row"><strong>Torn window:</strong> ${tornCalls} / ${tornLimitEnabled ? tornLimit : "∞"} ${tornLimitEnabled ? `(remaining ${tornRemaining})` : "(tracking only)"}</div>
+        <div class="tc-row"><strong>Torn reset:</strong> ${fmtIn(tornWindowResetAt)} | <strong>Blocked:</strong> ${status.tornApiHardLimitHitCount || 0}</div>
         <div class="tc-row"><strong>FF remaining:</strong> ${status.ffRateLimitRemaining ?? "-"} / ${status.ffRateLimitLimit ?? "-"}</div>
 
         <div class="tc-divider"></div>
@@ -1808,6 +1916,21 @@
         <div class="tc-check">
           <input id="tc-enabled" type="checkbox" ${state.cfg.enabled ? "checked" : ""}>
           <label for="tc-enabled">Enabled</label>
+        </div>
+
+        <div class="tc-check">
+          <input id="tc-torn-hard-limit-enabled" type="checkbox" ${state.cfg.tornApiHardLimitEnabled ? "checked" : ""}>
+          <label for="tc-torn-hard-limit-enabled">Enable Torn hard API limit</label>
+        </div>
+
+        <div class="tc-row">
+          <label class="tc-label" for="tc-torn-call-limit">Torn call limit per window</label>
+          <input id="tc-torn-call-limit" class="tc-input" type="number" min="1" step="1" value="${escapeHtml(String(tornLimit))}">
+        </div>
+
+        <div class="tc-row">
+          <label class="tc-label" for="tc-torn-window-seconds">Torn window seconds</label>
+          <input id="tc-torn-window-seconds" class="tc-input" type="number" min="1" step="1" value="${escapeHtml(String(Math.max(1, Math.round(tornWindowMs / 1000))))}">
         </div>
 
         <div class="tc-check">
@@ -1981,6 +2104,9 @@
         state.cfg.enabled = !!state.panel.querySelector("#tc-enabled")?.checked;
         state.cfg.tornApiKey = String(state.panel.querySelector("#tc-torn-key")?.value || "").trim();
         state.cfg.ffApiKey = String(state.panel.querySelector("#tc-ff-key")?.value || "").trim();
+        state.cfg.tornApiHardLimitEnabled = !!state.panel.querySelector("#tc-torn-hard-limit-enabled")?.checked;
+        state.cfg.tornApiCallLimit = clamp(Number(state.panel.querySelector("#tc-torn-call-limit")?.value || 90), 1, 10000);
+        state.cfg.tornApiLimitWindowMs = Math.max(1000, Number(state.panel.querySelector("#tc-torn-window-seconds")?.value || 60) * 1000);
         state.cfg.allianceProtectionEnabled = !!state.panel.querySelector("#tc-protection-enabled")?.checked;
         state.cfg.allianceSkipPollingProtected = !!state.panel.querySelector("#tc-protection-skip")?.checked;
         state.cfg.allianceHighlightBlue = !!state.panel.querySelector("#tc-protection-blue")?.checked;
