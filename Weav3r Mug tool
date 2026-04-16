@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weav3r Mugging Helper
 // @namespace    Violentmonkey Scripts
-// @version      1.4.0
-// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links, skips protected/alliance members, and shows hospital countdowns. Includes attack-page hospital timer + release alarm.
+// @version      1.4.1
+// @description  Highlights sellers on weav3r.dev/item when Torn status is Okay and FF estimated stats are under your threshold. Adds Attack links, skips protected/alliance members, and shows hospital countdowns. Includes attack-page hospital timer + release/landing alarm.
 // @match        https://weav3r.dev/item/*
 // @match        https://www.torn.com/bazaar.php*
 // @match        https://www.torn.com/loader.php?sid=attack*
@@ -64,6 +64,7 @@
     attackMonitor: {
       targetUserId: null,
       previousHospital: null,
+      previousStatus: "",
       alarmedAt: 0,
       autoAttackStarted: false,
       ui: null,
@@ -880,20 +881,29 @@
     return true;
   }
 
-  function handleAttackReleaseTransition(userId, isHospital) {
+  function handleAttackReleaseTransition(userId, status, isHospital) {
     const prev = state.attackMonitor.previousHospital;
     const changedToReleased = prev === true && isHospital === false;
     state.attackMonitor.previousHospital = isHospital;
-    if (!changedToReleased) return;
+    const prevStatus = String(state.attackMonitor.previousStatus || "");
+    const normalizedStatus = String(status || "").trim();
+    const changedToOkay = prevStatus !== "Okay" && normalizedStatus === "Okay";
+    state.attackMonitor.previousStatus = normalizedStatus;
+    if (!changedToReleased && !changedToOkay) return;
 
     const nowMs = now();
     if (state.cfg.attackAlarmEnabled && (nowMs - state.attackMonitor.alarmedAt) >= 5000) {
       state.attackMonitor.alarmedAt = nowMs;
-      beepAttackAlarm();
-      alert(`Target ${userId} is out of hospital.`);
+      if (changedToOkay) {
+        beepAttackAlarm();
+        alert(`Target ${userId} has landed (Okay).`);
+      } else {
+        beepAttackAlarm();
+        alert(`Target ${userId} is out of hospital.`);
+      }
     }
 
-    if (state.cfg.attackAutoStartEnabled && !state.attackMonitor.autoAttackStarted) {
+    if (state.cfg.attackAutoStartEnabled && changedToOkay && !state.attackMonitor.autoAttackStarted) {
       const clicked = tryAutoStartAttack();
       if (clicked) {
         state.attackMonitor.autoAttackStarted = true;
@@ -962,15 +972,22 @@
     if (isHospital) {
       ui.box.classList.remove("released");
       ui.status.textContent = `Target ${userId}: Hosp ${timerText}`;
-      ui.sub.textContent = "Alarm will trigger when this target leaves hospital.";
+      ui.sub.textContent = "Alarm watches release and landing (Okay); auto-start triggers on Okay.";
       state.attackMonitor.autoAttackStarted = false;
+      state.attackMonitor.previousStatus = "Hospital";
+    } else if (status === "Okay") {
+      ui.box.classList.add("released");
+      ui.status.textContent = `Target ${userId}: Okay`;
+      ui.sub.textContent = state.cfg.attackAutoStartEnabled
+        ? "Target landed (Okay). Auto-start is enabled."
+        : "Target landed (Okay). Enable auto-start to click attack automatically.";
     } else {
       ui.box.classList.add("released");
       ui.status.textContent = `Target ${userId}: ${status}`;
       ui.sub.textContent = "Target appears to be out of hospital.";
     }
 
-    handleAttackReleaseTransition(userId, isHospital);
+    handleAttackReleaseTransition(userId, status, isHospital);
   }
 
   function startAttackMonitorLoop() {
