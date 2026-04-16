@@ -1,161 +1,68 @@
 // ==UserScript==
-// @name         TORN Auction Price Checker Edited
+// @name         TORN Auction Pricing + BB Pill UI
 // @namespace    https://torn.com/
-// @version      3.9.0
-// @description  Check historical auction prices, market & bazaar listings for TORN weapons/armor
-// @author       WinterValor [3945658]
+// @version      2.1.0
+// @description  Auction pricing helper with BB pill UI, rarity/effect parsing, settings tab, history summaries, and safe injection
+// @author       You + ChatGPT
 // @match        https://www.torn.com/amarket.php*
-// @match        https://www.torn.com/page.php?sid=ItemMarket*
-// @match        https://www.torn.com/item.php*
-// @match        https://www.torn.com/bazaar.php*
-// @match        https://www.torn.com/displaycase.php*
-// @match        https://www.torn.com/factions.php*
 // @match        https://torn.com/amarket.php*
-// @match        https://torn.com/page.php?sid=ItemMarket*
-// @match        https://torn.com/item.php*
-// @match        https://torn.com/bazaar.php*
-// @match        https://torn.com/displaycase.php*
-// @match        https://torn.com/factions.php*
-// @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
 // @connect      btrmmuuoofbonmuwrkzg.supabase.co
-// @connect      weav3r.dev
 // @license      MIT
-// @downloadURL https://update.greasyfork.org/scripts/566823/TORN%20Auction%20Price%20Checker%20Edited.user.js
-// @updateURL https://update.greasyfork.org/scripts/566823/TORN%20Auction%20Price%20Checker%20Edited.meta.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    // ─── Config ──────────────────────────────────────────────────────────────────
-
+    /**********************************************************************
+     * CONFIG
+     **********************************************************************/
     const CFG = {
         SUPABASE_URL: 'https://btrmmuuoofbonmuwrkzg.supabase.co',
         SUPABASE_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ0cm1tdXVvb2Zib25tdXdya3pnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg4NTEzMTgsImV4cCI6MjA4NDQyNzMxOH0.E-s0k46BORXLICAvxtEpqoM3Qmh4-TRLaJAwXO6wJTY',
-        WEAV3R_API:   'https://weav3r.dev/api/ranked-weapons',
-        CACHE_KEY:    'ah_cache_v3',
-        SETTINGS_KEY: 'ah_settings_v3',
-        POSITION_KEY: 'ah_position',
-        CACHE_TTL:    5 * 60 * 1000,
-        CACHE_MAX:    50,
-        PAGE_SIZE:    20,
+
+        SETTINGS_KEY: 'twx_auction_pricer_settings_v3',
+        HISTORY_CACHE_KEY: 'twx_auction_pricer_history_cache_v3',
+        ROW_CACHE_KEY: 'twx_auction_pricer_row_cache_v3',
+        MODAL_POS_KEY: 'twx_auction_pricer_modal_pos_v3',
+
+        HISTORY_CACHE_TTL_MS: 15 * 60 * 1000,
+        ROW_CACHE_TTL_MS: 60 * 60 * 1000,
+
+        REQUEST_SPACING_MS: 1000,
+        MAX_HISTORY_ROWS: 10,
+
+        BOOT_PASS_COUNT: 8,
+        BOOT_PASS_INTERVAL_MS: 1000,
+        RESCAN_INTERVAL_MS: 5000,
     };
 
-    // ─── Defaults ─────────────────────────────────────────────────────────────────
+    const DEFAULT_SETTINGS = {
+        autoInjectPill: true,
+        autoPriceOnClick: true,
 
-    const DEFAULTS = {
-        // Search behaviour
-        bonusTolerance:   10,
-        qualityTolerance: 10,
-        ignoreQuality:    false,
-        autoWiden:        true,
-        minResults:       3,
-        widenSteps:       [[0,0],[25,25],[50,50],[100,100],[200,150],[400,200]],
-        bonusOverrides:   {},
-        market: { disableBonusFilter: false, disableQualityFilter: false },
+        targetPerBB: 5500000,
+        pctGood: 85,
+        pctWarn: 100,
+        pctBad: 115,
 
-        // Appearance
-        style: {
-            opacity:          0.92,   // modal background opacity  0–1
-            blur:             12,     // backdrop blur px
-            borderRadius:     12,     // modal corner radius px
-            rowRadius:        6,      // result-row corner radius px
-            accentColor:      '#22c55e', // green price/positive
-            negColor:         '#ef4444', // red negative delta
-            headerText:       '#f5f5f5',
-            bodyText:         '#a0a0a0',
-            mutedText:        '#666666',
-            borderColor:      '#2a2a2a',
-            bgBase:           '#0f0f0f', // base bg (will be composited with opacity)
-            bgRow:            '#1a1a1a',
-            inputBg:          '#1a1a1a',
-            inputBorder:      '#333333',
-            btnBg:            '#ffffff',
-            btnText:          '#000000',
-            linkColor:        '#60a5fa',
-        },
+        accent: '#7dd3fc',
+        success: '#34d399',
+        warning: '#fbbf24',
+        danger: '#f87171',
+        bg: '#0b1220',
+        panel: '#111827',
+        text: '#e5e7eb',
+        muted: '#94a3b8',
+        border: '#243041',
+        opacity: 0.96,
+        blur: 12,
     };
 
-    // ─── Settings ─────────────────────────────────────────────────────────────────
-
-    const settings = {
-        _d: null,
-        load() {
-            try {
-                const raw = localStorage.getItem(CFG.SETTINGS_KEY);
-                const saved = raw ? JSON.parse(raw) : {};
-                this._d = {
-                    ...DEFAULTS, ...saved,
-                    market:        { ...DEFAULTS.market,  ...(saved.market  || {}) },
-                    style:         { ...DEFAULTS.style,   ...(saved.style   || {}) },
-                    bonusOverrides: saved.bonusOverrides || {},
-                };
-            } catch {
-                this._d = { ...DEFAULTS, bonusOverrides: {}, market: { ...DEFAULTS.market }, style: { ...DEFAULTS.style } };
-            }
-        },
-        save() { try { localStorage.setItem(CFG.SETTINGS_KEY, JSON.stringify(this._d)); } catch {} },
-        get() { if (!this._d) this.load(); return this._d; },
-        set(patch) { Object.assign(this.get(), patch); this.save(); },
-        setStyle(patch) { Object.assign(this.get().style, patch); this.save(); applyStyle(); },
-        setMarket(patch) { Object.assign(this.get().market, patch); this.save(); },
-        getBonusOverride(id) { return this.get().bonusOverrides[id] || null; },
-        setBonusOverride(id, cfg) {
-            if (cfg === null) delete this.get().bonusOverrides[id];
-            else this.get().bonusOverrides[id] = cfg;
-            this.save();
-        },
-        bonusTol(id) {
-            const ov = this.getBonusOverride(id);
-            return (ov?.bonusTolerance != null) ? ov.bonusTolerance : this.get().bonusTolerance;
-        },
-        qualityTol(id) {
-            const ov = this.getBonusOverride(id);
-            if (ov) { if (ov.ignoreQuality) return null; if (ov.qualityTolerance != null) return ov.qualityTolerance; }
-            const d = this.get();
-            return d.ignoreQuality ? null : d.qualityTolerance;
-        },
-        export() { return JSON.stringify(this.get(), null, 2); },
-        import(json) {
-            try {
-                const d = JSON.parse(json);
-                if (typeof d !== 'object') return false;
-                this._d = { ...DEFAULTS, ...d, market: { ...DEFAULTS.market, ...(d.market||{}) }, style: { ...DEFAULTS.style, ...(d.style||{}) }, bonusOverrides: d.bonusOverrides || {} };
-                this.save(); return true;
-            } catch { return false; }
-        },
-        reset() {
-            this._d = { ...DEFAULTS, bonusOverrides: {}, market: { ...DEFAULTS.market }, style: { ...DEFAULTS.style } };
-            this.save();
-        },
-    };
-
-    // ─── Cache ────────────────────────────────────────────────────────────────────
-
-    const cache = {
-        _s: null,
-        _load() { if (!this._s) { try { this._s = JSON.parse(localStorage.getItem(CFG.CACHE_KEY) || '{}'); } catch { this._s = {}; } } },
-        _save() { try { localStorage.setItem(CFG.CACHE_KEY, JSON.stringify(this._s)); } catch {} },
-        get(k) {
-            this._load();
-            const e = this._s[k];
-            if (e && Date.now() - e.ts < CFG.CACHE_TTL) return e.data;
-            if (e) { delete this._s[k]; this._save(); }
-            return null;
-        },
-        set(k, data) {
-            this._load();
-            const keys = Object.keys(this._s);
-            if (keys.length >= CFG.CACHE_MAX)
-                keys.sort((a,b) => this._s[a].ts - this._s[b].ts).slice(0,10).forEach(x => delete this._s[x]);
-            this._s[k] = { data, ts: Date.now() };
-            this._save();
-        },
-    };
-
-    // ─── Bonus data ───────────────────────────────────────────────────────────────
-
+    /**********************************************************************
+     * DATA
+     **********************************************************************/
     const BONUS_DATA = [
         {id:50,title:"Achilles"},{id:72,title:"Assassinate"},{id:52,title:"Backstab"},
         {id:54,title:"Berserk"},{id:57,title:"Bleed"},{id:33,title:"Blindfire"},
@@ -183,2025 +90,1878 @@
         {id:46,title:"Weaken"},{id:76,title:"Wind-up"},{id:42,title:"Wither"},
     ];
 
-    const bonusList  = BONUS_DATA.slice().sort((a,b) => a.title.localeCompare(b.title));
-    const bonusById  = {};
-    const bonusByKey = {};
-    BONUS_DATA.forEach(b => {
-        bonusById[b.id] = b.title;
-        bonusByKey[b.title.toLowerCase()] = b.id;
-        bonusByKey[b.title.toLowerCase().replace(/[\s-]/g,'')] = b.id;
-    });
-    const bonusName = id => bonusById[id] || 'Bonus #' + id;
-    const bonusId   = name => {
-        const k = name.toLowerCase().replace(/[\s-]/g,'');
-        return bonusByKey[name.toLowerCase()] || bonusByKey[k] || null;
+    const BONUS_BY_ID = Object.fromEntries(BONUS_DATA.map(b => [b.id, b.title]));
+
+    const BUNKER_VALUES = {
+        pistol:           { yellow: 4,  orange: 12, orangeTwo: 18, red: 36,  redTwo: 54 },
+        smg:              { yellow: 4,  orange: 12, orangeTwo: 18, red: 36,  redTwo: 54 },
+        clubbing:         { yellow: 6,  orange: 18, orangeTwo: 27, red: 54,  redTwo: 81 },
+        slashing:         { yellow: 6,  orange: 18, orangeTwo: 27, red: 54,  redTwo: 81 },
+        piercing:         { yellow: 6,  orange: 18, orangeTwo: 27, red: 54,  redTwo: 81 },
+        shotgun:          { yellow: 10, orange: 30, orangeTwo: 45, red: 90,  redTwo: 135 },
+        rifle:            { yellow: 10, orange: 30, orangeTwo: 45, red: 90,  redTwo: 135 },
+        armor:            { yellow: 12, orange: 36, orangeTwo: null, red: 108, redTwo: null },
+        machine_gun:      { yellow: 14, orange: 42, orangeTwo: 63, red: 126, redTwo: 189 },
+        heavy_artillery:  { yellow: 14, orange: 42, orangeTwo: 63, red: 126, redTwo: 189 },
+        mechanical:       null,
+        temporary:        null,
+        unknown:          null,
     };
 
-    // ─── State ────────────────────────────────────────────────────────────────────
+    const WeaponNameTypeLookup = {
+        '9mm Uzi': 'SMG','AK-47': 'Rifle','AK74U': 'SMG','ArmaLite M-15A4': 'Rifle',
+        'Benelli M1 Tactical': 'Shotgun','Benelli M4 Super': 'Shotgun','Bushmaster Carbon 15': 'SMG',
+        'Dual Bushmasters': 'SMG','Dual MP5s': 'SMG','Dual P90s': 'SMG','Dual TMPs': 'SMG','Dual Uzis': 'SMG',
+        'Egg Propelled Launcher': 'Heavy Artillery','Enfield SA-80': 'Rifle','Gold Plated AK-47': 'Rifle',
+        'Heckler & Koch SL8': 'Rifle','Ithaca 37': 'Shotgun','Jackhammer': 'Shotgun','M16 A2 Rifle': 'Rifle',
+        'M249 SAW': 'Machine Gun','M4A1 Colt Carbine': 'Rifle','Mag 7': 'Shotgun','Minigun': 'Machine Gun',
+        'MP 40': 'SMG','MP5 Navy': 'SMG','Negev NG-5': 'Machine Gun','Neutrilux 2000': 'Machine Gun',
+        'Nock Gun': 'Shotgun','P90': 'SMG','PKM': 'Machine Gun','Prototype': 'Machine Gun',
+        'Rheinmetall MG 3': 'Machine Gun','Sawed-Off Shotgun': 'Shotgun','SIG 550': 'Rifle','SIG 552': 'Rifle',
+        'SKS Carbine': 'Rifle','Snow Cannon': 'Heavy Artillery','Steyr AUG': 'Rifle','Stoner 96': 'Machine Gun',
+        'Tavor TAR-21': 'Rifle','Thompson': 'SMG','Vektor CR-21': 'Rifle','XM8 Rifle': 'Rifle',
 
-    const state = {
-        open: false, activeTab: 'search', itemType: 'weapon',
-        // The item stats from the page when opened — used for comparison
-        sourceStats: null, // { dmg, acc, armor, quality, bonuses: [{id, value}] }
+        'Type 98 Anti Tank': 'Heavy Artillery','Beretta 92FS': 'Pistol','Beretta M9': 'Pistol','Beretta Pico': 'Pistol',
+        'Blowgun': 'Piercing','Blunderbuss': 'Shotgun','BT MP9': 'SMG','China Lake': 'Heavy Artillery',
+        'Cobra Derringer': 'Pistol','Crossbow': 'Piercing','Desert Eagle': 'Pistol','Dual 92G Berettas': 'Pistol',
+        'Fiveseven': 'Pistol','Flamethrower': 'Heavy Artillery','Flare Gun': 'Pistol','Glock 17': 'Pistol',
+        'Harpoon': 'Piercing','Homemade Pocket Shotgun': 'Shotgun','Lorcin 380': 'Pistol','Luger': 'Pistol',
+        'Magnum': 'Pistol','Milkor MGL': 'Heavy Artillery','MP5k': 'SMG','Pink Mac-10': 'SMG','Qsz-92': 'Pistol',
+        'Raven MP25': 'Pistol','RPG Launcher': 'Heavy Artillery','Ruger 57': 'Pistol','S&W M29': 'Pistol',
+        'S&W Revolver': 'Pistol','Skorpion': 'SMG','Slingshot': 'Clubbing','SMAW Launcher': 'Heavy Artillery',
+        'Springfield 1911': 'Pistol','Taser': 'Mechanical','Taurus': 'Pistol','TMP': 'SMG','Tranquilizer Gun': 'Piercing','USP': 'Pistol',
 
-        loading: false, error: null, results: [], total: 0, offset: 0,
-        autoWidened: null, lastItem: '',
+        'Axe': 'Clubbing','Baseball Bat': 'Clubbing','Blood Spattered Sickle': 'Slashing','Bone Saw': 'Slashing',
+        'Bo Staff': 'Clubbing','Bread Knife': 'Slashing','Bug Swatter': 'Slashing','Butterfly Knife': 'Piercing',
+        'Cattle Prod': 'Mechanical','Chain Whip': 'Slashing','Chainsaw': 'Mechanical','Claymore Sword': 'Slashing',
+        'Cleaver': 'Slashing','Cricket Bat': 'Clubbing','Crowbar': 'Clubbing',"Duke's Hammer": 'Clubbing',
+        'Dagger': 'Piercing',"Devil's Pitchfork": 'Piercing','Diamond Bladed Knife': 'Piercing','Diamond Icicle': 'Piercing',
+        'Dual Axes': 'Clubbing','Dual Hammers': 'Clubbing','Dual Samurai Swords': 'Slashing','Dual Scimitars': 'Slashing',
+        'Fine Chisel': 'Piercing','Flail': 'Clubbing','Frying Pan': 'Clubbing','Golden Broomstick': 'Clubbing',
+        'Golf Club': 'Clubbing','Guandao': 'Slashing','Hammer': 'Clubbing','Handbag': 'Clubbing','Ice Pick': 'Piercing',
+        'Ivory Walking Cane': 'Clubbing','Kama': 'Slashing','Katana': 'Slashing','Kitchen Knife': 'Piercing',
+        'Knuckle Dusters': 'Clubbing','Kodachi': 'Slashing','Lead Pipe': 'Clubbing','Leather Bullwhip': 'Slashing',
+        'Macana': 'Piercing','Madball': 'Clubbing','Meat Hook': 'Piercing','Metal Nunchakus': 'Clubbing',
+        'Naval Cutlass': 'Slashing','Ninja Claws': 'Piercing','Pair of High Heels': 'Piercing','Pair of Ice Skates': 'Slashing',
+        'Pen Knife': 'Piercing','Penelope': 'Clubbing','Petrified Humerus': 'Clubbing','Pillow': 'Clubbing',
+        'Plastic Sword': 'Clubbing','Poison Umbrella': 'Piercing','Riding Crop': 'Slashing','Rusty Sword': 'Slashing',
+        'Sai': 'Piercing','Samurai Sword': 'Slashing','Scalpel': 'Piercing','Scimitar': 'Slashing',
+        'Sledgehammer': 'Clubbing','Spear': 'Piercing','Swiss Army Knife': 'Piercing','Twin Tiger Hooks': 'Piercing',
+        'Wand of Destruction': 'Piercing','Wooden Nunchaku': 'Clubbing','Wushu Double Axes': 'Clubbing','Yasukuni Sword': 'Slashing',
+    };
 
-        mLoading: false, mError: null, mResults: [], mTotal: 0, mLastItem: '',
+    /**********************************************************************
+     * UTIL
+     **********************************************************************/
+    const Util = {
+        qs(sel, root = document) {
+            return root.querySelector(sel);
+        },
 
-        filters: {
-            itemName: '',
-            bonus1Id: '', bonus1Min: '', bonus1Max: '',
-            bonus2Id: '', bonus2Min: '', bonus2Max: '',
-            qualityMin: '', qualityMax: '',
+        qsa(sel, root = document) {
+            return Array.from(root.querySelectorAll(sel));
+        },
+
+        text(el) {
+            return (el?.textContent || '').replace(/\s+/g, ' ').trim();
+        },
+
+        lower(v) {
+            return String(v || '').trim().toLowerCase();
+        },
+
+        slug(v) {
+            return Util.lower(v).replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+        },
+
+        sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        },
+
+        safeJsonParse(raw, fallback) {
+            try { return JSON.parse(raw); } catch { return fallback; }
+        },
+
+        money(v) {
+            if (!Number.isFinite(v)) return '—';
+            if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+            if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+            if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
+            return `$${Math.round(v).toLocaleString()}`;
+        },
+
+        parseMoney(text) {
+            const m = String(text || '').match(/\$?\s*([\d,.]+)\s*([kmb])?/i);
+            if (!m) return null;
+            let n = parseFloat(m[1].replace(/,/g, ''));
+            if (!Number.isFinite(n)) return null;
+            const u = (m[2] || '').toLowerCase();
+            if (u === 'k') n *= 1e3;
+            else if (u === 'm') n *= 1e6;
+            else if (u === 'b') n *= 1e9;
+            return Math.round(n);
+        },
+
+        tryNumber(text) {
+            const n = parseFloat(String(text ?? '').replace(/[^\d.-]/g, ''));
+            return Number.isFinite(n) ? n : null;
+        },
+
+        parsePercent(text) {
+            const m = String(text || '').match(/(-?\d+(?:\.\d+)?)\s*%/);
+            if (m) return parseFloat(m[1]);
+            return Util.tryNumber(text);
+        },
+
+        escapeHtml(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        },
+
+        uniqueBy(arr, keyFn) {
+            const seen = new Set();
+            const out = [];
+            for (const item of arr) {
+                const key = keyFn(item);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(item);
+            }
+            return out;
+        },
+
+        normalizeWhitespace(v) {
+            return String(v || '').replace(/\s+/g, ' ').trim();
+        },
+
+        pageIsAuction() {
+            return /amarket\.php/i.test(location.href);
+        },
+
+        getPropRowValue(root, titleText) {
+            const rows = Util.qsa('li.propertyWrapper___xSOH1, li[class*="propertyWrapper"]', root);
+            for (const row of rows) {
+                const titleEl = row.querySelector('.title___DbORn, [class*="title___DbORn"]');
+                const title = Util.text(titleEl).replace(/:$/, '').trim().toLowerCase();
+                if (title !== titleText.toLowerCase()) continue;
+
+                const valueEl =
+                    row.querySelector('.valueWrapper___vVHLn [aria-label]') ||
+                    row.querySelector('.valueWrapper___vVHLn') ||
+                    row.querySelector('[class*="valueWrapper"]') ||
+                    row;
+
+                return Util.normalizeWhitespace(Util.text(valueEl));
+            }
+            return '';
         },
     };
 
-    // ─── HTTP ─────────────────────────────────────────────────────────────────────
+    /**********************************************************************
+     * SETTINGS / STORAGE
+     **********************************************************************/
+    const SettingsStore = {
+        _data: null,
 
-    function httpRequest(method, url, headers, body) {
-        return new Promise((resolve, reject) => {
-            let done = false;
-            const ok  = v => { if (!done) { done = true; resolve(v); } };
-            const err = v => { if (!done) { done = true; reject(v);  } };
-            const fallback = () =>
-                fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
-                    .then(r => r.json().then(d => r.ok ? ok(d) : err(new Error(d.error || d.message || `HTTP ${r.status}`))))
-                    .catch(() => err(new Error('Network error')));
-            try {
-                GM_xmlhttpRequest({
-                    method, url, headers, data: body ? JSON.stringify(body) : undefined, timeout: 15000,
-                    onload(r) {
-                        if (done) return;
-                        try { const d = JSON.parse(r.responseText); r.status < 300 ? ok(d) : err(new Error(d.error || d.message || `HTTP ${r.status}`)); }
-                        catch { err(new Error(r.status === 429 ? 'Rate limited' : `Error ${r.status}`)); }
-                    },
-                    onerror() { if (!done) { done = true; fallback(); } },
-                    ontimeout() { err(new Error('Request timed out')); },
-                });
-            } catch { fallback(); }
-        });
-    }
+        load() {
+            const raw = localStorage.getItem(CFG.SETTINGS_KEY);
+            const saved = Util.safeJsonParse(raw, {});
+            this._data = { ...DEFAULT_SETTINGS, ...(saved || {}) };
+        },
 
-    const supabase  = (ep, body) => httpRequest('POST', `${CFG.SUPABASE_URL}/functions/v1/${ep}`, { 'Content-Type':'application/json','apikey':CFG.SUPABASE_KEY,'Authorization':'Bearer '+CFG.SUPABASE_KEY }, body);
-    const weav3rGet = params    => httpRequest('GET',  `${CFG.WEAV3R_API}?${params}`, {}, null);
+        get() {
+            if (!this._data) this.load();
+            return this._data;
+        },
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────────
+        save() {
+            localStorage.setItem(CFG.SETTINGS_KEY, JSON.stringify(this.get()));
+        },
 
-    const fmt$ = p => p >= 1e9 ? '$'+(p/1e9).toFixed(2)+'B' : p >= 1e6 ? '$'+(p/1e6).toFixed(2)+'M' : p >= 1e3 ? '$'+(p/1e3).toFixed(1)+'K' : '$'+p.toLocaleString();
-
-    function fmtDate(ts) {
-        const d = Math.floor((Date.now() - ts*1000) / 86400000);
-        return d === 0 ? 'Today' : d === 1 ? 'Yesterday' : d < 7 ? d+'d ago' : new Date(ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
-    }
-
-    function rarityBadge(rarity) {
-        if (!rarity) return '';
-        const r = rarity.toLowerCase();
-        const cls = r.includes('red') ? 'r-red' : r.includes('orange') ? 'r-orange' : r.includes('yellow') ? 'r-yellow' : '';
-        return cls ? `<span class="ah-rarity ${cls}">${rarity.toUpperCase()}</span>` : '';
-    }
-
-    const profileLink = (id, name) => id ? `<a href="https://www.torn.com/profiles.php?XID=${id}" target="_blank">${name||id}</a>` : 'Unknown';
-
-    // Delta comparison vs sourceStats
-    function deltaBadge(val, refVal, unit = '') {
-        if (refVal == null || val == null) return '';
-        const diff = parseFloat((val - refVal).toFixed(1));
-        if (diff === 0) return `<span class="ah-delta eq">≈</span>`;
-        const sign = diff > 0 ? '+' : '';
-        const cls  = diff > 0 ? 'pos' : 'neg';
-        return `<span class="ah-delta ${cls}">${sign}${diff}${unit}</span>`;
-    }
-
-    function computeSuggestion(results) {
-        if (!results?.length) return null;
-        const now = Date.now() / 1000;
-        const w = results.map(a => ({ p: a.price, w: Math.exp(-((now-a.timestamp)/86400)/60) })).sort((a,b)=>a.p-b.p);
-        const tot = w.reduce((s,x)=>s+x.w, 0);
-        let cum = 0, med = w[0].p;
-        for (const x of w) { cum += x.w; if (cum >= tot/2) { med = x.p; break; } }
-        const prices = results.map(a=>a.price).sort((a,b)=>a-b);
-        // Median stats across results
-        const midIdx = Math.floor(results.length / 2);
-        const sorted = [...results].sort((a,b)=>(a.stat_quality||0)-(b.stat_quality||0));
-        const mid    = sorted[midIdx];
-        return {
-            suggested: med,
-            low:  prices[Math.floor(prices.length*0.10)] ?? prices[0],
-            high: prices[Math.floor(prices.length*0.90)] ?? prices[prices.length-1],
-            count: results.length,
-            medDmg:     mid?.stat_damage,
-            medAcc:     mid?.stat_accuracy,
-            medArmor:   mid?.stat_armor,
-            medQuality: mid?.stat_quality,
-        };
-    }
-        // ─── Deal / popularity analysis patch ────────────────────────────────────────
-
-    const BONUS_SCORE_MAP = {
-        'Achilles': 56,
-        'Assassinate': 89,
-        'Backstab': 36,
-        'Berserk': 55,
-        'Bleed': 78,
-        'Blindside': 52,
-        'Bloodlust': 69,
-        'Comeback': 64,
-        'Conserve': 72,
-        'Cripple': 58,
-        'Crusher': 66,
-        'Cupid': 42,
-        'Deadeye': 86,
-        'Deadly': 47,
-        'Disarm': 54,
-        'Double-edged': 62,
-        'Double Tap': 68,
-        'Empower': 73,
-        'Eviscerate': 74,
-        'Execute': 78,
-        'Expose': 88,
-        'Finale': 61,
-        'Focus': 56,
-        'Frenzy': 44,
-        'Fury': 79,
-        'Grace': 50,
-        'Home run': 45,
-        'Irradiate': 34,
-        'Motivation': 70,
-        'Paralyze': 63,
-        'Parry': 74,
-        'Penetrate': 92,
-        'Plunder': 33,
-        'Powerful': 84,
-        'Proficience': 35,
-        'Puncture': 76,
-        'Quicken': 77,
-        'Rage': 80,
-        'Revitalize': 34,
-        'Roshambo': 40,
-        'Slow': 62,
-        'Smurf': 30,
-        'Specialist': 83,
-        'Stricken': 30,
-        'Stun': 78,
-        'Suppress': 72,
-        'Sure Shot': 84,
-        'Throttle': 42,
-        'Warlord': 34,
-        'Weaken': 60,
-        'Wind-up': 64,
-        'Wither': 61,
+        set(patch) {
+            Object.assign(this.get(), patch);
+            this.save();
+            Theme.apply();
+        },
     };
 
-    const ITEM_FAMILY_WEIGHTS = [
-        [/^arma/i, 25],
-        [/\barma\b/i, 25],
-        [/\brifle\b/i, 18],
-        [/\bsmg\b/i, 15],
-        [/\bshotgun\b/i, 12],
-        [/\bpistol\b/i, 10],
-        [/\brevolver\b/i, 10],
-        [/\bmelee\b/i, 8],
-        [/\btemporary\b/i, 4],
-    ];
+    const ExpiringStore = {
+        getAll(storageKey) {
+            return Util.safeJsonParse(localStorage.getItem(storageKey), {}) || {};
+        },
 
-    function clamp(n, min, max) {
-        return Math.max(min, Math.min(max, n));
-    }
+        setAll(storageKey, data) {
+            localStorage.setItem(storageKey, JSON.stringify(data || {}));
+        },
 
-    function escapeHtml(str) {
-        return String(str ?? '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
-
-    function weaponFamilyWeight(name) {
-        let best = 0;
-        for (const [rx, weight] of ITEM_FAMILY_WEIGHTS) {
-            if (rx.test(name || '')) best = Math.max(best, weight);
-        }
-        return best;
-    }
-
-    function getBonusScoreByName(name) {
-        return BONUS_SCORE_MAP[name] ?? 50;
-    }
-
-    function scoreBonusesFromSource(src) {
-        const bonuses = src?.bonuses || [];
-        if (!bonuses.length) {
-            return { tier: 'None', score: 0, names: [] };
-        }
-
-        const scored = bonuses.map(b => {
-            const name = bonusName(b.id);
-            return {
-                id: b.id,
-                name,
-                value: b.value ?? null,
-                score: getBonusScoreByName(name),
-            };
-        });
-
-        const avg = scored.reduce((sum, x) => sum + x.score, 0) / scored.length;
-
-        let tier = 'Low';
-        if (avg >= 88) tier = 'Meta';
-        else if (avg >= 76) tier = 'High';
-        else if (avg >= 62) tier = 'Mid';
-
-        return {
-            tier,
-            score: Math.round(avg),
-            names: scored.map(x => x.value != null ? `${x.name} ${x.value}%` : x.name),
-            details: scored,
-        };
-    }
-
-    function extractComparableBonuses(rows) {
-        const names = [];
-        for (const row of rows || []) {
-            if (row?.bonus_values?.length) {
-                for (const bv of row.bonus_values) {
-                    names.push(bonusName(bv.bonus_id));
-                }
-            } else if (row?.bonus_ids?.length) {
-                for (const id of row.bonus_ids) {
-                    names.push(bonusName(id));
-                }
-            } else if (row?.bonuses && typeof row.bonuses === 'object') {
-                for (const b of Object.values(row.bonuses)) {
-                    if (b?.bonus) names.push(b.bonus);
-                }
+        get(storageKey, key, ttlMs) {
+            const all = this.getAll(storageKey);
+            const row = all[key];
+            if (!row) return null;
+            if ((Date.now() - row.ts) > ttlMs) {
+                delete all[key];
+                this.setAll(storageKey, all);
+                return null;
             }
-        }
-        return names;
-    }
+            return row.data;
+        },
 
-    function computeMarketFloor(marketRows) {
-        const prices = (marketRows || [])
-            .map(x => Number(x?.price))
-            .filter(x => Number.isFinite(x) && x > 0)
-            .sort((a, b) => a - b);
+        set(storageKey, key, data) {
+            const all = this.getAll(storageKey);
+            all[key] = { ts: Date.now(), data };
+            this.setAll(storageKey, all);
+        },
 
-        return prices.length ? prices[0] : null;
-    }
+        clear(storageKey) {
+            this.setAll(storageKey, {});
+        },
+    };
 
-    function computeFairValue(histSuggestion, marketRows) {
-        const hist = histSuggestion?.suggested ?? null;
-        const floor = computeMarketFloor(marketRows);
+    /**********************************************************************
+     * TRANSPORT / DATA
+     **********************************************************************/
+    const Transport = {
+        async request(method, url, headers = {}, body = null) {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method,
+                    url,
+                    headers,
+                    data: body ? JSON.stringify(body) : undefined,
+                    timeout: 15000,
+                    onload: (resp) => {
+                        try {
+                            const data = resp.responseText ? JSON.parse(resp.responseText) : {};
+                            if (resp.status >= 200 && resp.status < 300) resolve(data);
+                            else reject(new Error(data?.error || data?.message || `HTTP ${resp.status}`));
+                        } catch (err) {
+                            reject(err);
+                        }
+                    },
+                    onerror: () => reject(new Error('Network error')),
+                    ontimeout: () => reject(new Error('Request timed out')),
+                });
+            });
+        },
+    };
 
-        if (hist && floor) {
-            // Conservative blend for flip decisions:
-            // don't overestimate above current live market floor
-            const blended = Math.round((hist * 0.65) + (floor * 0.35));
-            return {
-                fairValue: Math.min(blended, Math.round(floor * 1.03)),
-                hist,
-                floor,
+    const DataAPI = {
+        historyKeyFromFingerprint(fingerprint) {
+            return JSON.stringify(fingerprint);
+        },
+
+        async searchAuctionHistory(filters) {
+            const body = {
+                limit: CFG.MAX_HISTORY_ROWS,
+                offset: 0,
+                sort_by: 'timestamp',
+                sort_order: 'desc',
             };
-        }
-        if (hist) return { fairValue: hist, hist, floor: null };
-        if (floor) return { fairValue: floor, hist: null, floor };
-        return { fairValue: null, hist: null, floor: null };
-    }
 
-function parseCurrentListingPrice() {
-    const source = document.querySelector('.ah-open-source');
-    if (!source) return null;
+            if (filters.itemName) body.item_name = filters.itemName;
+            if (filters.bonus1Id) body.bonus1_id = Number(filters.bonus1Id);
+            if (filters.bonus2Id) body.bonus2_id = Number(filters.bonus2Id);
+            if (filters.bonus1Min !== '') body.bonus1_value_min = Number(filters.bonus1Min);
+            if (filters.bonus1Max !== '') body.bonus1_value_max = Number(filters.bonus1Max);
+            if (filters.bonus2Min !== '') body.bonus2_value_min = Number(filters.bonus2Min);
+            if (filters.bonus2Max !== '') body.bonus2_value_max = Number(filters.bonus2Max);
+            if (filters.qualityMin !== '') body.quality_min = Number(filters.qualityMin);
+            if (filters.qualityMax !== '') body.quality_max = Number(filters.qualityMax);
 
-    const scopes = [
-        source,
-        source.closest('li'),
-        source.closest('tr'),
-        source.closest('[class*="row"]'),
-        source.closest('[class*="item"]'),
-        source.parentElement,
-        source.parentElement?.parentElement,
-    ].filter(Boolean);
+            const data = await Transport.request(
+                'POST',
+                `${CFG.SUPABASE_URL}/functions/v1/search-auctions`,
+                {
+                    'Content-Type': 'application/json',
+                    'apikey': CFG.SUPABASE_KEY,
+                    'Authorization': `Bearer ${CFG.SUPABASE_KEY}`,
+                },
+                body
+            );
 
-    const candidates = [
-        '[class*="currentBid"]',
-        '[class*="current-bid"]',
-        '[class*="bid"]',
-        '[class*="price"]',
-        '[aria-label*="current bid" i]',
-        '[aria-label*="bid" i]',
-        '[aria-label*="price" i]',
-        '.price',
-        '.bid',
-    ];
+            return {
+                rows: data?.auctions || [],
+                total: data?.total || 0,
+            };
+        },
+    };
 
-    const found = [];
+    /**********************************************************************
+     * TYPE / BONUS / BB / DEAL / ANALYSIS
+     **********************************************************************/
+    const TypeNormalizer = {
+        normalizeTypeName(raw) {
+            const v = Util.lower(raw);
+            if (!v) return 'unknown';
+            if (v === 'pistol') return 'pistol';
+            if (v === 'smg') return 'smg';
+            if (v === 'shotgun') return 'shotgun';
+            if (v === 'rifle') return 'rifle';
+            if (v === 'machine gun' || v === 'machine_gun') return 'machine_gun';
+            if (v === 'heavy artillery' || v === 'heavy_artillery') return 'heavy_artillery';
+            if (v === 'clubbing' || v === 'club') return 'clubbing';
+            if (v === 'slashing') return 'slashing';
+            if (v === 'piercing') return 'piercing';
+            if (v === 'mechanical') return 'mechanical';
+            if (v === 'temporary') return 'temporary';
+            if (v === 'armor') return 'armor';
+            return Util.slug(v) || 'unknown';
+        },
 
-    for (const scope of scopes) {
-        for (const sel of candidates) {
-            scope.querySelectorAll(sel).forEach(el => {
-                const txt = (el.textContent || '').trim();
-                if (!txt) return;
-                if (!/\$[\d,.]+(?:\s*[kmb])?/i.test(txt)) return;
+        toDisplayType(normalizedType) {
+            switch (normalizedType) {
+                case 'machine_gun': return 'Machine Gun';
+                case 'heavy_artillery': return 'Heavy Artillery';
+                case 'clubbing': return 'Clubbing';
+                case 'slashing': return 'Slashing';
+                case 'piercing': return 'Piercing';
+                case 'smg': return 'SMG';
+                case 'rifle': return 'Rifle';
+                case 'shotgun': return 'Shotgun';
+                case 'pistol': return 'Pistol';
+                case 'armor': return 'Armor';
+                case 'mechanical': return 'Mechanical';
+                case 'temporary': return 'Temporary';
+                default: return normalizedType ? normalizedType.replace(/_/g, ' ') : 'Unknown';
+            }
+        },
 
-                const parsed = parseMoneyText(txt);
-                if (Number.isFinite(parsed) && parsed > 0) {
+        getBunkerValues(normalizedType) {
+            return BUNKER_VALUES[normalizedType] || null;
+        },
+    };
+
+    const Stats = {
+        bonusName(id) {
+            return BONUS_BY_ID[id] || `Bonus #${id}`;
+        },
+
+        summarizeBonuses(bonuses = []) {
+            if (!bonuses.length) return 'None';
+            return bonuses.map(b => {
+                const name = b.name || Stats.bonusName(b.id);
+                return b.value != null ? `${name} ${b.value}%` : name;
+            }).join(' • ');
+        },
+
+        parseBonusesFromText(text) {
+            const normalized = Util.normalizeWhitespace(
+                String(text || '')
+                    .replace(/<br\s*\/?>/gi, ' ')
+                    .replace(/<[^>]+>/g, ' ')
+            );
+
+            const found = [];
+            for (const bonus of BONUS_DATA) {
+                const safe = bonus.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const rx1 = new RegExp(`\\b${safe}\\b[: ]*\\s*(\\d+(?:\\.\\d+)?)?%?`, 'i');
+                const rx2 = new RegExp(`(\\d+(?:\\.\\d+)?)%\\s+${safe}`, 'i');
+                const m = normalized.match(rx2) || normalized.match(rx1);
+                if (m) {
                     found.push({
-                        value: parsed,
-                        text: txt,
-                        bidish: /bid/i.test(txt) ? 2 : /price/i.test(txt) ? 1 : 0,
+                        id: bonus.id,
+                        name: bonus.title,
+                        value: m[1] != null && m[1] !== '' ? parseFloat(m[1]) : null,
                     });
                 }
+            }
+            return found;
+        },
+
+        parseEffectTypesFromRow(row) {
+            const out = [];
+
+            const spans = Util.qsa('.item-bonuses .iconsbonuses span[title]', row);
+            for (const span of spans) {
+                const title = span.getAttribute('title') || '';
+                const m = title.match(/<b>(.*?)<\/b>/i);
+                if (m && m[1]) {
+                    out.push({ name: Util.normalizeWhitespace(m[1]) });
+                }
+            }
+
+            const icons = Util.qsa('.item-bonuses .iconsbonuses i', row);
+            for (const icon of icons) {
+                const classes = Array.from(icon.classList || []);
+                const cls = classes.find(c => c.startsWith('bonus-attachment-'));
+                if (!cls) continue;
+                if (cls.includes('item-damage-bonus') || cls.includes('item-accuracy-bonus')) continue;
+
+                const plain = cls.replace(/^bonus-attachment-/, '').replace(/[-_]+/g, ' ');
+                const pretty = plain.replace(/\b\w/g, c => c.toUpperCase());
+                out.push({ name: pretty });
+            }
+
+            return Util.uniqueBy(out.filter(x => x.name), x => x.name).slice(0, 2);
+        },
+    };
+
+    const BB = {
+        getExactValue(item) {
+            const table = TypeNormalizer.getBunkerValues(item.classification?.normalizedType);
+            if (!table) return null;
+
+            const rarity = item.rarity;
+            const effects = item.effectCount || 0;
+
+            if (rarity === 'yellow') return table.yellow ?? null;
+            if (rarity === 'orange') return effects >= 2 ? (table.orangeTwo ?? table.orange ?? null) : (table.orange ?? null);
+            if (rarity === 'red') return effects >= 2 ? (table.redTwo ?? table.red ?? null) : (table.red ?? null);
+            return null;
+        },
+
+        rarityColor(rarity) {
+            if (rarity === 'yellow') return '#facc15';
+            if (rarity === 'orange') return '#fb923c';
+            if (rarity === 'red') return '#ef4444';
+            return '#7dd3fc';
+        },
+    };
+
+    const Deal = {
+        getTargetValue(item) {
+            const settings = SettingsStore.get();
+            if (!item?.bbValue || !settings.targetPerBB) return null;
+            return item.bbValue * settings.targetPerBB;
+        },
+
+        getPercent(item) {
+            const target = this.getTargetValue(item);
+            if (!target || !item?.currentPrice) return null;
+            return (item.currentPrice / target) * 100;
+        },
+
+        getPercentLabel(item) {
+            const pct = this.getPercent(item);
+            if (pct == null) return '—';
+            return `${Math.round(pct)}%`;
+        },
+
+        getPercentColor(item) {
+            const pct = this.getPercent(item);
+            const s = SettingsStore.get();
+
+            if (pct == null) return '#94a3b8';
+            if (pct <= s.pctGood) return '#34d399';
+            if (pct <= s.pctWarn) return '#fbbf24';
+            if (pct <= s.pctBad) return '#fb923c';
+            return '#ef4444';
+        },
+
+        parseTargetInput(raw) {
+            const v = String(raw || '').trim();
+            if (!v) return null;
+            return Util.parseMoney(v) ?? Util.tryNumber(v);
+        },
+    };
+
+    const HistoryAnalysis = {
+        summarize(rows = []) {
+            if (!rows.length) {
+                return {
+                    lastSold: null,
+                    count: 0,
+                    median: null,
+                    low: null,
+                    high: null,
+                    suggested: null,
+                    rows: [],
+                };
+            }
+
+            const prices = rows
+                .map(r => Number(r.price))
+                .filter(n => Number.isFinite(n) && n > 0)
+                .sort((a, b) => a - b);
+
+            if (!prices.length) {
+                return {
+                    lastSold: null,
+                    count: 0,
+                    median: null,
+                    low: null,
+                    high: null,
+                    suggested: null,
+                    rows,
+                };
+            }
+
+            const median = prices[Math.floor(prices.length / 2)] ?? null;
+            const low = prices[Math.floor(prices.length * 0.10)] ?? prices[0] ?? null;
+            const high = prices[Math.floor(prices.length * 0.90)] ?? prices[prices.length - 1] ?? null;
+
+            const newest = [...rows]
+                .filter(r => Number.isFinite(Number(r.timestamp)))
+                .sort((a, b) => Number(b.timestamp) - Number(a.timestamp))[0];
+
+            const lastSold = newest?.price != null ? Number(newest.price) : null;
+
+            return {
+                lastSold,
+                count: prices.length,
+                median,
+                low,
+                high,
+                suggested: median,
+                rows,
+            };
+        },
+    };
+
+    /**********************************************************************
+     * PARSER
+     **********************************************************************/
+    const AuctionParser = {
+        findRows() {
+            return Util.qsa('li[id]').filter(row =>
+                row.querySelector('.item-cont-wrap') &&
+                row.querySelector('.item-name')
+            );
+        },
+
+        parseAll() {
+            const items = this.findRows()
+                .map(row => this.parseRow(row))
+                .filter(Boolean);
+
+            return Util.uniqueBy(items, item => item.rowKey);
+        },
+
+        parseRow(row) {
+            const itemName = Util.text(row.querySelector('.item-name'));
+            if (!itemName) return null;
+
+            const imageElement = row.querySelector('.item-plate img, .img-wrap img') || null;
+            const currentPrice = Util.parseMoney(Util.text(row.querySelector('.c-bid-wrap')));
+            const seller = Util.text(row.querySelector('.seller-wrap .name a')) || null;
+            const highBidder = Util.text(row.querySelector('.seller-wrap .namehight a')) || null;
+
+            const bidCountText = Util.text(row.querySelector('.bids-wrap'));
+            const bidCountMatch = bidCountText.match(/(\d+)/);
+            const bidCount = bidCountMatch ? Number(bidCountMatch[1]) : null;
+
+            const endTitle = row.querySelector('.time-wrap [title]')?.getAttribute('title') || '';
+            const timeLeft = Util.text(row.querySelector('.time-wrap .dh-time')) ||
+                             Util.text(row.querySelector('.time-wrap .time')) ||
+                             null;
+
+            const aria = row.querySelector('.view-info')?.getAttribute('aria-label') || '';
+
+            const collapsed = this.extractCollapsedStats(row, aria);
+            const expanded = this.extractExpandedStats(row);
+            const classification = this.extractClassification(row, itemName, aria);
+            const rarity = expanded.rarity || this.extractGlowRarity(row) || null;
+            const effectTypes = this.extractEffectTypes(row, collapsed, expanded);
+            const iconEffectCount = Util.qsa('.item-bonuses .iconsbonuses i', row).filter(i => {
+                const cls = Array.from(i.classList || []).join(' ');
+                return !cls.includes('item-damage-bonus') && !cls.includes('item-accuracy-bonus');
+            }).length;
+            const effectCount = Math.min(2, Math.max(iconEffectCount, effectTypes.length, collapsed.bonuses.length, expanded.bonuses.length));
+
+            const stats = {
+                dmg: expanded.dmg ?? collapsed.dmg ?? null,
+                acc: expanded.acc ?? collapsed.acc ?? null,
+                armor: expanded.armor ?? collapsed.armor ?? null,
+                quality: expanded.quality ?? collapsed.quality ?? null,
+                bonuses: expanded.bonuses.length ? expanded.bonuses : collapsed.bonuses,
+            };
+
+            const rowKey = JSON.stringify({
+                itemName,
+                currentPrice: currentPrice || 0,
+                seller: seller || '',
+                highBidder: highBidder || '',
+                bids: bidCount || 0,
+                endTitle: endTitle || '',
+                quality: stats.quality ?? '',
+                bonuses: (stats.bonuses || []).map(b => `${b.name || b.id}:${b.value ?? ''}`).join('|'),
             });
-        }
-    }
 
-    if (!found.length) return null;
+            const fingerprint = {
+                itemName: itemName || '',
+                qualityMin: stats.quality != null ? String(Math.floor(stats.quality)) : '',
+                qualityMax: stats.quality != null ? String(Math.ceil(stats.quality)) : '',
+                bonus1Id: stats.bonuses?.[0]?.id != null ? String(stats.bonuses[0].id) : '',
+                bonus1Min: stats.bonuses?.[0]?.value != null ? String(stats.bonuses[0].value) : '',
+                bonus1Max: stats.bonuses?.[0]?.value != null ? String(stats.bonuses[0].value) : '',
+                bonus2Id: stats.bonuses?.[1]?.id != null ? String(stats.bonuses[1].id) : '',
+                bonus2Min: stats.bonuses?.[1]?.value != null ? String(stats.bonuses[1].value) : '',
+                bonus2Max: stats.bonuses?.[1]?.value != null ? String(stats.bonuses[1].value) : '',
+            };
 
-    found.sort((a, b) => {
-        if (a.biddish !== b.biddish) return b.biddish - a.biddish;
-        return b.value - a.value;
-    });
+            const cachedSummary = ExpiringStore.get(CFG.ROW_CACHE_KEY, rowKey, CFG.ROW_CACHE_TTL_MS) || null;
 
-    return found[0].value;
-}
+            const item = {
+                pageType: 'auction',
+                itemType: classification.normalizedType === 'armor' ? 'armor' : 'weapon',
+                itemName,
+                currentPrice,
+                seller,
+                highBidder,
+                bidCount,
+                endTitle,
+                timeLeft,
+                sourceStats: stats,
+                classification,
+                rarity,
+                effectCount,
+                effectTypes,
+                auctionId: row.id || null,
+                rowKey,
+                historyFingerprint: fingerprint,
+                containerElement: row,
+                sourceElement: row.querySelector('.item-cont-wrap') || row,
+                imageElement,
+                historySummary: cachedSummary?.summary || null,
+                historyRows: cachedSummary?.rows || [],
+                historyError: cachedSummary?.error || null,
+            };
 
-    function parseMoneyText(text) {
-        const m = String(text || '').match(/\$?\s*([\d,.]+)\s*([kmb])?/i);
-        if (!m) return null;
-        let n = parseFloat(m[1].replace(/,/g, ''));
-        if (!Number.isFinite(n)) return null;
-        const unit = (m[2] || '').toLowerCase();
-        if (unit === 'k') n *= 1e3;
-        else if (unit === 'm') n *= 1e6;
-        else if (unit === 'b') n *= 1e9;
-        return Math.round(n);
-    }
+            item.bbValue = BB.getExactValue(item);
+            return item;
+        },
 
-    function rateDeal(currentPrice, fairValue) {
-        if (!Number.isFinite(currentPrice) || !Number.isFinite(fairValue) || fairValue <= 0) {
-            return { label: 'Unknown', score: 0, ratio: null };
-        }
+        extractCollapsedStats(row, ariaText) {
+            let dmg = null;
+            let acc = null;
+            let armor = null;
+            let quality = null;
+            let bonuses = [];
 
-        const ratio = currentPrice / fairValue;
+            const statSpans = Util.qsa('.item-bonuses .infobonuses .label-value', row)
+                .map(el => Util.text(el))
+                .filter(Boolean);
 
-        if (ratio <= 0.80) return { label: 'STEAL', score: 95, ratio };
-        if (ratio <= 0.92) return { label: 'GOOD', score: 82, ratio };
-        if (ratio <= 1.08) return { label: 'FAIR', score: 60, ratio };
-        if (ratio <= 1.20) return { label: 'HIGH', score: 35, ratio };
-        return { label: 'OVERPRICED', score: 15, ratio };
-    }
+            if (statSpans.length >= 1) dmg = Util.tryNumber(statSpans[0]);
+            if (statSpans.length >= 2) acc = Util.tryNumber(statSpans[1]);
 
-    function computeDemandSignals(itemName, histRows, marketRows, bonusScore) {
-        const now = Date.now() / 1000;
-        const recentSales = (histRows || []).filter(x => {
-            const ts = Number(x?.timestamp);
-            if (!Number.isFinite(ts)) return false;
-            return ((now - ts) / 86400) <= 30;
-        }).length;
+            const bonusTitles = Util.qsa('.iconsbonuses [title]', row)
+                .map(el => el.getAttribute('title') || '')
+                .filter(Boolean);
 
-        const salesDepth = (histRows || []).length;
-        const marketDepth = (marketRows || []).length;
-        const familyWeight = weaponFamilyWeight(itemName);
+            for (const t of bonusTitles) {
+                bonuses.push(...Stats.parseBonusesFromText(t));
+            }
 
-        let score = 0;
-        score += familyWeight;
-        score += Math.min(recentSales * 5, 30);
-        score += Math.min(salesDepth * 1.5, 20);
+            if (ariaText) {
+                const dmgMatch = ariaText.match(/Damage:\s*([0-9.]+)/i);
+                const accMatch = ariaText.match(/Accuracy:\s*([0-9.]+)/i);
+                const qMatch = ariaText.match(/([0-9.]+)%\s*Quality/i);
 
-        if (marketDepth <= 3) score += 15;
-        else if (marketDepth <= 8) score += 8;
-        else if (marketDepth >= 20) score -= 10;
+                if (dmg == null && dmgMatch) dmg = parseFloat(dmgMatch[1]);
+                if (acc == null && accMatch) acc = parseFloat(accMatch[1]);
+                if (quality == null && qMatch) quality = parseFloat(qMatch[1]);
 
-        score += Math.min((bonusScore?.score || 0) * 0.28, 25);
-        score = clamp(Math.round(score), 0, 100);
+                if (!bonuses.length) {
+                    bonuses = Stats.parseBonusesFromText(ariaText);
+                }
+            }
 
-        let tier = 'Slow';
-        if (score >= 75) tier = 'Hot';
-        else if (score >= 55) tier = 'Popular';
-        else if (score >= 35) tier = 'Average';
+            bonuses = Util.uniqueBy(bonuses, b => `${b.name || b.id}:${b.value ?? ''}`).slice(0, 2);
+            return { dmg, acc, armor, quality, bonuses };
+        },
 
-        return {
-            tier,
-            score,
-            recentSales,
-            salesDepth,
-            marketDepth,
-            familyWeight,
-        };
-    }
+        extractExpandedStats(row) {
+            const info = row.querySelector('.show-item-info .item-info, .show-item-info .itemInfo___mNZ5j');
+            if (!info) {
+                return { dmg: null, acc: null, armor: null, quality: null, bonuses: [], rarity: null };
+            }
 
-    function computeConfidence(histRows, marketRows, autoWidened) {
-        let score = 0;
-        const h = (histRows || []).length;
-        const m = (marketRows || []).length;
+            const dmg = Util.tryNumber(Util.getPropRowValue(info, 'Damage'));
+            const acc = Util.tryNumber(Util.getPropRowValue(info, 'Accuracy'));
+            const armor = Util.tryNumber(Util.getPropRowValue(info, 'Armor'));
+            const quality = Util.parsePercent(Util.getPropRowValue(info, 'Quality'));
+            const bonusText = Util.getPropRowValue(info, 'Bonus');
+            const rarityText = Util.text(info.querySelector('[class*="rarity"]'));
+            const rarity = rarityText ? Util.lower(rarityText) : null;
 
-        score += Math.min(h * 8, 50);
-        score += Math.min(m * 4, 20);
-        if (!autoWidened) score += 20;
-        else {
-            const penalty = (autoWidened.bonusPct || 0) + (autoWidened.qualityPct || 0);
-            score -= Math.min(Math.round(penalty / 15), 20);
-        }
+            const bonuses = Util.uniqueBy(
+                Stats.parseBonusesFromText(bonusText),
+                b => `${b.name || b.id}:${b.value ?? ''}`
+            ).slice(0, 2);
 
-        score = clamp(score, 0, 100);
+            return {
+                dmg,
+                acc,
+                armor,
+                quality,
+                bonuses,
+                rarity: rarity && (rarity.includes('yellow') || rarity.includes('orange') || rarity.includes('red'))
+                    ? (rarity.includes('yellow') ? 'yellow' : rarity.includes('orange') ? 'orange' : 'red')
+                    : null
+            };
+        },
 
-        let tier = 'Low';
-        if (score >= 65) tier = 'High';
-        else if (score >= 40) tier = 'Medium';
+        extractClassification(row, itemName, ariaText) {
+            let typeName = '';
 
-        return { tier, score };
-    }
+            const infoDesc = row.querySelector('.show-item-info .description___xJ1N5, .show-item-info [class*="description"]');
+            const descText = Util.text(infoDesc);
+            const descMatch = descText.match(/\bis a\s+([A-Za-z ]+?)\s+Weapon\b/i);
+            if (descMatch) typeName = descMatch[1].trim();
 
-    function analyzeCurrentItem() {
-        const src = state.sourceStats || {};
-        const histRows = state.results || [];
-        const marketRows = state.mResults || [];
+            if (!typeName && ariaText) {
+                const ariaTypeMatch = ariaText.match(/\b(Pistol|SMG|Shotgun|Rifle|Machine Gun|Heavy Artillery|Clubbing|Slashing|Piercing|Mechanical|Armor)\b/i);
+                if (ariaTypeMatch) typeName = ariaTypeMatch[1];
+            }
 
-        const currentPrice = parseCurrentListingPrice();
-        const histSuggestion = computeSuggestion(histRows);
-        const fair = computeFairValue(histSuggestion, marketRows);
-        const bonus = scoreBonusesFromSource(src);
-        const pop = computeDemandSignals(state.filters.itemName, histRows, marketRows, bonus);
-        const deal = rateDeal(currentPrice, fair.fairValue);
-        const confidence = computeConfidence(histRows, marketRows, state.autoWidened);
+            if (!typeName) {
+                typeName = WeaponNameTypeLookup[itemName] || '';
+            }
 
-        return {
-            currentPrice,
-            histSuggestion,
-            fair,
-            bonus,
-            popularity: pop,
-            confidence,
-            deal,
-            comparableBonuses: extractComparableBonuses(histRows).slice(0, 8),
-        };
-    }
+            return {
+                slot: null,
+                typeName,
+                normalizedType: TypeNormalizer.normalizeTypeName(typeName),
+            };
+        },
 
-    function analysisBadgeClass(label) {
-        if (label === 'STEAL' || label === 'GOOD' || label === 'Hot' || label === 'Popular' || label === 'Meta' || label === 'High') {
-            return 'good';
-        }
-        if (label === 'FAIR' || label === 'Average' || label === 'Mid' || label === 'Medium') {
-            return 'mid';
-        }
-        return 'bad';
-    }
+        extractGlowRarity(row) {
+            const plate = row.querySelector('.item-plate');
+            if (!plate) return null;
+            const cls = plate.className;
+            if (/glow-yellow/i.test(cls)) return 'yellow';
+            if (/glow-orange/i.test(cls)) return 'orange';
+            if (/glow-red/i.test(cls)) return 'red';
+            return null;
+        },
 
-    function renderAnalysisBanner() {
-        const a = analyzeCurrentItem();
-        const fairValue = a.fair?.fairValue;
-        const currentPrice = a.currentPrice;
+        extractEffectTypes(row, collapsed, expanded) {
+            const fromIcons = Stats.parseEffectTypesFromRow(row);
+            if (fromIcons.length) return fromIcons.slice(0, 2);
 
-        const dealCls = analysisBadgeClass(a.deal.label);
-        const popCls = analysisBadgeClass(a.popularity.tier);
-        const bonusCls = analysisBadgeClass(a.bonus.tier);
-        const confCls = analysisBadgeClass(a.confidence.tier);
+            const fromBonuses = (expanded?.bonuses?.length ? expanded.bonuses : collapsed?.bonuses || [])
+                .map(b => ({
+                    id: b.id ?? null,
+                    name: b.name || Stats.bonusName(b.id),
+                    value: b.value ?? null,
+                }));
 
-        const ratioTxt = a.deal.ratio ? `${(a.deal.ratio * 100).toFixed(1)}% of fair value` : 'No live auction price detected';
-        const bonusTxt = a.bonus.names?.length ? escapeHtml(a.bonus.names.join(' • ')) : 'No parsed bonuses';
+            return Util.uniqueBy(fromBonuses, x => x.name).slice(0, 2);
+        },
+    };
 
-        return `
-            <div class="ah-analysis">
-                <div class="ah-analysis-top">
-                    <div class="ah-analysis-main">
-                        <div class="ah-analysis-kicker">Auction Read</div>
-                        <div class="ah-analysis-price-row">
-                            <div>
-                                <div class="ah-analysis-price-label">Current</div>
-                                <div class="ah-analysis-price">${currentPrice ? fmt$(currentPrice) : '—'}</div>
-                            </div>
-                            <div>
-                                <div class="ah-analysis-price-label">Fair Value</div>
-                                <div class="ah-analysis-price">${fairValue ? fmt$(fairValue) : '—'}</div>
-                            </div>
-                            <div>
-                                <div class="ah-analysis-price-label">Historical</div>
-                                <div class="ah-analysis-price">${a.fair.hist ? fmt$(a.fair.hist) : '—'}</div>
-                            </div>
-                            <div>
-                                <div class="ah-analysis-price-label">Market Floor</div>
-                                <div class="ah-analysis-price">${a.fair.floor ? fmt$(a.fair.floor) : '—'}</div>
-                            </div>
-                        </div>
-                        <div class="ah-analysis-sub">${ratioTxt}</div>
-                    </div>
-                    <div class="ah-analysis-pill ah-${dealCls}">
-                        <span class="ah-analysis-pill-kicker">Deal</span>
-                        <strong>${a.deal.label}</strong>
-                    </div>
-                </div>
+    /**********************************************************************
+     * STATE
+     **********************************************************************/
+    const AppState = {
+        items: [],
+        activeItem: null,
 
-                <div class="ah-analysis-grid">
-                    <div class="ah-analysis-card">
-                        <div class="ah-analysis-card-label">Popularity</div>
-                        <div class="ah-analysis-card-main">
-                            <span class="ah-chip ah-${popCls}">${a.popularity.tier}</span>
-                            <span>${a.popularity.score}/100</span>
-                        </div>
-                        <div class="ah-analysis-card-sub">
-                            ${a.popularity.recentSales} recent sales • ${a.popularity.salesDepth} comps • ${a.popularity.marketDepth} listings
-                        </div>
-                    </div>
+        ui: {
+            activeTab: 'details',
+        },
 
-                    <div class="ah-analysis-card">
-                        <div class="ah-analysis-card-label">Bonuses</div>
-                        <div class="ah-analysis-card-main">
-                            <span class="ah-chip ah-${bonusCls}">${a.bonus.tier}</span>
-                            <span>${a.bonus.score}/100</span>
-                        </div>
-                        <div class="ah-analysis-card-sub">${bonusTxt}</div>
-                    </div>
+        batch: {
+            running: false,
+            done: 0,
+            total: 0,
+            statusText: '',
+        },
 
-                    <div class="ah-analysis-card">
-                        <div class="ah-analysis-card-label">Confidence</div>
-                        <div class="ah-analysis-card-main">
-                            <span class="ah-chip ah-${confCls}">${a.confidence.tier}</span>
-                            <span>${a.confidence.score}/100</span>
-                        </div>
-                        <div class="ah-analysis-card-sub">
-                            ${state.autoWidened ? 'Search widened for extra comps' : 'Exact-match search held'}
-                        </div>
-                    </div>
-                </div>
-            </div>
-        `;
-    }
+        bootTimer: null,
+        rescanTimer: null,
+    };
 
-    // ─── Style injection ──────────────────────────────────────────────────────────
+    /**********************************************************************
+     * THEME / CSS
+     **********************************************************************/
+    const Theme = {
+        apply() {
+            const s = SettingsStore.get();
+            let style = document.getElementById('twx-auction-pricer-theme-v3');
+            if (!style) {
+                style = document.createElement('style');
+                style.id = 'twx-auction-pricer-theme-v3';
+                document.head.appendChild(style);
+            }
 
-    let _styleEl = null;
-    function applyStyle() {
-        const st = settings.get().style;
-        const vars = `
-            --bg0: ${hexAlpha(st.bgBase, st.opacity)};
-            --bg1: ${hexAlpha(st.bgRow,  Math.min(1, st.opacity + 0.04))};
-            --bg2: ${hexAlpha(st.inputBg, Math.min(1, st.opacity + 0.06))};
-            --br:  ${st.borderColor};
-            --t0:  ${st.headerText};
-            --t1:  ${st.bodyText};
-            --t2:  ${st.mutedText};
-            --in-bg:  ${st.inputBg};
-            --in-br:  ${st.inputBorder};
-            --btn-bg: ${st.btnBg};
-            --btn-t:  ${st.btnText};
-            --green:  ${st.accentColor};
-            --red:    ${st.negColor};
-            --link:   ${st.linkColor};
-            --radius: ${st.borderRadius}px;
-            --rrow:   ${st.rowRadius}px;
-            --blur:   ${st.blur}px;
-        `;
-        const rule = `#ah-modal { ${vars} }`;
-        if (!_styleEl) {
-            _styleEl = document.createElement('style');
-            _styleEl.id = 'ah-dynamic-style';
-            document.head.appendChild(_styleEl);
-        }
-        _styleEl.textContent = rule;
-    }
+            style.textContent = `
+                :root {
+                    --twx-bg: ${hexAlpha(s.bg, s.opacity)};
+                    --twx-panel: ${hexAlpha(s.panel, Math.min(1, s.opacity + 0.02))};
+                    --twx-text: ${s.text};
+                    --twx-muted: ${s.muted};
+                    --twx-border: ${s.border};
+                    --twx-accent: ${s.accent};
+                    --twx-success: ${s.success};
+                    --twx-warning: ${s.warning};
+                    --twx-danger: ${s.danger};
+                    --twx-blur: ${s.blur}px;
+                }
+            `;
+        },
+    };
 
     function hexAlpha(hex, alpha) {
-        // Returns rgba() from hex string + alpha
-        const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
-        return `rgba(${r},${g},${b},${alpha.toFixed(2)})`;
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
     }
 
-    // ─── Static CSS ───────────────────────────────────────────────────────────────
-
     GM_addStyle(`
-        /* ── Price Check button ── */
-        .ah-btn {
-            position: absolute; top: 24px; right: 0;
-            padding: 4px 10px; background: rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.15);
-            border-radius: 4px; color: #aaa; cursor: pointer;
-            font-size: 11px; font-family: Arial, sans-serif; z-index: 10; backdrop-filter: blur(4px);
+        .twx-overlay-host {
+            position: relative !important;
         }
-        .ah-btn:hover { background: rgba(40,40,40,0.9); color: #fff; }
 
-        /* ── Modal shell ── */
-        #ah-modal {
-            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            width: 600px; max-width: 96vw; max-height: 86vh;
-            background: var(--bg0);
-            backdrop-filter: blur(var(--blur)); -webkit-backdrop-filter: blur(var(--blur));
-            border: 1px solid var(--br); border-radius: var(--radius);
-            z-index: 99999; display: none; flex-direction: column;
-            color: var(--t0); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            box-shadow: 0 16px 60px rgba(0,0,0,0.7);
+.twx-title-host {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+}
+
+.twx-pill {
+    position: static;
+    transform: none;
+    z-index: 80;
+
+    min-width: 72px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(10, 12, 20, 0.94);
+    color: var(--twx-text);
+    border: 1px solid rgba(255,255,255,0.14);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.03em;
+    line-height: 1;
+
+    cursor: pointer;
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+    justify-content: center;
+    white-space: nowrap;
+
+    transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+    margin-bottom: 1px;
+}
+
+.twx-pill:hover {
+    transform: scale(1.04);
+    border-color: var(--twx-accent);
+}
+
+.twx-pill .twx-bb,
+.twx-pill .twx-pct {
+    font-weight: 1000;
+}
+
+.twx-pill .twx-sep {
+    color: var(--twx-muted);
+    opacity: 0.9;
+}
+        .twx-history-summary {
+            margin-top: 8px;
+            border: 1px solid rgba(125,211,252,0.18);
+            border-radius: 10px;
+            background: rgba(7,10,18,0.70);
+            color: #dbeafe;
+            padding: 7px 8px;
+            font-size: 10px;
+            line-height: 1.35;
         }
-                /* ── Analysis banner patch ── */
-        .ah-analysis {
-            padding: 12px 14px;
-            border-bottom: 1px solid var(--br);
-            background: rgba(255,255,255,0.03);
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            flex-shrink: 0;
-        }
-        .ah-analysis-top {
-            display: flex;
-            gap: 10px;
-            justify-content: space-between;
-            align-items: stretch;
-            flex-wrap: wrap;
-        }
-        .ah-analysis-main {
-            flex: 1;
-            min-width: 260px;
-        }
-        .ah-analysis-kicker,
-        .ah-analysis-card-label,
-        .ah-analysis-pill-kicker,
-        .ah-analysis-price-label {
+
+        .twx-history-summary .twx-history-title {
             font-size: 9px;
-            font-weight: 700;
+            font-weight: 900;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
-            letter-spacing: .08em;
-            color: var(--t2);
+            color: #7dd3fc;
+            margin-bottom: 4px;
         }
-        .ah-analysis-price-row {
+
+        .twx-history-summary .twx-history-line {
             display: flex;
-            gap: 16px;
-            flex-wrap: wrap;
-            margin-top: 6px;
+            justify-content: space-between;
+            gap: 8px;
         }
-        .ah-analysis-price {
+
+        .twx-history-summary .k {
+            color: #94a3b8;
+            font-weight: 700;
+        }
+
+        .twx-history-summary .v {
+            color: #f8fafc;
+            font-weight: 800;
+        }
+
+        .twx-page-batch-btn {
+            position: fixed;
+            right: 18px;
+            bottom: 18px;
+            z-index: 999998;
+            padding: 10px 14px;
+            border-radius: 12px;
+            border: 1px solid var(--twx-border);
+            background: rgba(7,10,18,0.94);
+            color: var(--twx-text);
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 900;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+            backdrop-filter: blur(8px);
+        }
+
+        .twx-page-batch-btn:hover {
+            border-color: var(--twx-accent);
+        }
+
+        .twx-page-batch-btn[disabled] {
+            opacity: 0.65;
+            cursor: wait;
+        }
+
+        #twx-modal {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: min(760px, 94vw);
+            max-height: 88vh;
+            display: none;
+            flex-direction: column;
+            background: var(--twx-bg);
+            color: var(--twx-text);
+            border: 1px solid var(--twx-border);
+            border-radius: 16px;
+            backdrop-filter: blur(var(--twx-blur));
+            -webkit-backdrop-filter: blur(var(--twx-blur));
+            z-index: 999999;
+            box-shadow: 0 20px 80px rgba(0,0,0,0.65);
+            overflow: hidden;
+        }
+
+        #twx-modal.open {
+            display: flex;
+        }
+
+        .twx-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--twx-border);
+            background: rgba(255,255,255,0.03);
+            cursor: move;
+        }
+
+        .twx-title {
             font-size: 17px;
             font-weight: 800;
-            color: var(--t0);
-            line-height: 1.1;
         }
-        .ah-analysis-sub,
-        .ah-analysis-card-sub {
+
+        .twx-subtitle {
             font-size: 11px;
-            color: var(--t1);
-            opacity: 0.85;
-            margin-top: 4px;
+            color: var(--twx-muted);
+            margin-top: 3px;
         }
-        .ah-analysis-pill {
-            min-width: 110px;
-            padding: 10px 12px;
-            border-radius: 10px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            gap: 2px;
-            border: 1px solid rgba(255,255,255,0.08);
-            background: rgba(255,255,255,0.04);
-        }
-        .ah-analysis-pill strong {
+
+        .twx-close {
+            border: 1px solid var(--twx-border);
+            background: rgba(255,255,255,0.05);
+            color: var(--twx-text);
+            border-radius: 999px;
+            width: 30px;
+            height: 30px;
+            cursor: pointer;
             font-size: 18px;
             line-height: 1;
         }
-        .ah-analysis-grid {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 8px;
-        }
-        .ah-analysis-card {
-            padding: 10px 11px;
-            border-radius: 10px;
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            min-width: 0;
-        }
-        .ah-analysis-card-main {
+
+        .twx-tabs {
             display: flex;
-            align-items: center;
             gap: 8px;
-            margin-top: 5px;
-            font-size: 15px;
-            font-weight: 700;
-            color: var(--t0);
-            flex-wrap: wrap;
+            padding: 10px 14px 0 14px;
+            border-bottom: 1px solid var(--twx-border);
         }
-        .ah-chip {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-size: 10px;
+
+        .twx-tab {
+            border: 1px solid var(--twx-border);
+            background: rgba(255,255,255,0.04);
+            color: var(--twx-muted);
+            border-radius: 10px 10px 0 0;
+            padding: 8px 12px;
+            font-size: 12px;
             font-weight: 800;
-            letter-spacing: .04em;
-            text-transform: uppercase;
-        }
-        .ah-good {
-            color: #86efac;
-            background: rgba(34,197,94,0.15);
-        }
-        .ah-mid {
-            color: #fde68a;
-            background: rgba(245,158,11,0.15);
-        }
-        .ah-bad {
-            color: #fca5a5;
-            background: rgba(239,68,68,0.15);
+            cursor: pointer;
         }
 
-        @media (max-width: 680px) {
-            .ah-analysis-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        #ah-modal.open { display: flex; }
-
-        @media (max-width: 620px), (pointer: coarse) {
-            #ah-modal {
-                top: auto !important; bottom: 0 !important;
-                left: 0 !important; right: 0 !important; transform: none !important;
-                width: 100% !important; max-width: 100% !important; max-height: 90vh;
-                border-radius: var(--radius) var(--radius) 0 0; border-bottom: none;
-            }
-        }
-        @media (min-width: 768px) and (pointer: fine) {
-            #ah-modal { resize: both; overflow: auto; min-width: 440px; min-height: 320px; }
-            #ah-modal.dragging { user-select: none; }
-            .ah-header { cursor: move; }
+        .twx-tab.active {
+            color: var(--twx-text);
+            border-color: var(--twx-accent);
+            background: rgba(125,211,252,0.08);
         }
 
-        /* ── Header ── */
-        .ah-header {
-            padding: 11px 16px; border-bottom: 1px solid var(--br);
-            display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
-            background: rgba(255,255,255,0.02);
-        }
-        .ah-title { font-size: 17px; font-weight: 700; margin: 0 !important; color: var(--t0); letter-spacing: -0.3px; }
-        .ah-close {
-            width: 26px; height: 26px; border-radius: 50%; border: none; background: rgba(255,255,255,0.07);
-            color: var(--t2); cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center;
-        }
-        .ah-close:hover { background: rgba(255,255,255,0.14); color: var(--t0); }
-
-        /* ── Tabs ── */
-        .ah-tabs { display: flex; border-bottom: 1px solid var(--br); flex-shrink: 0; }
-        .ah-tab {
-            flex: 1; padding: 9px 4px; background: none; border: none;
-            color: var(--t2); cursor: pointer; font-size: 12px; font-weight: 500;
-            border-bottom: 2px solid transparent; margin-bottom: -1px;
-        }
-        .ah-tab:hover { color: var(--t1); }
-        .ah-tab.active { color: var(--t0); border-bottom-color: var(--green); }
-
-        /* ── Filters ── */
-        .ah-filters {
-            padding: 8px 14px; border-bottom: 1px solid var(--br);
-            display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
-        }
-        .ah-name-row { display: flex; gap: 7px; }
-        .ah-name-row input { flex: 1; padding: 8px 11px; background: var(--in-bg); border: 1px solid var(--in-br); border-radius: 7px; color: var(--t0); font-size: 13px; }
-        .ah-name-row input::placeholder { color: var(--t2); opacity: 0.6; }
-        .ah-name-row input:focus { outline: none; border-color: var(--green); }
-        .ah-search-btn {
-            padding: 8px 16px; background: var(--btn-bg); border: none; border-radius: 7px;
-            color: var(--btn-t); font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap;
-        }
-        .ah-search-btn:hover { opacity: 0.88; }
-        .ah-search-btn:active { opacity: 0.72; }
-
-        .ah-bonus-line, .ah-quality-line { display: flex; align-items: center; gap: 5px; }
-        .ah-bonus-line select {
-            flex: 1; padding: 6px 24px 6px 9px; background: var(--in-bg); border: 1px solid var(--in-br);
-            border-radius: 6px; color: var(--t0); font-size: 12px;
-            appearance: none; -webkit-appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='5'%3E%3Cpath fill='%23666' d='M0 0l4.5 5L9 0z'/%3E%3C/svg%3E");
-            background-repeat: no-repeat; background-position: right 8px center;
-        }
-        .ah-bonus-line select:focus, .ah-bonus-line input:focus, .ah-quality-line input:focus { outline: none; border-color: var(--green); }
-        .ah-bonus-line input[type="number"], .ah-quality-line input[type="number"] {
-            width: 58px; padding: 6px 4px; text-align: center;
-            background: var(--in-bg); border: 1px solid var(--in-br); border-radius: 6px; color: var(--t0); font-size: 12px;
-        }
-        .ah-bonus-line input::placeholder, .ah-quality-line input::placeholder { color: var(--t2); opacity: 0.5; }
-        .ah-range-sep { color: var(--t2); font-size: 12px; opacity: 0.5; flex-shrink: 0; }
-        .ah-quality-label { flex: 1; font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--t2); }
-
-        /* ── Results ── */
-        .ah-results { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-        .ah-item {
-            display: flex; justify-content: space-between; align-items: flex-start;
-            padding: 10px 14px; border-bottom: 1px solid var(--br);
-            border-radius: 0; transition: background 0.1s;
-        }
-        .ah-item:last-child { border-bottom: none; }
-        .ah-item:hover { background: rgba(255,255,255,0.035); }
-        .ah-item-left { flex: 1; min-width: 0; }
-        .ah-item-top  { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; flex-wrap: wrap; }
-        .ah-item-name { font-size: 13px; font-weight: 700; margin: 0; color: var(--t0); }
-
-        /* Rarity badges */
-        .ah-rarity { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 700; flex-shrink: 0; }
-        .ah-rarity.r-yellow { background: rgba(120,53,15,0.7); color: #fcd34d; }
-        .ah-rarity.r-orange { background: rgba(124,45,18,0.7); color: #fb923c; }
-        .ah-rarity.r-red    { background: rgba(127,29,29,0.7); color: #f87171; }
-
-        /* Stats line with delta badges */
-        .ah-item-meta { font-size: 11px; color: var(--t1); margin: 0 0 3px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
-        .ah-stat-sep  { color: var(--t2); opacity: 0.4; }
-
-        .ah-delta {
-            display: inline-block; padding: 0px 4px; border-radius: 3px;
-            font-size: 9.5px; font-weight: 700; line-height: 1.6;
-        }
-        .ah-delta.pos { background: rgba(34,197,94,0.15); color: var(--green); }
-        .ah-delta.neg { background: rgba(239,68,68,0.15); color: var(--red); }
-        .ah-delta.eq  { color: var(--t2); font-size: 10px; opacity: 0.5; }
-
-        .ah-item-bonuses { display: flex; flex-wrap: wrap; gap: 3px; margin: 3px 0; }
-        .ah-bonus {
-            display: inline-block; padding: 2px 7px;
-            background: rgba(255,255,255,0.06); border-radius: 3px; font-size: 11px; color: var(--t1);
-        }
-        .ah-players { font-size: 11px; color: var(--t2); margin: 2px 0 0; }
-        .ah-players a { color: var(--link); text-decoration: none; }
-        .ah-players a:hover { text-decoration: underline; }
-
-        .ah-item-right { text-align: right; flex-shrink: 0; margin-left: 12px; }
-        .ah-price { font-size: 14px; font-weight: 800; color: var(--green); margin: 0 0 2px; white-space: nowrap; }
-        .ah-date  { font-size: 10px; color: var(--t2); margin: 0; opacity: 0.7; }
-        .ah-bids  { font-size: 10px; color: var(--t2); margin: 2px 0 0; opacity: 0.5; }
-
-        /* ── States ── */
-        .ah-loading, .ah-empty, .ah-error { padding: 36px 16px; text-align: center; color: var(--t2); font-size: 13px; }
-        .ah-error { color: var(--red); }
-        .ah-spinner { width: 20px; height: 20px; margin: 0 auto 10px; border: 2px solid rgba(255,255,255,0.1); border-top-color: var(--green); border-radius: 50%; animation: ah-spin 0.65s linear infinite; }
-        @keyframes ah-spin { to { transform: rotate(360deg); } }
-
-        /* ── Auto-widen banner ── */
-        .ah-widened {
-            display: flex; align-items: center; gap: 6px;
-            padding: 6px 14px; border-bottom: 1px solid rgba(214,175,0,0.25);
-            background: rgba(214,175,0,0.08); font-size: 11px; color: #d6af00;
+        .twx-body {
+            overflow: auto;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
         }
 
-        /* ── Suggested price / stats bar ── */
-        .ah-suggestion {
-            padding: 9px 14px; border-top: 1px solid var(--br);
+        .twx-card {
+            border: 1px solid var(--twx-border);
+            border-radius: 14px;
             background: rgba(255,255,255,0.03);
-            display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex-shrink: 0;
-        }
-        .ah-sug-label  { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--t2); }
-        .ah-sug-main   { font-size: 18px; font-weight: 800; color: var(--green); line-height: 1; }
-        .ah-sug-range  { font-size: 11px; color: var(--t2); }
-        .ah-sug-range span { color: var(--t1); font-weight: 600; }
-        .ah-sug-stats  {
-            display: flex; gap: 10px; margin-left: auto; align-items: center;
-            font-size: 11px; color: var(--t1); flex-wrap: wrap; justify-content: flex-end;
-        }
-        .ah-sug-stat   { display: flex; align-items: center; gap: 3px; }
-        .ah-sug-stat .lbl { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--t2); }
-        .ah-sug-stat .val { font-weight: 700; color: var(--t0); }
-        .ah-sug-note   { font-size: 10px; color: var(--t2); opacity: 0.6; width: 100%; text-align: right; margin: 0; }
-
-        /* ── Footer ── */
-        .ah-footer {
-            padding: 8px 14px; border-top: 1px solid var(--br);
-            display: flex; justify-content: space-between; align-items: center;
-            font-size: 11px; color: var(--t2); flex-shrink: 0;
-        }
-        .ah-nav { display: flex; gap: 6px; }
-        .ah-nav-btn {
-            padding: 5px 13px; background: rgba(255,255,255,0.06); border: 1px solid var(--br);
-            border-radius: 6px; color: var(--t1); font-size: 12px; cursor: pointer;
-        }
-        .ah-nav-btn:hover:not(:disabled) { background: rgba(255,255,255,0.12); color: var(--t0); }
-        .ah-nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
-
-        /* ── Settings ── */
-        .ah-settings { padding: 14px; overflow-y: auto; flex: 1; -webkit-overflow-scrolling: touch; }
-        .ah-sec { margin-bottom: 20px; }
-        .ah-sec h4 {
-            font-size: 10px; font-weight: 700; text-transform: uppercase;
-            letter-spacing: .08em; color: var(--t2); margin: 0 0 8px;
-        }
-        .ah-row {
-            display: flex; align-items: center; gap: 8px;
-            padding: 7px 10px; background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: var(--rrow, 6px); margin-bottom: 4px;
-        }
-        .ah-row label { font-size: 11px; color: var(--t1); min-width: 130px; }
-        .ah-row input[type="number"] { width: 56px; padding: 3px 6px; background: var(--in-bg); border: 1px solid var(--in-br); border-radius: 4px; color: var(--t0); font-size: 11px; }
-        .ah-row input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--green); }
-        .ah-row input[type="range"]  { flex: 1; accent-color: var(--green); }
-        .ah-row input[type="color"]  { width: 28px; height: 22px; padding: 0; border: 1px solid var(--in-br); border-radius: 3px; cursor: pointer; background: none; }
-        .ah-row .ah-note { font-size: 10px; color: var(--t2); }
-        .ah-row .val-display { font-size: 11px; color: var(--t0); min-width: 30px; font-weight: 600; }
-        .ah-row select {
-            padding: 3px 22px 3px 7px; background: var(--in-bg); border: 1px solid var(--in-br);
-            border-radius: 4px; color: var(--t0); font-size: 11px;
-            appearance: none; -webkit-appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='5'%3E%3Cpath fill='%23666' d='M0 0l4.5 5L9 0z'/%3E%3C/svg%3E");
-            background-repeat: no-repeat; background-position: right 7px center;
+            padding: 12px;
         }
 
-        /* Per-bonus overrides */
-        .ah-ovr-item {
-            display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-            padding: 6px 10px; background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06); border-radius: 6px; margin-bottom: 4px;
-        }
-        .ah-ovr-item .name { font-size: 11px; color: var(--t0); min-width: 110px; }
-        .ah-ovr-item .grp  { display: flex; align-items: center; gap: 3px; }
-        .ah-ovr-item .lbl  { font-size: 10px; color: var(--t2); }
-        .ah-ovr-item input[type="number"] { width: 44px; padding: 2px 4px; background: var(--in-bg); border: 1px solid var(--in-br); border-radius: 3px; color: var(--t0); font-size: 10px; }
-        .ah-ovr-item input[type="checkbox"] { width: 12px; height: 12px; accent-color: var(--green); }
-        .ah-remove { background: rgba(127,29,29,0.6); border: none; color: #fca5a5; padding: 2px 7px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: auto; }
-        .ah-remove:hover { background: rgba(153,27,27,0.8); }
-
-        .ah-add-row { display: flex; gap: 6px; margin-top: 8px; }
-        .ah-add-row select { flex: 1; padding: 5px 8px; background: var(--in-bg); border: 1px solid var(--in-br); border-radius: 5px; color: var(--t0); font-size: 11px; }
-        .ah-add-btn { padding: 5px 11px; background: rgba(22,101,52,0.7); border: none; border-radius: 5px; color: #fff; font-size: 11px; cursor: pointer; }
-        .ah-add-btn:hover { background: rgba(21,128,61,0.9); }
-
-        .ah-ie-row { display: flex; gap: 6px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--br); flex-wrap: wrap; }
-        .ah-ie-row button { padding: 5px 11px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 5px; color: var(--t1); font-size: 11px; cursor: pointer; }
-        .ah-ie-row button:hover { background: rgba(255,255,255,0.12); color: var(--t0); }
-        .ah-ie-row .ah-reset-btn { background: rgba(127,29,29,0.5); border-color: transparent; color: #fca5a5; margin-left: auto; }
-        .ah-ie-row .ah-reset-btn:hover { background: rgba(153,27,27,0.7); }
-        .ah-hidden { display: none; }
-
-        /* style preview swatch */
-        .ah-preview { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-        .ah-color-group { display: flex; flex-direction: column; align-items: center; gap: 3px; }
-        .ah-color-group span { font-size: 9px; color: var(--t2); }
-    `);
-
-    // ─── Apply initial style vars ─────────────────────────────────────────────────
-
-    applyStyle();
-
-    // ─── Search logic ─────────────────────────────────────────────────────────────
-
-    function buildSearchBody(f, offset, bPct, qPct) {
-        const expand = (min, max, pct) => {
-            const lo = (min !== '' && min != null) ? parseFloat(min) : null;
-            const hi = (max !== '' && max != null) ? parseFloat(max) : null;
-            if (lo == null && hi == null) return { min: null, max: null };
-            if (pct === 0) return { min: lo, max: hi };
-            const center = lo != null && hi != null ? (lo+hi)/2 : lo??hi;
-            const half   = lo != null && hi != null ? (hi-lo)/2 : Math.abs(center)*(pct/100);
-            const nh     = half + half*(pct/100);
-            return { min: lo != null ? Math.max(0, Math.floor(center-nh)) : null,
-                     max: hi != null ? Math.ceil(center+nh) : null };
-        };
-        const body = { limit: CFG.PAGE_SIZE, offset, sort_by: 'timestamp', sort_order: 'desc' };
-        if (f.itemName) body.item_name = f.itemName;
-        if (f.bonus1Id) { body.bonus1_id = +f.bonus1Id; const r = expand(f.bonus1Min, f.bonus1Max, bPct); if (r.min!=null) body.bonus1_value_min=r.min; if (r.max!=null) body.bonus1_value_max=r.max; }
-        if (f.bonus2Id) { body.bonus2_id = +f.bonus2Id; const r = expand(f.bonus2Min, f.bonus2Max, bPct); if (r.min!=null) body.bonus2_value_min=r.min; if (r.max!=null) body.bonus2_value_max=r.max; }
-        const qr = expand(f.qualityMin, f.qualityMax, qPct);
-        if (qr.min != null) body.quality_min = qr.min;
-        if (qr.max != null) body.quality_max = qr.max;
-        return body;
-    }
-
-    async function doSearch() {
-        state.loading = true; state.error = null; state.autoWidened = null;
-        render();
-        try {
-            const f  = state.filters;
-            const s  = settings.get();
-            const hasRanges = f.bonus1Min||f.bonus1Max||f.bonus2Min||f.bonus2Max||f.qualityMin||f.qualityMax;
-            const steps = (s.autoWiden && hasRanges) ? s.widenSteps : [[0,0]];
-            const minR  = s.minResults || 1;
-            let found = false;
-            for (const [bPct, qPct] of steps) {
-                const body = buildSearchBody(f, state.offset, bPct, qPct);
-                const k    = JSON.stringify(body);
-                let data   = cache.get(k);
-                if (!data) { data = await supabase('search-auctions', body); cache.set(k, data); }
-                const results = data.auctions || [];
-                if (results.length >= minR || (state.offset > 0 && (data.total||0) > 0)) {
-                    state.results   = results;
-                    state.total     = data.total || 0;
-                    state.autoWidened = (bPct>0||qPct>0) ? {bonusPct:bPct, qualityPct:qPct} : null;
-                    found = true; break;
-                }
-            }
-            if (!found) { state.results = []; state.total = 0; }
-        } catch(e) { console.error('[AH]', e); state.error = e.message; state.results = []; state.total = 0; }
-        state.loading = false; state.lastItem = state.filters.itemName;
-        render();
-    }
-
-    function buildMarketParams() {
-        const f = state.filters, ms = settings.get().market, p = new URLSearchParams();
-        if (f.itemName) p.set(state.itemType==='armor' ? 'armorPiece' : 'weaponName', f.itemName);
-        if (f.bonus1Id) { const n=bonusById[f.bonus1Id]; if(n) p.set('bonus1',n); if(!ms.disableBonusFilter){if(f.bonus1Min)p.set('minBonus1Value',f.bonus1Min);if(f.bonus1Max)p.set('maxBonus1Value',f.bonus1Max);} }
-        if (f.bonus2Id) { const n=bonusById[f.bonus2Id]; if(n) p.set('bonus2',n); if(!ms.disableBonusFilter){if(f.bonus2Min)p.set('minBonus2Value',f.bonus2Min);if(f.bonus2Max)p.set('maxBonus2Value',f.bonus2Max);} }
-        if (!ms.disableQualityFilter) { if(f.qualityMin)p.set('minQuality',f.qualityMin); if(f.qualityMax)p.set('maxQuality',f.qualityMax); }
-        p.set('tab', state.itemType==='armor' ? 'armor' : 'weapons'); p.set('sortField','price'); p.set('sortDirection','asc');
-        return p;
-    }
-
-    async function doMarketSearch() {
-        state.mLoading = true; state.mError = null; render();
-        try { const d = await weav3rGet(buildMarketParams()); state.mResults = d.weapons||[]; state.mTotal = d.total_count||0; }
-        catch(e) { state.mError = e.message; state.mResults = []; state.mTotal = 0; }
-        state.mLoading = false; state.mLastItem = state.filters.itemName; render();
-    }
-
-    // ─── Render helpers ───────────────────────────────────────────────────────────
-
-    const bonusOptions = () => bonusList.map(b => `<option value="${b.id}">${b.title}</option>`).join('');
-
-    function filterHTML(f) {
-        const opts = bonusOptions();
-        return `<div class="ah-filters">
-            <div class="ah-name-row">
-                <input type="text" id="ah-item" value="${f.itemName}" placeholder="Item name e.g. Desert Eagle">
-                <button class="ah-search-btn" id="ah-search-btn">Search</button>
-            </div>
-            <div class="ah-bonus-line">
-                <select id="ah-b1"><option value="">Bonus 1 — Any</option>${opts}</select>
-                <input type="number" id="ah-b1min" value="${f.bonus1Min}" placeholder="Min">
-                <span class="ah-range-sep">—</span>
-                <input type="number" id="ah-b1max" value="${f.bonus1Max}" placeholder="Max">
-            </div>
-            <div class="ah-bonus-line">
-                <select id="ah-b2"><option value="">Bonus 2 — Any</option>${opts}</select>
-                <input type="number" id="ah-b2min" value="${f.bonus2Min}" placeholder="Min">
-                <span class="ah-range-sep">—</span>
-                <input type="number" id="ah-b2max" value="${f.bonus2Max}" placeholder="Max">
-            </div>
-            <div class="ah-quality-line">
-                <span class="ah-quality-label">Quality</span>
-                <input type="number" id="ah-qmin" value="${f.qualityMin}" placeholder="Min">
-                <span class="ah-range-sep">—</span>
-                <input type="number" id="ah-qmax" value="${f.qualityMax}" placeholder="Max">
-            </div>
-        </div>`;
-    }
-
-    function setSelects(f) {
-        const b1 = document.getElementById('ah-b1'), b2 = document.getElementById('ah-b2');
-        if (b1) b1.value = f.bonus1Id;
-        if (b2) b2.value = f.bonus2Id;
-    }
-
-    function readFilters() {
-        const g = id => document.getElementById(id);
-        state.filters.itemName   = g('ah-item').value.trim();
-        state.filters.bonus1Id   = g('ah-b1').value;   state.filters.bonus1Min = g('ah-b1min').value; state.filters.bonus1Max = g('ah-b1max').value;
-        state.filters.bonus2Id   = g('ah-b2').value;   state.filters.bonus2Min = g('ah-b2min').value; state.filters.bonus2Max = g('ah-b2max').value;
-        state.filters.qualityMin = g('ah-qmin').value;  state.filters.qualityMax = g('ah-qmax').value;
-    }
-
-    const tabsHTML = active => {
-        const t = (id, lbl) => `<button class="ah-tab${active===id?' active':''}" data-tab="${id}">${lbl}</button>`;
-        return `<div class="ah-tabs">${t('search','Search')}${t('market','Market &amp; Bazaar')}${t('settings','Settings')}</div>`;
-    };
-
-    const headerHTML = () =>
-        `<div class="ah-header"><h3 class="ah-title">Price History</h3><button class="ah-close" id="ah-close">&times;</button></div>`;
-
-    // Build stats meta line with optional delta badges vs sourceStats
-    function statsMetaHTML(dmg, acc, armor, quality, srcStats) {
-        const parts = [];
-        if (quality != null) {
-            const qVal = parseFloat(quality).toFixed(1);
-            parts.push(`<span>Quality: <strong>${qVal}%</strong>${srcStats ? deltaBadge(parseFloat(qVal), srcStats.quality, '%') : ''}</span>`);
-        }
-        if (dmg != null) {
-            const d = parseFloat(dmg).toFixed(1);
-            parts.push(`<span>DMG: <strong>${d}</strong>${srcStats ? deltaBadge(parseFloat(d), srcStats.dmg) : ''}</span>`);
-        }
-        if (acc != null) {
-            const a = parseFloat(acc).toFixed(1);
-            parts.push(`<span>ACC: <strong>${a}</strong>${srcStats ? deltaBadge(parseFloat(a), srcStats.acc) : ''}</span>`);
-        }
-        if (armor != null) {
-            const ar = parseFloat(armor).toFixed(1);
-            parts.push(`<span>Armor: <strong>${ar}</strong>${srcStats ? deltaBadge(parseFloat(ar), srcStats.armor) : ''}</span>`);
-        }
-        return parts.join(`<span class="ah-stat-sep">·</span>`);
-    }
-
-    function itemCardHTML(a, isMarket = false) {
-        const src = state.sourceStats;
-
-        // Extract stats
-        const name    = isMarket ? a.itemName : a.item_name;
-        const quality = isMarket ? parseFloat(a.quality||0) : (a.stat_quality ?? null);
-        const dmg     = isMarket ? (a.damage   != null ? parseFloat(a.damage)   : null) : (a.stat_damage   ?? null);
-        const acc     = isMarket ? (a.accuracy != null ? parseFloat(a.accuracy) : null) : (a.stat_accuracy ?? null);
-        const armor   = isMarket ? null : (a.stat_armor ?? null);
-
-        // Bonuses
-        let bonusHtml = '';
-        if (!isMarket) {
-            if (a.bonus_values?.length) bonusHtml = a.bonus_values.map(bv => {
-                const bval = bv.bonus_value != null ? bv.bonus_value : null;
-                // Delta vs source bonus if same bonus id
-                let bdelta = '';
-                if (src && bval != null) {
-                    const srcB = src.bonuses?.find(b => b.id === bv.bonus_id);
-                    if (srcB?.value != null) bdelta = deltaBadge(bval, srcB.value, '%');
-                }
-                return `<span class="ah-bonus">${bval != null ? bval+'% ' : ''}${bonusName(bv.bonus_id)}${bdelta}</span>`;
-            }).join('');
-            else if (a.bonus_ids?.length) bonusHtml = a.bonus_ids.map(id => `<span class="ah-bonus">${bonusName(id)}</span>`).join('');
-        } else {
-            if (a.bonuses) bonusHtml = Object.values(a.bonuses).map(b => `<span class="ah-bonus">${b.value?b.value+'% ':''}${b.bonus}</span>`).join('');
-        }
-
-        const metaHTML = statsMetaHTML(dmg, acc, armor, quality, src);
-
-        let rightHTML, bottomHTML;
-        if (!isMarket) {
-            rightHTML  = `<p class="ah-price">${fmt$(a.price)}</p><p class="ah-date">${fmtDate(a.timestamp)}</p>${a.bid_count?`<p class="ah-bids">${a.bid_count} bids</p>`:''}`;
-            bottomHTML = `<p class="ah-players">Seller: ${profileLink(a.seller_id, a.seller_name)} · Buyer: ${profileLink(a.buyer_id, a.buyer_name)}</p>`;
-        } else {
-            rightHTML  = `<p class="ah-price">${fmt$(a.price)}</p>`;
-            const isBaz = a.playerId || a.playerName;
-            bottomHTML = `<p class="ah-players">Listed by: ${isBaz ? `<a href="https://www.torn.com/bazaar.php?userId=${a.playerId}#/" target="_blank">${a.playerName||'Unknown'}'s Bazaar</a>` : `<span style="color:var(--t2)">Market Listing</span>`}</p>`;
-        }
-
-        return `<div class="ah-item">
-            <div class="ah-item-left">
-                <div class="ah-item-top"><p class="ah-item-name">${name}</p>${rarityBadge(a.rarity)}</div>
-                <div class="ah-item-meta">${metaHTML}</div>
-                ${bonusHtml ? `<div class="ah-item-bonuses">${bonusHtml}</div>` : ''}
-                ${bottomHTML}
-            </div>
-            <div class="ah-item-right">${rightHTML}</div>
-        </div>`;
-    }
-
-    // ─── Render ───────────────────────────────────────────────────────────────────
-
-    function render() {
-        const modal = document.getElementById('ah-modal');
-        if (!modal) return;
-        modal.className = state.open ? 'ah-modal open' : 'ah-modal';
-        if (!state.open) return;
-        if (state.activeTab === 'search')   renderSearch(modal);
-        else if (state.activeTab === 'market')   renderMarket(modal);
-        else                                     renderSettings(modal);
-    }
-
-    function bindCommon(modal) {
-        document.getElementById('ah-close').onclick = closeModal;
-        modal.querySelectorAll('.ah-tab').forEach(tab => {
-            tab.onclick = () => {
-                state.activeTab = tab.dataset.tab; render();
-                if (state.activeTab === 'market' && !state.mLoading && !state.mResults.length) doMarketSearch();
-            };
-        });
-    }
-
-    function renderSearch(modal) {
-        const f = state.filters;
-        const widenBanner = state.autoWidened ? (() => {
-            const parts = [];
-            if (state.autoWidened.bonusPct  > 0) parts.push(`bonus ±${state.autoWidened.bonusPct}%`);
-            if (state.autoWidened.qualityPct > 0) parts.push(`quality ±${state.autoWidened.qualityPct}%`);
-            return `<div class="ah-widened">⚠️ <span>No exact matches — results shown with widened <strong>${parts.join(' and ')}</strong></span></div>`;
-        })() : '';
-
-        let resultsHTML;
-                const analysisHTML = (!state.loading && !state.error)
-            ? renderAnalysisBanner()
-            : '';
-        if (state.loading) {
-            resultsHTML = `<div class="ah-loading"><div class="ah-spinner"></div>Searching...</div>`;
-        } else if (state.error) {
-            resultsHTML = `<div class="ah-error">⚠️ ${state.error}<br><button class="ah-search-btn" id="ah-retry" style="margin-top:10px;font-size:12px;padding:6px 14px">Retry</button></div>`;
-        } else if (!state.results.length) {
-            resultsHTML = `<div class="ah-empty">No matching sales found</div>`;
-        } else {
-            resultsHTML = widenBanner + state.results.map(a => itemCardHTML(a)).join('');
-        }
-
-        // Suggested price + median stats bar
-        let sugHTML = '';
-        if (!state.loading && !state.error && state.results.length) {
-            const s = computeSuggestion(state.results);
-            if (s) {
-                const src = state.sourceStats;
-                sugHTML = `<div class="ah-suggestion">
-                    <div style="display:flex;flex-direction:column;gap:2px">
-                        <span class="ah-sug-label">Suggested Price</span>
-                        <span class="ah-sug-main">${fmt$(s.suggested)}</span>
-                        <span class="ah-sug-range">Low <span>${fmt$(s.low)}</span> – High <span>${fmt$(s.high)}</span></span>
-                    </div>
-                    <div class="ah-sug-stats">
-                        ${s.medDmg     != null ? `<div class="ah-sug-stat"><span class="lbl">DMG</span><span class="val">${s.medDmg.toFixed(1)}</span>${src?.dmg != null ? deltaBadge(s.medDmg, src.dmg) : ''}</div>` : ''}
-                        ${s.medAcc     != null ? `<div class="ah-sug-stat"><span class="lbl">ACC</span><span class="val">${s.medAcc.toFixed(1)}</span>${src?.acc != null ? deltaBadge(s.medAcc, src.acc) : ''}</div>` : ''}
-                        ${s.medArmor   != null ? `<div class="ah-sug-stat"><span class="lbl">Armor</span><span class="val">${s.medArmor.toFixed(1)}</span>${src?.armor != null ? deltaBadge(s.medArmor, src.armor) : ''}</div>` : ''}
-                        ${s.medQuality != null ? `<div class="ah-sug-stat"><span class="lbl">Qual</span><span class="val">${s.medQuality.toFixed(1)}%</span>${src?.quality != null ? deltaBadge(s.medQuality, src.quality, '%') : ''}</div>` : ''}
-                    </div>
-                    <p class="ah-sug-note">Based on ${s.count} recent sale${s.count!==1?'s':''} (weighted median)</p>
-                </div>`;
-            }
-        }
-
-    modal.innerHTML =
-        headerHTML() +
-        tabsHTML('search') +
-        filterHTML(f) +
-        analysisHTML +
-        `<div class="ah-results">${resultsHTML}</div>` +
-        sugHTML +
-        `<div class="ah-footer">
-            <span>${state.total.toLocaleString()} results</span>
-            <div class="ah-nav">
-                <button class="ah-nav-btn" id="ah-prev" ${state.offset === 0 ? 'disabled' : ''}>Prev</button>
-                <button class="ah-nav-btn" id="ah-next" ${state.offset + CFG.PAGE_SIZE >= state.total ? 'disabled' : ''}>Next</button>
-            </div>
-        </div>`;
-
-        bindCommon(modal); setSelects(f);
-        document.getElementById('ah-search-btn').onclick = () => { readFilters(); state.offset = 0; doSearch(); };
-        document.getElementById('ah-prev').onclick = () => { state.offset = Math.max(0, state.offset-CFG.PAGE_SIZE); doSearch(); };
-        document.getElementById('ah-next').onclick = () => { state.offset += CFG.PAGE_SIZE; doSearch(); };
-        document.getElementById('ah-item').onkeypress = e => { if (e.key==='Enter') document.getElementById('ah-search-btn').click(); };
-        document.getElementById('ah-retry')?.addEventListener('click', () => { state.offset=0; doSearch(); });
-        if (f.itemName && f.itemName !== state.lastItem && !state.loading) { state.offset = 0; doSearch(); }
-    }
-
-    function renderMarket(modal) {
-        const f  = state.filters, ms = settings.get().market;
-        const noFiltered = !state.mLoading && !state.mError && !state.mResults.length
-            && (f.bonus1Id || f.qualityMin) && (!ms.disableBonusFilter || !ms.disableQualityFilter);
-
-        let resultsHTML;
-        if (state.mLoading) resultsHTML = `<div class="ah-loading"><div class="ah-spinner"></div>Searching market...</div>`;
-        else if (state.mError) resultsHTML = `<div class="ah-error">⚠️ ${state.mError}<br><button class="ah-search-btn" id="ah-mretry" style="margin-top:10px;font-size:12px;padding:6px 14px">Retry</button></div>`;
-        else if (noFiltered) resultsHTML = `<div class="ah-empty">No items found.<br><button class="ah-search-btn" id="ah-disable-filters" style="margin-top:10px;font-size:12px;padding:6px 14px">Remove bonus &amp; quality filters?</button></div>`;
-        else if (!state.mResults.length) resultsHTML = `<div class="ah-empty">No similar items on the market or in bazaars</div>`;
-        else resultsHTML = state.mResults.map(a => itemCardHTML(a, true)).join('');
-
-        modal.innerHTML = headerHTML() + tabsHTML('market') + filterHTML(f) +
-            `<div class="ah-results">${resultsHTML}</div>
-            <div class="ah-footer"><span>${state.mTotal.toLocaleString()} listings</span><a href="https://weav3r.dev/" target="_blank" style="color:var(--t2);text-decoration:none;font-size:11px;">Powered by TornW3B</a></div>`;
-
-        bindCommon(modal); setSelects(f);
-        document.getElementById('ah-search-btn').onclick = () => { readFilters(); doMarketSearch(); };
-        document.getElementById('ah-item').onkeypress = e => { if (e.key==='Enter') document.getElementById('ah-search-btn').click(); };
-        document.getElementById('ah-mretry')?.addEventListener('click', doMarketSearch);
-        document.getElementById('ah-disable-filters')?.addEventListener('click', () => { settings.setMarket({disableBonusFilter:true, disableQualityFilter:true}); doMarketSearch(); });
-        if (f.itemName && f.itemName !== state.mLastItem && !state.mLoading) doMarketSearch();
-    }
-
-    function renderSettings(modal) {
-        const s    = settings.get();
-        const st   = s.style;
-        const ms   = s.market;
-        const ovrs = Object.keys(s.bonusOverrides).map(id => ({ id:+id, name:bonusName(+id), ...s.bonusOverrides[id] })).sort((a,b)=>a.name.localeCompare(b.name));
-        const ovrIds = new Set(ovrs.map(o=>o.id));
-        const avail  = bonusList.filter(b=>!ovrIds.has(b.id));
-
-        modal.innerHTML = headerHTML() + tabsHTML('settings') + `
-        <div class="ah-settings">
-
-            <div class="ah-sec">
-                <h4>Appearance</h4>
-
-                <div class="ah-row">
-                    <label>Opacity</label>
-                    <input type="range" id="st-opacity" min="5" max="100" step="1" value="${Math.round(st.opacity*100)}">
-                    <span class="val-display" id="st-opacity-val">${Math.round(st.opacity*100)}%</span>
-                </div>
-                <div class="ah-row">
-                    <label>Blur</label>
-                    <input type="range" id="st-blur" min="0" max="40" step="1" value="${st.blur}">
-                    <span class="val-display" id="st-blur-val">${st.blur}px</span>
-                </div>
-                <div class="ah-row">
-                    <label>Corner Radius</label>
-                    <input type="range" id="st-radius" min="0" max="28" step="1" value="${st.borderRadius}">
-                    <span class="val-display" id="st-radius-val">${st.borderRadius}px</span>
-                </div>
-                <div class="ah-row">
-                    <label>Row Radius</label>
-                    <input type="range" id="st-rrow" min="0" max="16" step="1" value="${st.rowRadius}">
-                    <span class="val-display" id="st-rrow-val">${st.rowRadius}px</span>
-                </div>
-
-                <div class="ah-row"><label>Background</label>  <input type="color" id="st-bgBase"  value="${st.bgBase}">  <span class="ah-note">Base background colour</span></div>
-                <div class="ah-row"><label>Row BG</label>       <input type="color" id="st-bgRow"   value="${st.bgRow}">   <span class="ah-note">Result row / input background</span></div>
-                <div class="ah-row"><label>Border</label>       <input type="color" id="st-border"  value="${st.borderColor}"> <span class="ah-note">Borders &amp; dividers</span></div>
-                <div class="ah-row"><label>Header Text</label>  <input type="color" id="st-t0"      value="${st.headerText}">  <span class="ah-note">Primary / header text</span></div>
-                <div class="ah-row"><label>Body Text</label>    <input type="color" id="st-t1"      value="${st.bodyText}">    <span class="ah-note">Stats &amp; secondary text</span></div>
-                <div class="ah-row"><label>Muted Text</label>   <input type="color" id="st-t2"      value="${st.mutedText}">   <span class="ah-note">Dates, labels, hints</span></div>
-                <div class="ah-row"><label>Accent (price)</label><input type="color" id="st-accent" value="${st.accentColor}"> <span class="ah-note">Price colour, positive delta</span></div>
-                <div class="ah-row"><label>Negative delta</label><input type="color" id="st-neg"    value="${st.negColor}">    <span class="ah-note">Negative stat difference</span></div>
-                <div class="ah-row"><label>Links</label>        <input type="color" id="st-link"    value="${st.linkColor}">   <span class="ah-note">Player profile links</span></div>
-                <div class="ah-row"><label>Button BG</label>    <input type="color" id="st-btnBg"   value="${st.btnBg}">       <span class="ah-note">Search button background</span></div>
-                <div class="ah-row"><label>Button Text</label>  <input type="color" id="st-btnT"    value="${st.btnText}">     <span class="ah-note">Search button text</span></div>
-            </div>
-
-            <div class="ah-sec">
-                <h4>Default Tolerances (History Search)</h4>
-                <div class="ah-row"><label>Bonus Value</label><input type="number" id="s-btol" value="${s.bonusTolerance}" min="0" max="100"><span class="ah-note">± % (0 = exact)</span></div>
-                <div class="ah-row"><label>Quality</label><input type="number" id="s-qtol" value="${s.qualityTolerance}" min="0" max="100" ${s.ignoreQuality?'disabled':''}><span class="ah-note">± %</span><input type="checkbox" id="s-iqual" ${s.ignoreQuality?'checked':''}><span class="ah-note">Any Quality</span></div>
-            </div>
-
-            <div class="ah-sec">
-                <h4>Auto-Widen (History Search)</h4>
-                <div class="ah-row"><label>Auto-Widen</label><input type="checkbox" id="s-autowiden" ${s.autoWiden?'checked':''}><span class="ah-note">Broaden ranges if too few results</span></div>
-                <div class="ah-row"><label>Min Results</label><input type="number" id="s-minresults" value="${s.minResults}" min="1" max="20" ${!s.autoWiden?'disabled':''}><span class="ah-note">Widen until at least this many found</span></div>
-            </div>
-
-            <div class="ah-sec">
-                <h4>Market &amp; Bazaar Filters</h4>
-                <p style="font-size:10px;color:var(--t2);margin:0 0 8px;">Only affect Market tab — History Search always uses your full filters.</p>
-                <div class="ah-row"><label>Bonus value filter</label><input type="checkbox" id="s-mbonus" ${ms.disableBonusFilter?'checked':''}><span class="ah-note">Disable min/max bonus value</span></div>
-                <div class="ah-row"><label>Quality filter</label><input type="checkbox" id="s-mqual" ${ms.disableQualityFilter?'checked':''}><span class="ah-note">Disable min/max quality</span></div>
-            </div>
-
-            <div class="ah-sec">
-                <h4>Per-Bonus Overrides</h4>
-                ${ovrs.length ? ovrs.map(o => `
-                <div class="ah-ovr-item" data-id="${o.id}">
-                    <span class="name">${o.name}</span>
-                    <div class="grp"><span class="lbl">Bonus ±</span><input type="number" class="btol" value="${o.bonusTolerance??s.bonusTolerance}" min="0" max="100"><span class="lbl">%</span></div>
-                    <div class="grp"><span class="lbl">Quality ±</span><input type="number" class="qtol" value="${o.ignoreQuality?'':(o.qualityTolerance??s.qualityTolerance)}" min="0" max="100" ${o.ignoreQuality?'disabled':''}><span class="lbl">%</span></div>
-                    <div class="grp"><input type="checkbox" class="iqual" ${o.ignoreQuality?'checked':''}><span class="lbl">Any</span></div>
-                    <button class="ah-remove">✕</button>
-                </div>`).join('') : '<p style="font-size:11px;color:var(--t2);text-align:center;padding:14px 0;opacity:.6">No overrides configured</p>'}
-                <div class="ah-add-row">
-                    <select id="s-addbonus"><option value="">Add bonus override…</option>${avail.map(b=>`<option value="${b.id}">${b.title}</option>`).join('')}</select>
-                    <button class="ah-add-btn" id="s-addbtn">Add</button>
-                </div>
-            </div>
-
-            <div class="ah-ie-row">
-                <button id="s-export">Export Settings</button>
-                <button id="s-import">Import Settings</button>
-                <input type="file" id="s-import-file" class="ah-hidden" accept=".json">
-                <button class="ah-reset-btn" id="s-reset">Reset All</button>
-            </div>
-        </div>`;
-
-        bindCommon(modal);
-
-        // ── Appearance sliders / colour pickers ──
-        const liveRange = (id, dispId, unit, fn) => {
-            const el = document.getElementById(id), disp = document.getElementById(dispId);
-            if (!el) return;
-            const up = () => { if(disp) disp.textContent = el.value + unit; fn(parseFloat(el.value)); };
-            el.oninput = up;
-        };
-        liveRange('st-opacity', 'st-opacity-val', '%', v => settings.setStyle({ opacity: v / 100 }));
-        liveRange('st-blur',    'st-blur-val',    'px', v => settings.setStyle({ blur: v }));
-        liveRange('st-radius',  'st-radius-val',  'px', v => settings.setStyle({ borderRadius: v }));
-        liveRange('st-rrow',    'st-rrow-val',    'px', v => settings.setStyle({ rowRadius: v }));
-
-        const liveColor = (id, key) => {
-            const el = document.getElementById(id); if (!el) return;
-            el.oninput = () => settings.setStyle({ [key]: el.value });
-        };
-        liveColor('st-bgBase',  'bgBase');
-        liveColor('st-bgRow',   'bgRow');
-        liveColor('st-border',  'borderColor');
-        liveColor('st-t0',      'headerText');
-        liveColor('st-t1',      'bodyText');
-        liveColor('st-t2',      'mutedText');
-        liveColor('st-accent',  'accentColor');
-        liveColor('st-neg',     'negColor');
-        liveColor('st-link',    'linkColor');
-        liveColor('st-btnBg',   'btnBg');
-        liveColor('st-btnT',    'btnText');
-
-        // ── Search settings ──
-        const wire = (id, fn) => { const el = document.getElementById(id); if (el) el.onchange = fn; };
-        wire('s-btol',       e => settings.set({ bonusTolerance:   parseInt(e.target.value)||0 }));
-        wire('s-qtol',       e => settings.set({ qualityTolerance: parseInt(e.target.value)||0 }));
-        wire('s-iqual',      e => { document.getElementById('s-qtol').disabled = e.target.checked; settings.set({ ignoreQuality: e.target.checked }); });
-        wire('s-autowiden',  e => { document.getElementById('s-minresults').disabled = !e.target.checked; settings.set({ autoWiden: e.target.checked }); });
-        wire('s-minresults', e => settings.set({ minResults: parseInt(e.target.value)||1 }));
-        wire('s-mbonus',     e => settings.setMarket({ disableBonusFilter:   e.target.checked }));
-        wire('s-mqual',      e => settings.setMarket({ disableQualityFilter: e.target.checked }));
-
-        modal.querySelectorAll('.ah-ovr-item').forEach(el => {
-            const id = +el.dataset.id;
-            const save = () => settings.setBonusOverride(id, { bonusTolerance: parseInt(el.querySelector('.btol').value)||0, qualityTolerance: parseInt(el.querySelector('.qtol').value)||0, ignoreQuality: el.querySelector('.iqual').checked });
-            el.querySelector('.btol').onchange = save;
-            el.querySelector('.qtol').onchange = save;
-            el.querySelector('.iqual').onchange = e => { el.querySelector('.qtol').disabled = e.target.checked; save(); };
-            el.querySelector('.ah-remove').onclick = () => { settings.setBonusOverride(id, null); render(); };
-        });
-
-        document.getElementById('s-addbtn').onclick = () => {
-            const sel = document.getElementById('s-addbonus'), id = +sel.value;
-            if (!id) return;
-            const d = settings.get();
-            settings.setBonusOverride(id, { bonusTolerance: d.bonusTolerance, qualityTolerance: d.qualityTolerance, ignoreQuality: false });
-            render();
-        };
-
-        document.getElementById('s-export').onclick = () => {
-            const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([settings.export()], {type:'application/json'})), download: 'ah-settings.json' });
-            a.click(); URL.revokeObjectURL(a.href);
-        };
-        document.getElementById('s-import').onclick = () => document.getElementById('s-import-file').click();
-        document.getElementById('s-import-file').onchange = e => {
-            const fr = new FileReader();
-            fr.onload = ev => { settings.import(ev.target.result) ? (applyStyle(), render()) : alert('Invalid settings file'); };
-            fr.readAsText(e.target.files[0]);
-        };
-        document.getElementById('s-reset').onclick = () => { if (confirm('Reset all settings?')) { settings.reset(); applyStyle(); render(); } };
-    }
-
-    // ─── Modal lifecycle ──────────────────────────────────────────────────────────
-
-    const posStore = {
-        load() { try { return JSON.parse(localStorage.getItem(CFG.POSITION_KEY)||'null'); } catch { return null; } },
-        save(p) { try { localStorage.setItem(CFG.POSITION_KEY, JSON.stringify(p)); } catch {} },
-    };
-
-    const isPC = () => window.matchMedia('(min-width: 768px) and (pointer: fine)').matches;
-
-    function setupDrag(modal) {
-        let drag = false, ox = 0, oy = 0;
-        document.addEventListener('mousedown', e => {
-            if (!e.target.closest('.ah-header') || !state.open || e.target.closest('.ah-close')) return;
-            drag = true; modal.classList.add('dragging');
-            const r = modal.getBoundingClientRect();
-            if (modal.style.transform) { modal.style.transform='none'; modal.style.top=r.top+'px'; modal.style.left=r.left+'px'; }
-            ox = e.clientX - r.left; oy = e.clientY - r.top;
-        });
-        document.addEventListener('mousemove', e => {
-            if (!drag) return;
-            modal.style.left = Math.max(0, Math.min(e.clientX-ox, window.innerWidth -modal.offsetWidth ))+'px';
-            modal.style.top  = Math.max(0, Math.min(e.clientY-oy, window.innerHeight-modal.offsetHeight))+'px';
-        });
-        document.addEventListener('mouseup', () => {
-            if (!drag) return;
-            drag = false; modal.classList.remove('dragging');
-            posStore.save({ top: modal.style.top, left: modal.style.left, w: modal.offsetWidth, h: modal.offsetHeight });
-        });
-        new ResizeObserver(() => { if (state.open && !drag) posStore.save({ top: modal.style.top, left: modal.style.left, w: modal.offsetWidth, h: modal.offsetHeight }); }).observe(modal);
-    }
-
-    function createModal() {
-        const modal = document.createElement('div');
-        modal.id = 'ah-modal';
-        document.body.appendChild(modal);
-        if (isPC()) setupDrag(modal);
-    }
-
-    function openModal(itemName, parsedBonuses, quality, itemType = 'weapon', srcStats = null) {
-        state.open      = true;
-        state.activeTab = 'search';
-        state.offset    = 0;
-        state.itemType  = itemType;
-        state.mResults  = []; state.mTotal = 0;
-        state.lastItem  = ''; state.mLastItem = '';
-        state.filters.itemName = itemName || '';
-        // Store the source item stats for comparison deltas
-        state.sourceStats = srcStats;
-
-        const modal = document.getElementById('ah-modal');
-        if (modal) {
-            if (isPC()) {
-                const pos = posStore.load();
-                if (pos?.top && pos?.left) {
-                    modal.style.transform = 'none'; modal.style.top = pos.top; modal.style.left = pos.left;
-                    if (pos.w) modal.style.width = pos.w+'px'; if (pos.h) modal.style.height = pos.h+'px';
-                } else { modal.style.transform = 'translate(-50%,-50%)'; modal.style.top = '50%'; modal.style.left = '50%'; }
-            } else { modal.style.transform = 'none'; modal.style.top = modal.style.left = ''; }
-        }
-
-        const calcRange = (val, tol) => {
-            if (!val) return { min:'', max:'' };
-            if (tol === 0) return { min: String(val), max: String(val) };
-            const f = tol/100;
-            return { min: String(Math.floor(val*(1-f))), max: String(Math.ceil(val*(1+f))) };
-        };
-
-        const b1 = parsedBonuses?.[0], b2 = parsedBonuses?.[1];
-        state.filters.bonus1Id = b1 ? String(b1.id) : ''; state.filters.bonus2Id = b2 ? String(b2.id) : '';
-        const r1 = b1 ? calcRange(b1.value, settings.bonusTol(b1.id)) : {min:'',max:''};
-        const r2 = b2 ? calcRange(b2.value, settings.bonusTol(b2.id)) : {min:'',max:''};
-        state.filters.bonus1Min = r1.min; state.filters.bonus1Max = r1.max;
-        state.filters.bonus2Min = r2.min; state.filters.bonus2Max = r2.max;
-
-        const qTol = settings.qualityTol(b1?.id);
-        const qr   = (qTol !== null && quality) ? calcRange(quality, qTol) : {min:'',max:''};
-        state.filters.qualityMin = qr.min; state.filters.qualityMax = qr.max;
-
-        state.results = []; state.total = 0;
-        render(); doSearch();
-    }
-
-    function closeModal() { state.open = false; render(); }
-
-    // ─── Page parsing ─────────────────────────────────────────────────────────────
-
-    const getPageType = () => {
-        const u = location.href;
-        if (u.includes('amarket.php'))    return 'auction';
-        if (u.includes('sid=ItemMarket')) return 'itemmarket';
-        if (u.includes('item.php'))       return 'inventory';
-        if (u.includes('bazaar.php'))     return 'bazaar';
-        if (u.includes('displaycase.php')) return 'displaycase';
-        if (u.includes('factions.php') && u.includes('armoury')) return 'armory';
-        return 'unknown';
-    };
-
-    function hasRarity(el) {
-        const r = el.querySelector('[class*="rarity___"]');
-        if (r) { const t = (r.className+r.textContent).toLowerCase(); if (t.includes('yellow')||t.includes('orange')||t.includes('red')) return true; }
-        return !!el.querySelector('[class*="extraordinary"],[class*="extremely-rare"]');
-    }
-
-    function parseReactItem(el) {
-        let itemName = '', bonuses = [], quality = null, itemType = 'weapon';
-        let dmg = null, acc = null, armor = null;
-        const nameEl = el.querySelector('.description___xJ1N5 .bold,[class*="description"] .bold,[class*="itemName"],.item-name');
-        if (nameEl) itemName = nameEl.textContent.trim().replace(/^The\s+/i, '');
-
-        for (const prop of el.querySelectorAll('li[class*="propertyWrapper"],[class*="propertyWrapper"]')) {
-            const title = prop.querySelector('[class*="title"]')?.textContent.trim();
-            if (!title) continue;
-            if (title === 'Damage:') { itemType = 'weapon'; const v = prop.querySelector('[aria-label*="Damage"]'); if(v){const m=(v.getAttribute('aria-label')||'').match(/([\d.]+)/);if(m)dmg=parseFloat(m[1]);} }
-            else if (title === 'Armor:') { itemType = 'armor'; const v = prop.querySelector('[aria-label*="Armor"]'); if(v){const m=(v.getAttribute('aria-label')||'').match(/([\d.]+)/);if(m)armor=parseFloat(m[1]);} }
-            if (title === 'Accuracy:') { const v = prop.querySelector('[aria-label*="Accuracy"]'); if(v){const m=(v.getAttribute('aria-label')||'').match(/([\d.]+)/);if(m)acc=parseFloat(m[1]);} }
-            if (title === 'Quality:') { const v = prop.querySelector('[aria-label*="Quality"]'); if(v){const m=(v.getAttribute('aria-label')||'').match(/([\d.]+)/);if(m)quality=parseFloat(m[1]);} }
-            if (title === 'Bonus:') {
-                const v = prop.querySelector('[aria-label*="Bonus"]');
-                if (v) {
-                    const aria = v.getAttribute('aria-label') || '';
-                    const mv = aria.match(/([\d.]+)\s*(%|T)?\s*(.+?)\s*Bonus/i);
-                    let bName = mv ? mv[3].trim() : (aria.match(/^\s*(.+?)\s*Bonus/i)||[])[1]?.trim();
-                    if (bName) { const id = bonusId(bName); if (id) bonuses.push({ id, value: mv ? parseFloat(mv[1]) : null }); }
-                }
-            }
-        }
-        return { itemName, bonuses, quality, itemType, srcStats: { dmg, acc, armor, quality, bonuses } };
-    }
-
-    function parseLegacyItem(row) {
-        let itemName = '', bonuses = [], quality = null, itemType = 'weapon';
-        itemName = row.querySelector('.item-name')?.textContent.trim() || '';
-        const exp = row.querySelector('.show-item-info');
-        if (exp?.textContent.includes('Armor:')) itemType = 'armor';
-        const bonusTxt = row.querySelector('.title p.t-gray-6');
-        if (bonusTxt) {
-            for (const line of bonusTxt.innerHTML.split(/<br\s*\/?>/i)) {
-                const text = line.trim();
-                const mv = text.match(/([\d.]+)\s*(%|T)\s+(.+)/i);
-                const bName = mv ? mv[3].trim() : (text && !text.match(/^\d/) ? text : null);
-                if (bName) { const id = bonusId(bName); if (id) bonuses.push({ id, value: mv ? parseFloat(mv[1]) : null }); }
-            }
-        }
-        if (exp) { const qs = exp.querySelector('span[aria-label*="Quality"]'); if(qs){const m=(qs.getAttribute('aria-label')||'').match(/([\d.]+)/);if(m)quality=parseFloat(m[1]);} }
-        return { itemName, bonuses, quality, itemType, srcStats: { dmg:null, acc:null, armor:null, quality, bonuses } };
-    }
-
-    const makeBtn = onClick => {
-        const btn = document.createElement('button');
-        btn.className = 'ah-btn'; btn.textContent = 'Price Check';
-        btn.onclick = e => { e.preventDefault(); e.stopPropagation(); onClick(); };
-        return btn;
-    };
-
-    function injectInto(containers, checkRarity = true) {
-        containers.forEach(el => {
-            if (el.querySelector('.ah-btn')) return;
-            if (checkRarity && !hasRarity(el)) return;
-            const wrap = el.querySelector('.descriptionWrapper___Lh0y0,[class*="itemInfo___"]') || el;
-            wrap.style.position = 'relative';
-            wrap.appendChild(makeBtn(() => { const d = parseReactItem(el); openModal(d.itemName, d.bonuses, d.quality, d.itemType, d.srcStats); }));
-        });
-    }
-
-    function injectAuction() {
-        for (const sel of ['.itemInfoWrapper___nA_eu','[class*="itemInfoWrapper"]','[class*="itemInfo___"]']) {
-            const els = document.querySelectorAll(sel);
-            if (!els.length) continue;
-            Array.from(els).forEach(el => {
-                if (el.querySelector('.ah-btn')) return;
-                if (!el.querySelector('[class*="propertyWrapper"],[aria-label*="Bonus"],[aria-label*="Quality"]')) return;
-                const wrap = el.querySelector('.descriptionWrapper___Lh0y0') || el;
-                wrap.appendChild(makeBtn(() => {
-                    const d = parseReactItem(el);
-                    document.querySelectorAll('.ah-open-source').forEach(x => x.classList.remove('ah-open-source'));
-                    el.classList.add('ah-open-source');
-                    openModal(d.itemName, d.bonuses, d.quality, d.itemType, d.srcStats);
-                }));
-            });
-            return;
-        }
-
-        // Legacy
-        document.querySelectorAll('li').forEach(li => {
-            if (!li.querySelector('.item-cont-wrap')) return;
-            const exp = li.querySelector('.show-item-info');
-            if (!exp || exp.style.display === 'none') {
-                li.querySelector('.ah-btn')?.remove();
-                return;
-            }
-            if (li.querySelector('.ah-btn')) return;
-            const wrap = li.querySelector('.descriptionWrapper___Lh0y0') || exp;
-            wrap.style.position = 'relative';
-            wrap.appendChild(makeBtn(() => {
-                const d = parseReactItem(el);
-                document.querySelectorAll('.ah-open-source').forEach(x => x.classList.remove('ah-open-source'));
-                el.classList.add('ah-open-source');
-                openModal(d.itemName, d.bonuses, d.quality, d.itemType, d.srcStats);
-            }));
-        });
-    }
-
-    function injectButtons() {
-        const pt = getPageType();
-        if (pt === 'auction') {
-            injectAuction();
-        } else if (pt === 'itemmarket') {
-            injectInto(document.querySelectorAll('.itemInfoWrapper___nA_eu,[class*="itemInfo___"]'));
-        } else if (pt === 'inventory' || pt === 'displaycase') {
-            injectInto(document.querySelectorAll('li.show-item-info'));
-        } else if (pt === 'bazaar') {
-            injectInto(document.querySelectorAll('div.show-item-info,[class*="info___"].show-item-info'));
-        } else if (pt === 'armory') {
-            injectInto(Array.from(document.querySelectorAll('div.view-item-info')).filter(e => e.style.display !== 'none'));
-        }
-    }
-
-    // ─── Page scan / deal scanner ───────────────────────────────────────────────
-
-    const pageScan = {
-        running: false,
-        stopped: false,
-        queue: [],
-        index: 0,
-        goodDeals: [],
-        delayMin: 4000,
-        delayMax: 9000,
-        panel: null,
-    };
-
-    function randInt(min, max) {
-        return Math.floor(Math.random() * (max - min + 1)) + min;
-    }
-
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    async function waitUntil(fn, timeout = 30000, step = 250) {
-        const start = Date.now();
-        while (Date.now() - start < timeout) {
-            try {
-                if (fn()) return true;
-            } catch {}
-            await sleep(step);
-        }
-        return false;
-    }
-
-    function getScanContainers() {
-        return Array.from(document.querySelectorAll('.ah-btn'))
-            .map(btn => btn.parentElement)
-            .filter(Boolean);
-    }
-
-    function getContainerSignature(container) {
-        const txt = (container.innerText || container.textContent || '')
-            .trim()
-            .replace(/\s+/g, ' ');
-        return txt.slice(0, 300);
-    }
-
-    function removeScanBadge(container) {
-        const old = container.querySelector('.ah-scan-badge');
-        if (old) old.remove();
-    }
-
-    function setScanBadge(container, html, cls = '') {
-        removeScanBadge(container);
-
-        if (getComputedStyle(container).position === 'static') {
-            container.style.position = 'relative';
-        }
-
-        const badge = document.createElement('div');
-        badge.className = `ah-scan-badge ${cls}`.trim();
-        badge.innerHTML = html;
-        container.appendChild(badge);
-    }
-
-    function analysisClass(label) {
-        if (['STEAL', 'GOOD', 'Hot', 'Popular', 'Meta', 'High'].includes(label)) return 'good';
-        if (['FAIR', 'Average', 'Mid', 'Medium'].includes(label)) return 'mid';
-        return 'bad';
-    }
-
-    function summarizeScanResult(analysis) {
-        const fair = analysis?.fair?.fairValue;
-        const current = analysis?.currentPrice;
-        const deal = analysis?.deal?.label || 'Unknown';
-        const pop = analysis?.popularity?.tier || 'Unknown';
-        const bonus = analysis?.bonus?.tier || 'Unknown';
-
-        return `
-            <div class="ah-scan-line ah-${analysisClass(deal)}"><strong>${deal}</strong></div>
-            <div class="ah-scan-mini">Fair: ${fair ? fmt$(fair) : '—'}</div>
-            <div class="ah-scan-mini">Now: ${current ? fmt$(current) : '—'}</div>
-            <div class="ah-scan-mini">Pop: ${pop} • Bonus: ${bonus}</div>
-        `;
-    }
-
-    function updateScanPanel() {
-        if (!pageScan.panel) return;
-
-        const total = pageScan.queue.length;
-        const done = pageScan.index;
-        const found = pageScan.goodDeals.length;
-
-        pageScan.panel.innerHTML = `
-            <div class="ah-scan-panel-top">
-                <strong>Page Scan</strong>
-                <div class="ah-scan-panel-actions">
-                    <button id="ah-stop-scan-btn" class="ah-scan-control">Stop</button>
-                    <button id="ah-start-scan-btn" class="ah-scan-control">Start</button>
-                </div>
-            </div>
-            <div class="ah-scan-panel-body">
-                <div>Status: ${pageScan.running ? 'Running' : 'Idle'}</div>
-                <div>Progress: ${done} / ${total}</div>
-                <div>Good deals found: ${found}</div>
-            </div>
-        `;
-
-        const stopBtn = document.getElementById('ah-stop-scan-btn');
-        const startBtn = document.getElementById('ah-start-scan-btn');
-
-        if (stopBtn) stopBtn.onclick = stopPageScan;
-        if (startBtn) startBtn.onclick = startPageScan;
-    }
-
-    function ensureScanPanel() {
-        if (pageScan.panel && document.body.contains(pageScan.panel)) return;
-
-        const panel = document.createElement('div');
-        panel.id = 'ah-scan-panel';
-        panel.style.position = 'fixed';
-        panel.style.right = '14px';
-        panel.style.bottom = '14px';
-        panel.style.zIndex = '100000';
-        panel.style.padding = '10px 12px';
-        panel.style.borderRadius = '10px';
-        panel.style.background = 'rgba(15,15,15,0.92)';
-        panel.style.border = '1px solid rgba(255,255,255,0.12)';
-        panel.style.color = '#f5f5f5';
-        panel.style.fontSize = '12px';
-        panel.style.minWidth = '200px';
-        panel.style.backdropFilter = 'blur(8px)';
-        panel.style.boxShadow = '0 8px 30px rgba(0,0,0,0.35)';
-        document.body.appendChild(panel);
-        pageScan.panel = panel;
-
-        updateScanPanel();
-    }
-
-    function stopPageScan() {
-        pageScan.stopped = true;
-        pageScan.running = false;
-        updateScanPanel();
-    }
-
-    async function scanOneContainer(container) {
-        const btn = container.querySelector('.ah-btn');
-        if (!btn) return null;
-
-        setScanBadge(
-            container,
-            `<div class="ah-scan-line ah-info"><strong>Checking…</strong></div>`,
-            'working'
-        );
-
-        btn.click();
-
-        const loaded = await waitUntil(() => !state.loading, 35000, 300);
-        if (!loaded) {
-            setScanBadge(
-                container,
-                `<div class="ah-scan-line ah-bad"><strong>Timed out</strong></div>`,
-                'bad'
-            );
-            return null;
-        }
-
-        if (typeof doMarketSearch === 'function') {
-            try {
-                await doMarketSearch();
-            } catch {}
-        }
-
-        const marketLoaded = await waitUntil(() => !state.mLoading, 35000, 300);
-        if (!marketLoaded) {
-            setScanBadge(
-                container,
-                `<div class="ah-scan-line ah-bad"><strong>Market timeout</strong></div>`,
-                'bad'
-            );
-            return null;
-        }
-
-        if (typeof analyzeCurrentItem !== 'function') {
-            setScanBadge(
-                container,
-                `<div class="ah-scan-line ah-bad"><strong>No analyzer</strong></div>`,
-                'bad'
-            );
-            return null;
-        }
-
-        const analysis = analyzeCurrentItem();
-        const dealLabel = analysis?.deal?.label || 'Unknown';
-        const cls = analysisClass(dealLabel);
-
-        setScanBadge(container, summarizeScanResult(analysis), cls);
-
-        if (dealLabel === 'STEAL' || dealLabel === 'GOOD') {
-            pageScan.goodDeals.push({
-                container,
-                analysis,
-                text: getContainerSignature(container),
-            });
-        }
-
-        return analysis;
-    }
-
-    async function startPageScan() {
-        if (pageScan.running) return;
-
-        ensureScanPanel();
-
-        pageScan.running = true;
-        pageScan.stopped = false;
-        pageScan.goodDeals = [];
-        pageScan.queue = getScanContainers();
-        pageScan.index = 0;
-
-        updateScanPanel();
-
-        for (let i = 0; i < pageScan.queue.length; i++) {
-            if (pageScan.stopped) break;
-
-            const container = pageScan.queue[i];
-            pageScan.index = i + 1;
-            updateScanPanel();
-
-            try {
-                await scanOneContainer(container);
-            } catch (err) {
-                console.error('[AH scan]', err);
-                setScanBadge(
-                    container,
-                    `<div class="ah-scan-line ah-bad"><strong>Error</strong></div><div class="ah-scan-mini">${String(err?.message || err)}</div>`,
-                    'bad'
-                );
-            }
-
-            if (pageScan.stopped) break;
-
-            const delay = randInt(pageScan.delayMin, pageScan.delayMax);
-            updateScanPanel();
-            await sleep(delay);
-        }
-
-        pageScan.running = false;
-        updateScanPanel();
-
-        if (typeof closeModal === 'function') {
-            closeModal();
-        }
-
-        console.log('[AH scan] finished', {
-            scanned: pageScan.index,
-            total: pageScan.queue.length,
-            goodDeals: pageScan.goodDeals.length,
-        });
-    }
-
-    function injectPageScanButton() {
-        ensureScanPanel();
-
-        let host = document.getElementById('ah-page-scan-host');
-        if (!host) {
-            host = document.createElement('div');
-            host.id = 'ah-page-scan-host';
-            host.style.position = 'fixed';
-            host.style.left = '14px';
-            host.style.bottom = '14px';
-            host.style.zIndex = '100000';
-            document.body.appendChild(host);
-        }
-
-        if (host.querySelector('#ah-page-scan-btn')) return;
-
-        const btn = document.createElement('button');
-        btn.id = 'ah-page-scan-btn';
-        btn.textContent = 'Scan Page Deals';
-        btn.style.padding = '10px 14px';
-        btn.style.borderRadius = '10px';
-        btn.style.border = '1px solid rgba(255,255,255,0.14)';
-        btn.style.background = 'rgba(15,15,15,0.92)';
-        btn.style.color = '#f5f5f5';
-        btn.style.cursor = 'pointer';
-        btn.style.fontSize = '12px';
-        btn.style.fontWeight = '700';
-        btn.style.backdropFilter = 'blur(8px)';
-        btn.style.boxShadow = '0 8px 30px rgba(0,0,0,0.35)';
-        btn.onclick = startPageScan;
-
-        host.appendChild(btn);
-    }
-
-    GM_addStyle(`
-        .ah-scan-badge {
-            position: absolute;
-            top: 50px;
-            right: 0;
-            z-index: 12;
-            min-width: 120px;
-            max-width: 180px;
-            padding: 6px 8px;
-            border-radius: 8px;
-            background: rgba(15,15,15,0.92);
-            border: 1px solid rgba(255,255,255,0.1);
-            color: #f5f5f5;
+        .twx-card-title {
             font-size: 11px;
-            line-height: 1.25;
-            box-shadow: 0 6px 20px rgba(0,0,0,0.25);
-            backdrop-filter: blur(8px);
+            font-weight: 800;
+            color: var(--twx-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 8px;
         }
-        .ah-scan-line {
-            font-size: 11px;
-            margin-bottom: 2px;
+
+        .twx-grid-2 {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
         }
-        .ah-scan-mini {
+
+        .twx-grid-4 {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+        }
+
+        .twx-summary-box {
+            border: 1px solid var(--twx-border);
+            border-radius: 12px;
+            background: rgba(255,255,255,0.03);
+            padding: 10px;
+        }
+
+        .twx-summary-label {
             font-size: 10px;
-            color: #b0b0b0;
+            color: var(--twx-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
         }
-        .ah-scan-badge.good .ah-scan-line,
-        .ah-scan-line.ah-good {
-            color: #86efac;
+
+        .twx-summary-value {
+            margin-top: 4px;
+            font-size: 16px;
+            font-weight: 800;
+            color: var(--twx-text);
         }
-        .ah-scan-badge.mid .ah-scan-line,
-        .ah-scan-line.ah-mid {
-            color: #fde68a;
+
+        .twx-name {
+            font-weight: 800;
+            font-size: 15px;
+            color: var(--twx-text);
         }
-        .ah-scan-badge.bad .ah-scan-line,
-        .ah-scan-line.ah-bad {
-            color: #fca5a5;
+
+        .twx-meta {
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--twx-muted);
         }
-        .ah-scan-badge.working .ah-scan-line,
-        .ah-scan-line.ah-info {
-            color: #c4b5fd;
+
+        .twx-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
         }
-        .ah-scan-panel-top {
+
+        .twx-row {
+            border: 1px solid var(--twx-border);
+            border-radius: 12px;
+            background: rgba(255,255,255,0.03);
+            padding: 10px;
             display: flex;
             justify-content: space-between;
             gap: 10px;
-            align-items: center;
-            margin-bottom: 8px;
         }
-        .ah-scan-panel-actions {
+
+        .twx-row-left {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .twx-row-right {
+            flex-shrink: 0;
+            text-align: right;
+        }
+
+        .twx-price {
+            font-weight: 800;
+            font-size: 14px;
+            color: var(--twx-success);
+        }
+
+        .twx-empty,
+        .twx-loading,
+        .twx-error {
+            border: 1px dashed var(--twx-border);
+            border-radius: 12px;
+            padding: 18px;
+            text-align: center;
+            color: var(--twx-muted);
+        }
+
+        .twx-error {
+            color: var(--twx-danger);
+        }
+
+        .twx-btn-row {
             display: flex;
-            gap: 6px;
+            gap: 8px;
+            flex-wrap: wrap;
         }
-        .ah-scan-control {
-            padding: 4px 8px;
-            border-radius: 6px;
-            border: 1px solid rgba(255,255,255,0.12);
+
+        .twx-btn {
+            border: 1px solid var(--twx-border);
             background: rgba(255,255,255,0.06);
-            color: #f5f5f5;
+            color: var(--twx-text);
+            border-radius: 10px;
+            padding: 8px 12px;
+            font-weight: 700;
+            font-size: 12px;
             cursor: pointer;
-            font-size: 11px;
         }
-        .ah-scan-control:hover {
-            background: rgba(255,255,255,0.12);
+
+        .twx-btn:hover {
+            border-color: var(--twx-accent);
         }
-        .ah-scan-panel-body {
+
+        .twx-field {
             display: flex;
             flex-direction: column;
-            gap: 4px;
+            gap: 6px;
+        }
+
+        .twx-label {
+            font-size: 11px;
+            color: var(--twx-muted);
+        }
+
+        .twx-input {
+            width: 100%;
+            background: rgba(0,0,0,0.2);
+            color: var(--twx-text);
+            border: 1px solid var(--twx-border);
+            border-radius: 10px;
+            padding: 8px 10px;
+            font-size: 12px;
+        }
+
+        @media (max-width: 760px) {
+            .twx-grid-2, .twx-grid-4 {
+                grid-template-columns: 1fr;
+            }
         }
     `);
 
-    // ─── Init ─────────────────────────────────────────────────────────────────────
+    /**********************************************************************
+     * DECORATORS
+     **********************************************************************/
+    const ItemDecorators = {
+        ensureHost(item) {
+            const host =
+                item.imageElement?.closest('.img-wrap') ||
+                item.imageElement?.parentElement ||
+                item.sourceElement ||
+                item.containerElement;
 
-    function init() {
-        createModal();
-        injectPageScanButton();
-        injectButtons();
-        new MutationObserver(() => setTimeout(injectButtons, 200)).observe(document.body, { childList: true, subtree: true });
-        setInterval(injectButtons, 2000);
+            if (!host) return null;
+            host.classList.add('twx-overlay-host');
+            const pos = getComputedStyle(host).position;
+            if (pos === 'static') host.style.position = 'relative';
+            return host;
+        },
+
+ensurePill(item, index) {
+    const titleHost =
+        item.containerElement.querySelector('.title') ||
+        item.containerElement.querySelector('.item-name')?.parentElement ||
+        this.ensureHost(item);
+
+    if (!titleHost || !SettingsStore.get().autoInjectPill) return;
+
+    titleHost.classList.add('twx-title-host');
+
+    let pill = titleHost.querySelector('.twx-pill');
+    if (!pill) {
+        pill = document.createElement('div');
+        pill.className = 'twx-pill';
+        titleHost.prepend(pill);
     }
 
-    document.readyState === 'loading'
-        ? document.addEventListener('DOMContentLoaded', init)
-        : init();
+    const bbLabel = item.bbValue != null ? `BB ${item.bbValue}` : 'BB ?';
+    const pctLabel = Deal.getPercentLabel(item);
+    const rarityColor = BB.rarityColor(item.rarity);
+    const pctColor = Deal.getPercentColor(item);
 
+    pill.innerHTML = `
+        <span class="twx-bb">${Util.escapeHtml(bbLabel)}</span>
+        <span class="twx-sep">|</span>
+        <span class="twx-pct">${Util.escapeHtml(pctLabel)}</span>
+    `;
+
+    pill.style.boxShadow = `0 0 10px ${rarityColor}44`;
+
+    const bbEl = pill.querySelector('.twx-bb');
+    const pctEl = pill.querySelector('.twx-pct');
+
+    if (bbEl) bbEl.style.color = rarityColor;
+    if (pctEl) pctEl.style.color = pctColor;
+
+    pill.onclick = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        await Actions.selectAndPriceItem(index);
+    };
+},
+
+        ensureHistorySummary(item) {
+            const existingAnywhere = item.containerElement.querySelectorAll('.twx-history-summary');
+            if (!item.historySummary) {
+                existingAnywhere.forEach(el => el.remove());
+                return;
+            }
+
+            const host =
+                ((item.containerElement.querySelector('.show-item-info')) &&
+                 getComputedStyle(item.containerElement.querySelector('.show-item-info')).display !== 'none')
+                    ? item.containerElement.querySelector('.show-item-info')
+                    : item.containerElement.querySelector('.item-cont-wrap') ||
+                      item.containerElement;
+
+            if (!host) return;
+
+            let box = host.querySelector('.twx-history-summary');
+            if (!box) {
+                box = document.createElement('div');
+                box.className = 'twx-history-summary';
+                host.appendChild(box);
+            }
+
+            const summary = item.historySummary;
+            box.innerHTML = `
+                <div class="twx-history-title">History</div>
+                <div class="twx-history-line"><span class="k">Last</span><span class="v">${Util.money(summary.lastSold)}</span></div>
+                <div class="twx-history-line"><span class="k">Median</span><span class="v">${Util.money(summary.median)}</span></div>
+                <div class="twx-history-line"><span class="k">Range</span><span class="v">${Util.money(summary.low)} – ${Util.money(summary.high)}</span></div>
+                <div class="twx-history-line"><span class="k">Comps</span><span class="v">${summary.count ?? 0}</span></div>
+            `;
+        },
+
+        refresh(items) {
+            items.forEach((item, index) => {
+                this.ensurePill(item, index);
+                this.ensureHistorySummary(item);
+            });
+        },
+    };
+
+    /**********************************************************************
+     * UI
+     **********************************************************************/
+    const UI = {
+        ensureModal() {
+            let modal = document.getElementById('twx-modal');
+            if (modal) return modal;
+
+            modal = document.createElement('div');
+            modal.id = 'twx-modal';
+            modal.innerHTML = `
+                <div class="twx-header" id="twx-modal-header">
+                    <div>
+                        <div class="twx-title">Auction Pricing</div>
+                        <div class="twx-subtitle" id="twx-modal-subtitle">Select an item</div>
+                    </div>
+                    <button class="twx-close" id="twx-modal-close" aria-label="Close">&times;</button>
+                </div>
+
+                <div class="twx-tabs">
+                    <button class="twx-tab active" data-twx-tab="details">Details</button>
+                    <button class="twx-tab" data-twx-tab="settings">Settings</button>
+                </div>
+
+                <div class="twx-body" id="twx-modal-body"></div>
+            `;
+            document.body.appendChild(modal);
+
+            modal.querySelector('#twx-modal-close')?.addEventListener('click', () => this.closeModal());
+            modal.querySelectorAll('.twx-tab').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    AppState.ui.activeTab = btn.dataset.twxTab;
+                    this.renderActiveItem(AppState.activeItem);
+                });
+            });
+
+            Drag.makeDraggable(modal, modal.querySelector('#twx-modal-header'));
+            return modal;
+        },
+
+        openModal() {
+            this.ensureModal().classList.add('open');
+        },
+
+        closeModal() {
+            document.getElementById('twx-modal')?.classList.remove('open');
+        },
+
+        renderTabs() {
+            const modal = document.getElementById('twx-modal');
+            if (!modal) return;
+            modal.querySelectorAll('.twx-tab').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.twxTab === AppState.ui.activeTab);
+            });
+        },
+
+        renderActiveItem(item) {
+            const subtitle = document.getElementById('twx-modal-subtitle');
+            const body = document.getElementById('twx-modal-body');
+            if (!body || !subtitle) return;
+
+            this.renderTabs();
+
+            if (AppState.ui.activeTab === 'settings') {
+                subtitle.textContent = 'Settings';
+                body.innerHTML = this.renderSettingsTab();
+                this.bindSettingsTab();
+                return;
+            }
+
+            if (!item) {
+                subtitle.textContent = 'Select an item';
+                body.innerHTML = `<div class="twx-empty">No item selected.</div>`;
+                return;
+            }
+
+            subtitle.textContent = `${item.itemName} • ${TypeNormalizer.toDisplayType(item.classification?.normalizedType)}`;
+            const history = item.historySummary;
+            const recentRows = history?.rows?.slice(0, 6) || [];
+            const effectNames = item.effectTypes?.map(x => x.name).filter(Boolean) || [];
+            const targetValue = Deal.getTargetValue(item);
+            const pctLabel = Deal.getPercentLabel(item);
+
+            body.innerHTML = `
+                <div class="twx-card">
+                    <div class="twx-card-title">Item</div>
+                    <div class="twx-grid-2">
+                        <div>
+                            <div class="twx-name">${Util.escapeHtml(item.itemName)}</div>
+                            <div class="twx-meta">${Util.escapeHtml(TypeNormalizer.toDisplayType(item.classification?.normalizedType))} • ${Util.escapeHtml(item.rarity || 'unknown rarity')}</div>
+                            <div class="twx-meta">Seller: ${Util.escapeHtml(item.seller || '—')}</div>
+                            <div class="twx-meta">High bidder: ${Util.escapeHtml(item.highBidder || '—')}</div>
+                            <div class="twx-meta">Bids: ${item.bidCount ?? '—'} • Time left: ${Util.escapeHtml(item.timeLeft || '—')}</div>
+                        </div>
+                        <div>
+                            <div class="twx-meta">Current bid: ${Util.money(item.currentPrice)}</div>
+                            <div class="twx-meta">Target value: ${Util.money(targetValue)}</div>
+                            <div class="twx-meta">% of target: ${Util.escapeHtml(pctLabel)}</div>
+                            <div class="twx-meta">Quality: ${item.sourceStats?.quality ?? '—'}</div>
+                            <div class="twx-meta">Effects: ${Util.escapeHtml(effectNames.join(' • ') || 'None')}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="twx-card">
+                    <div class="twx-card-title">BB</div>
+                    <div class="twx-grid-4">
+                        <div class="twx-summary-box">
+                            <div class="twx-summary-label">Exact BB</div>
+                            <div class="twx-summary-value">${item.bbValue ?? '—'}</div>
+                        </div>
+                        <div class="twx-summary-box">
+                            <div class="twx-summary-label">Type</div>
+                            <div class="twx-summary-value">${Util.escapeHtml(TypeNormalizer.toDisplayType(item.classification?.normalizedType))}</div>
+                        </div>
+                        <div class="twx-summary-box">
+                            <div class="twx-summary-label">Rarity</div>
+                            <div class="twx-summary-value">${Util.escapeHtml(item.rarity || '—')}</div>
+                        </div>
+                        <div class="twx-summary-box">
+                            <div class="twx-summary-label">Effects</div>
+                            <div class="twx-summary-value">${item.effectCount ?? 0}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="twx-card">
+                    <div class="twx-card-title">History Summary</div>
+                    ${history ? `
+                        <div class="twx-grid-4">
+                            <div class="twx-summary-box">
+                                <div class="twx-summary-label">Last Sold</div>
+                                <div class="twx-summary-value">${Util.money(history.lastSold)}</div>
+                            </div>
+                            <div class="twx-summary-box">
+                                <div class="twx-summary-label">Median</div>
+                                <div class="twx-summary-value">${Util.money(history.median)}</div>
+                            </div>
+                            <div class="twx-summary-box">
+                                <div class="twx-summary-label">Range</div>
+                                <div class="twx-summary-value">${Util.money(history.low)} – ${Util.money(history.high)}</div>
+                            </div>
+                            <div class="twx-summary-box">
+                                <div class="twx-summary-label">Comps</div>
+                                <div class="twx-summary-value">${history.count ?? 0}</div>
+                            </div>
+                        </div>
+                    ` : item.historyError ? `
+                        <div class="twx-error">${Util.escapeHtml(item.historyError)}</div>
+                    ` : `
+                        <div class="twx-loading">Loading history…</div>
+                    `}
+                </div>
+
+                <div class="twx-card">
+                    <div class="twx-card-title">Recent Comps</div>
+                    ${recentRows.length ? `
+                        <div class="twx-list">
+                            ${recentRows.map(r => `
+                                <div class="twx-row">
+                                    <div class="twx-row-left">
+                                        <div class="twx-meta">Quality ${r.stat_quality ?? '—'} • DMG ${r.stat_damage ?? '—'} • ACC ${r.stat_accuracy ?? '—'}</div>
+                                    </div>
+                                    <div class="twx-row-right">
+                                        <div class="twx-price">${Util.money(Number(r.price || 0))}</div>
+                                        <div class="twx-meta">${r.timestamp ? new Date(r.timestamp * 1000).toLocaleDateString() : '—'}</div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : `
+                        <div class="twx-empty">No recent comps loaded.</div>
+                    `}
+                </div>
+
+                <div class="twx-card">
+                    <div class="twx-card-title">Actions</div>
+                    <div class="twx-btn-row">
+                        <button class="twx-btn" id="twx-refresh-active">Refresh This Item</button>
+                        <button class="twx-btn" id="twx-price-page-from-modal">Price Entire Page</button>
+                        <button class="twx-btn" id="twx-open-settings">Settings</button>
+                        <button class="twx-btn" id="twx-clear-caches">Clear Cache</button>
+                    </div>
+                </div>
+            `;
+
+            body.querySelector('#twx-refresh-active')?.addEventListener('click', async () => {
+                const idx = AppState.items.findIndex(x => x.rowKey === item.rowKey);
+                if (idx >= 0) await Actions.selectAndPriceItem(idx, true);
+            });
+
+            body.querySelector('#twx-price-page-from-modal')?.addEventListener('click', async () => {
+                await Actions.priceEntirePage();
+            });
+
+            body.querySelector('#twx-open-settings')?.addEventListener('click', () => {
+                AppState.ui.activeTab = 'settings';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            body.querySelector('#twx-clear-caches')?.addEventListener('click', () => {
+                Actions.clearCaches();
+                this.renderActiveItem(item);
+            });
+        },
+
+        renderSettingsTab() {
+            const s = SettingsStore.get();
+            return `
+                <div class="twx-card">
+                    <div class="twx-card-title">Pricing Settings</div>
+                    <div class="twx-grid-2">
+                        <label class="twx-field">
+                            <span class="twx-label">Target $ / BB</span>
+                            <input class="twx-input" id="twx-setting-target-bb" value="${Util.escapeHtml(String(s.targetPerBB))}" placeholder="5500000 or 5.5m">
+                        </label>
+
+                        <label class="twx-field">
+                            <span class="twx-label">Auto Price On Click</span>
+                            <input class="twx-input" id="twx-setting-auto-price" value="${s.autoPriceOnClick ? 'true' : 'false'}" placeholder="true / false">
+                        </label>
+                    </div>
+
+                    <div class="twx-grid-4" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Green ≤</span>
+                            <input class="twx-input" id="twx-setting-pct-good" value="${Util.escapeHtml(String(s.pctGood))}">
+                        </label>
+
+                        <label class="twx-field">
+                            <span class="twx-label">Yellow ≤</span>
+                            <input class="twx-input" id="twx-setting-pct-warn" value="${Util.escapeHtml(String(s.pctWarn))}">
+                        </label>
+
+                        <label class="twx-field">
+                            <span class="twx-label">Orange ≤</span>
+                            <input class="twx-input" id="twx-setting-pct-bad" value="${Util.escapeHtml(String(s.pctBad))}">
+                        </label>
+
+                        <div class="twx-field">
+                            <span class="twx-label">Preview</span>
+                            <div class="twx-meta">Row pill shows BB | %.</div>
+                        </div>
+                    </div>
+
+                    <div class="twx-btn-row" style="margin-top:12px;">
+                        <button class="twx-btn" id="twx-save-settings">Save Settings</button>
+                        <button class="twx-btn" id="twx-back-details">Back to Details</button>
+                    </div>
+                </div>
+            `;
+        },
+
+        bindSettingsTab() {
+            document.getElementById('twx-save-settings')?.addEventListener('click', () => {
+                const targetRaw = document.getElementById('twx-setting-target-bb')?.value ?? '';
+                const targetPerBB = Deal.parseTargetInput(targetRaw);
+
+                const autoPriceRaw = (document.getElementById('twx-setting-auto-price')?.value || '').trim().toLowerCase();
+                const autoPriceOnClick = autoPriceRaw !== 'false';
+
+                const pctGood = Util.tryNumber(document.getElementById('twx-setting-pct-good')?.value) ?? DEFAULT_SETTINGS.pctGood;
+                const pctWarn = Util.tryNumber(document.getElementById('twx-setting-pct-warn')?.value) ?? DEFAULT_SETTINGS.pctWarn;
+                const pctBad = Util.tryNumber(document.getElementById('twx-setting-pct-bad')?.value) ?? DEFAULT_SETTINGS.pctBad;
+
+                SettingsStore.set({
+                    targetPerBB: targetPerBB ?? DEFAULT_SETTINGS.targetPerBB,
+                    autoPriceOnClick,
+                    pctGood,
+                    pctWarn,
+                    pctBad,
+                });
+
+                for (const item of AppState.items) {
+                    item.bbValue = BB.getExactValue(item);
+                }
+
+                ItemDecorators.refresh(AppState.items);
+                AppState.ui.activeTab = 'details';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            document.getElementById('twx-back-details')?.addEventListener('click', () => {
+                AppState.ui.activeTab = 'details';
+                this.renderActiveItem(AppState.activeItem);
+            });
+        },
+
+        ensurePageBatchButton() {
+            let btn = document.getElementById('twx-page-batch-btn');
+
+            if (!Util.pageIsAuction()) {
+                if (btn) btn.remove();
+                return;
+            }
+
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.id = 'twx-page-batch-btn';
+                btn.className = 'twx-page-batch-btn';
+                btn.addEventListener('click', async () => {
+                    if (AppState.batch.running) return;
+                    await Actions.priceEntirePage();
+                });
+                document.body.appendChild(btn);
+            }
+
+            btn.disabled = !!AppState.batch.running;
+            btn.textContent = AppState.batch.running
+                ? `Pricing Page ${AppState.batch.statusText}`
+                : (AppState.batch.statusText
+                    ? `Price Page • ${AppState.batch.statusText}`
+                    : 'Price Entire Auction Page');
+        },
+    };
+
+    /**********************************************************************
+     * DRAG
+     **********************************************************************/
+    const Drag = {
+        makeDraggable(modal, handle) {
+            if (!modal || !handle) return;
+
+            let dragging = false;
+            let startX = 0;
+            let startY = 0;
+            let startLeft = 0;
+            let startTop = 0;
+
+            const saved = Util.safeJsonParse(localStorage.getItem(CFG.MODAL_POS_KEY), null);
+            if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+                modal.style.left = `${saved.left}px`;
+                modal.style.top = `${saved.top}px`;
+                modal.style.transform = 'none';
+            }
+
+            handle.addEventListener('mousedown', (e) => {
+                if (e.target.closest('button')) return;
+                dragging = true;
+                startX = e.clientX;
+                startY = e.clientY;
+
+                const rect = modal.getBoundingClientRect();
+                startLeft = rect.left;
+                startTop = rect.top;
+                document.body.style.userSelect = 'none';
+            });
+
+            window.addEventListener('mousemove', (e) => {
+                if (!dragging) return;
+                const dx = e.clientX - startX;
+                const dy = e.clientY - startY;
+                modal.style.left = `${startLeft + dx}px`;
+                modal.style.top = `${startTop + dy}px`;
+                modal.style.transform = 'none';
+            });
+
+            window.addEventListener('mouseup', () => {
+                if (!dragging) return;
+                dragging = false;
+                document.body.style.userSelect = '';
+                const rect = modal.getBoundingClientRect();
+                localStorage.setItem(CFG.MODAL_POS_KEY, JSON.stringify({ left: rect.left, top: rect.top }));
+            });
+        },
+    };
+
+    /**********************************************************************
+     * ACTIONS
+     **********************************************************************/
+    const Actions = {
+        reparsePage() {
+            const items = AuctionParser.parseAll();
+
+            const byRowKey = new Map(AppState.items.map(item => [item.rowKey, item]));
+            for (const item of items) {
+                const old = byRowKey.get(item.rowKey);
+                if (old?.historySummary && !item.historySummary) {
+                    item.historySummary = old.historySummary;
+                    item.historyRows = old.historyRows || [];
+                    item.historyError = old.historyError || null;
+                }
+            }
+
+            AppState.items = items;
+
+            if (AppState.activeItem) {
+                const same = items.find(x => x.rowKey === AppState.activeItem.rowKey);
+                AppState.activeItem = same || items[0] || null;
+            } else {
+                AppState.activeItem = items[0] || null;
+            }
+
+            ItemDecorators.refresh(items);
+            UI.ensurePageBatchButton();
+
+            const modal = document.getElementById('twx-modal');
+            if (modal?.classList.contains('open')) {
+                UI.renderActiveItem(AppState.activeItem);
+            }
+        },
+
+        clearCaches() {
+            ExpiringStore.clear(CFG.HISTORY_CACHE_KEY);
+            ExpiringStore.clear(CFG.ROW_CACHE_KEY);
+
+            for (const item of AppState.items) {
+                item.historySummary = null;
+                item.historyRows = [];
+                item.historyError = null;
+            }
+
+            ItemDecorators.refresh(AppState.items);
+            UI.ensurePageBatchButton();
+        },
+
+        async selectAndPriceItem(index, forceRefresh = false) {
+            const item = AppState.items[index];
+            if (!item) return;
+
+            AppState.activeItem = item;
+            AppState.ui.activeTab = 'details';
+            UI.openModal();
+            UI.renderActiveItem(item);
+
+            if (SettingsStore.get().autoPriceOnClick || forceRefresh) {
+                await this.priceItem(item, forceRefresh);
+                UI.renderActiveItem(item);
+            }
+        },
+
+        async priceItem(item, forceRefresh = false) {
+            const fpKey = DataAPI.historyKeyFromFingerprint(item.historyFingerprint);
+
+            if (!forceRefresh) {
+                const cached = ExpiringStore.get(CFG.HISTORY_CACHE_KEY, fpKey, CFG.HISTORY_CACHE_TTL_MS);
+                if (cached) {
+                    item.historySummary = cached.summary || null;
+                    item.historyRows = cached.rows || [];
+                    item.historyError = cached.error || null;
+
+                    ExpiringStore.set(CFG.ROW_CACHE_KEY, item.rowKey, {
+                        summary: item.historySummary,
+                        rows: item.historyRows,
+                        error: item.historyError,
+                    });
+
+                    ItemDecorators.ensureHistorySummary(item);
+                    return item.historySummary;
+                }
+            }
+
+            try {
+                const result = await DataAPI.searchAuctionHistory(item.historyFingerprint);
+                const summary = HistoryAnalysis.summarize(result.rows || []);
+
+                item.historySummary = summary;
+                item.historyRows = result.rows || [];
+                item.historyError = null;
+
+                ExpiringStore.set(CFG.HISTORY_CACHE_KEY, fpKey, {
+                    summary,
+                    rows: item.historyRows,
+                    error: null,
+                });
+
+                ExpiringStore.set(CFG.ROW_CACHE_KEY, item.rowKey, {
+                    summary,
+                    rows: item.historyRows,
+                    error: null,
+                });
+
+                ItemDecorators.ensureHistorySummary(item);
+                return summary;
+            } catch (err) {
+                const msg = err?.message || 'History request failed';
+                item.historySummary = {
+                    lastSold: null,
+                    count: 0,
+                    median: null,
+                    low: null,
+                    high: null,
+                    suggested: null,
+                    rows: [],
+                };
+                item.historyRows = [];
+                item.historyError = msg;
+
+                ExpiringStore.set(CFG.HISTORY_CACHE_KEY, fpKey, {
+                    summary: item.historySummary,
+                    rows: [],
+                    error: msg,
+                });
+
+                ExpiringStore.set(CFG.ROW_CACHE_KEY, item.rowKey, {
+                    summary: item.historySummary,
+                    rows: [],
+                    error: msg,
+                });
+
+                ItemDecorators.ensureHistorySummary(item);
+                return item.historySummary;
+            }
+        },
+
+        async priceEntirePage() {
+            const items = AppState.items || [];
+            if (!items.length) return;
+
+            AppState.batch.running = true;
+            AppState.batch.done = 0;
+            AppState.batch.total = items.length;
+            AppState.batch.statusText = `0 / ${items.length}`;
+            UI.ensurePageBatchButton();
+
+            for (let i = 0; i < items.length; i++) {
+                const item = items[i];
+
+                await this.priceItem(item, false);
+
+                AppState.batch.done = i + 1;
+                AppState.batch.statusText = `${i + 1} / ${items.length}`;
+                UI.ensurePageBatchButton();
+
+                if (AppState.activeItem?.rowKey === item.rowKey) {
+                    UI.renderActiveItem(item);
+                }
+
+                if (i < items.length - 1) {
+                    await Util.sleep(CFG.REQUEST_SPACING_MS);
+                }
+            }
+
+            AppState.batch.running = false;
+            AppState.batch.statusText = `Done (${items.length})`;
+            UI.ensurePageBatchButton();
+        },
+    };
+
+    /**********************************************************************
+     * SAFE BOOT / RESCAN
+     **********************************************************************/
+    function bootPass() {
+        try {
+            Actions.reparsePage();
+        } catch (err) {
+            console.error('[TWX] reparse failed', err);
+        }
+    }
+
+    function startBootPasses() {
+        let runs = 0;
+        if (AppState.bootTimer) clearInterval(AppState.bootTimer);
+
+        AppState.bootTimer = setInterval(() => {
+            runs++;
+            bootPass();
+
+            if (runs >= CFG.BOOT_PASS_COUNT) {
+                clearInterval(AppState.bootTimer);
+                AppState.bootTimer = null;
+            }
+        }, CFG.BOOT_PASS_INTERVAL_MS);
+    }
+
+    function startPeriodicRescan() {
+        if (AppState.rescanTimer) clearInterval(AppState.rescanTimer);
+
+        AppState.rescanTimer = setInterval(() => {
+            if (AppState.batch.running) return;
+            bootPass();
+        }, CFG.RESCAN_INTERVAL_MS);
+    }
+
+    /**********************************************************************
+     * INIT
+     **********************************************************************/
+    function init() {
+        if (!Util.pageIsAuction()) return;
+
+        Theme.apply();
+        UI.ensureModal();
+        UI.ensurePageBatchButton();
+
+        startBootPasses();
+        startPeriodicRescan();
+    }
+
+    window.addEventListener('load', () => {
+        setTimeout(init, 1200);
+    });
+
+    setTimeout(() => {
+        if (Util.pageIsAuction()) init();
+    }, 2200);
 })();
