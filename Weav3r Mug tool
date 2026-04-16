@@ -30,6 +30,7 @@
     // Protected/alliance behavior
     skipProtectedTargets: true,
     highlightProtectedBlue: true,
+    hideOutOfRangeTargets: true,
 
     // Bazaar tracker
     enableBazaarTracking: true,
@@ -326,6 +327,9 @@
     .wmh-row-protected {
       outline: 1px solid rgba(96, 165, 250, 0.65) !important;
       box-shadow: inset 0 0 0 9999px rgba(30, 64, 175, 0.14);
+    }
+    .wmh-row-hidden {
+      display: none !important;
     }
   `);
 
@@ -1029,6 +1033,7 @@
     const bsText = truth.estimatedStatsHuman || (Number.isFinite(bs) ? humanizeNumber(bs) : "?");
     const protectedInfo = truth.protectedInfo;
     const hospitalCountdown = statusText === "Hospital" ? getHospitalCountdownText(userId) : "";
+    const hideOutOfRange = !!state.cfg.hideOutOfRangeTargets && Number.isFinite(bs) && !underCap;
 
     if (seller.badgeEl) {
       seller.badgeEl.className = "wmh-badge neutral";
@@ -1060,6 +1065,7 @@
       seller.row.classList.toggle("wmh-row-good", !truth.isProtected && good);
       seller.row.classList.toggle("wmh-row-bad", !truth.isProtected && bad);
       seller.row.classList.toggle("wmh-row-protected", !!(truth.isProtected && state.cfg.highlightProtectedBlue));
+      seller.row.classList.toggle("wmh-row-hidden", hideOutOfRange);
     }
   }
 
@@ -1353,6 +1359,11 @@
           <label for="wmh-highlight-protected" style="margin:0;">Highlight protected targets blue</label>
         </div>
 
+        <div class="wmh-check">
+          <input id="wmh-hide-out-range" type="checkbox">
+          <label for="wmh-hide-out-range" style="margin:0;">Hide out-of-range targets</label>
+        </div>
+
         <div class="wmh-actions">
           <button class="wmh-btn" id="wmh-save">Save</button>
           <button class="wmh-btn wmh-secondary" id="wmh-refresh">Rescan</button>
@@ -1369,6 +1380,7 @@
     const enabled = panel.querySelector("#wmh-enabled");
     const skipProtected = panel.querySelector("#wmh-skip-protected");
     const highlightProtected = panel.querySelector("#wmh-highlight-protected");
+    const hideOutRange = panel.querySelector("#wmh-hide-out-range");
 
     threshold.value = state.cfg.statThresholdText || "";
     batch.value = String(state.cfg.batchSize || 15);
@@ -1376,6 +1388,7 @@
     enabled.checked = !!state.cfg.enabled;
     skipProtected.checked = !!state.cfg.skipProtectedTargets;
     highlightProtected.checked = !!state.cfg.highlightProtectedBlue;
+    hideOutRange.checked = !!state.cfg.hideOutOfRangeTargets;
 
     panel.querySelector("#wmh-save").addEventListener("click", () => {
       state.cfg.statThresholdText = threshold.value.trim();
@@ -1384,6 +1397,7 @@
       state.cfg.enabled = !!enabled.checked;
       state.cfg.skipProtectedTargets = !!skipProtected.checked;
       state.cfg.highlightProtectedBlue = !!highlightProtected.checked;
+      state.cfg.hideOutOfRangeTargets = !!hideOutRange.checked;
 
       state.thresholdValue = parseHumanNumber(state.cfg.statThresholdText);
       saveConfig();
