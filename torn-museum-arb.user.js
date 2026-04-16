@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Museum Arbitrage Helper (API Truth + Tab Coordination + TE Market Value Scraper)
 // @namespace    https://torn.com/
-// @version      0.5.0
+// @version      0.5.1
 // @description  Read-only plushie/flower set helper. API prices drive live pricing; Torn Exchange TE Market Values are scraped from edit price list every 30 minutes and shared across tabs.
 // @author       GPT-5.4 Thinking
 // @match        https://www.torn.com/*
@@ -1473,31 +1473,46 @@
     const tables = Array.from(document.querySelectorAll('table'));
     let bestRows = [];
 
+    const getRowCells = (row) => {
+      const cells = Array.from(row.querySelectorAll('th,td'));
+      if (cells.length) return cells;
+      return Array.from(row.children || []);
+    };
+
     for (const table of tables) {
       const rows = Array.from(table.querySelectorAll('tr'));
       if (!rows.length) continue;
 
-      const headerCells = Array.from(rows[0].querySelectorAll('th,td')).map(el => normalizeItemName(el.textContent));
-      const hasItem = headerCells.some(x => x.includes('item'));
-      const hasTe = headerCells.some(x => x.includes('te market value'));
-      const hasTorn = headerCells.some(x => x.includes('torn market value'));
-
-      if (!hasItem || !hasTe || !hasTorn) continue;
-
+      let headerIdx = -1;
       let itemIdx = -1;
       let tornIdx = -1;
       let teIdx = -1;
 
-      headerCells.forEach((h, i) => {
-        if (itemIdx === -1 && h.includes('item')) itemIdx = i;
-        if (tornIdx === -1 && h.includes('torn market value')) tornIdx = i;
-        if (teIdx === -1 && h.includes('te market value')) teIdx = i;
-      });
+      for (let r = 0; r < rows.length; r++) {
+        const headerCells = getRowCells(rows[r]).map(el => normalizeItemName(el.textContent));
+        if (!headerCells.length) continue;
 
-      if (itemIdx < 0 || teIdx < 0) continue;
+        const hasItem = headerCells.some(x => x.includes('item'));
+        const hasTe = headerCells.some(x => x.includes('te market value'));
+        const hasTorn = headerCells.some(x => x.includes('torn market value'));
+        if (!hasItem || !hasTe || !hasTorn) continue;
+
+        headerCells.forEach((h, i) => {
+          if (itemIdx === -1 && h.includes('item')) itemIdx = i;
+          if (tornIdx === -1 && h.includes('torn market value')) tornIdx = i;
+          if (teIdx === -1 && h.includes('te market value')) teIdx = i;
+        });
+
+        if (itemIdx >= 0 && teIdx >= 0) {
+          headerIdx = r;
+          break;
+        }
+      }
+
+      if (headerIdx < 0 || itemIdx < 0 || teIdx < 0) continue;
 
       const found = [];
-      for (const row of rows.slice(1)) {
+      for (const row of rows.slice(headerIdx + 1)) {
         const cells = Array.from(row.querySelectorAll('td'));
         if (!cells.length) continue;
         if (!cells[itemIdx] || !cells[teIdx]) continue;
