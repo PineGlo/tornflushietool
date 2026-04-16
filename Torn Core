@@ -243,7 +243,19 @@
   }
 
   function saveSettings() {
+    state.cfg.settingsUpdatedAt = now();
     GM_setValue(STORAGE_KEYS.settings, state.cfg);
+  }
+
+  function syncSettingsFromStorage() {
+    const latest = loadSettings();
+    const currentTs = Number(state.cfg?.settingsUpdatedAt || 0);
+    const latestTs = Number(latest?.settingsUpdatedAt || 0);
+
+    if (latestTs <= 0) return;
+    if (latestTs <= currentTs) return;
+
+    state.cfg = { ...latest };
   }
 
   function log(...args) {
@@ -1841,6 +1853,8 @@
   }
 
   function domTick(force = false) {
+    syncSettingsFromStorage();
+
     if (!state.cfg.enabled) {
       restartDomLoop();
       return;
