@@ -2020,6 +2020,7 @@ ensurePill(item, index) {
 
             const modal = document.getElementById('twx-modal');
             if (modal?.classList.contains('open')) {
+                if (AppState.ui.activeTab === 'search') return;
                 UI.renderActiveItem(AppState.activeItem);
             }
         },
