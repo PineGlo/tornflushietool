@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trade Chat Auto Poster
 // @namespace    torn.trade.autoposter
-// @version      3.0.0
+// @version      3.0.1
 // @description  Auto-post a trade message in Torn Trade chat with manual leader tab selection, refresh-persistent leader, jittered timing, and minimize after post.
 // @match        https://www.torn.com/*
 // @grant        GM_getValue
@@ -38,6 +38,8 @@
     const POST_AFTER_FILL_MS = 180;
     const POST_AFTER_SEND_MS = 400;
     const POST_AFTER_MINIMIZE_MS = 250;
+    const SEND_BTN_WAIT_MS = 600;
+    const SEND_BTN_WAIT_STEP_MS = 60;
 
     function getOrCreateSessionTabId() {
         let id = sessionStorage.getItem(SESSION_KEYS.tabId);
@@ -271,7 +273,12 @@
     }
 
     function fireInputEvents(el) {
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            cancelable: false,
+            data: el.value,
+            inputType: 'insertText'
+        }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
@@ -475,14 +482,21 @@
         const textarea = findTradeTextareaWithin(tradePanel);
         if (!textarea) return { ok: false, reason: 'Trade textarea not found.' };
 
-        textarea.focus();
-        await sleep(100);
+        if (document.visibilityState === 'visible') {
+            textarea.focus();
+            await sleep(100);
+        }
 
         setNativeValue(textarea, message);
         fireInputEvents(textarea);
         await sleep(POST_AFTER_FILL_MS);
 
-        const sendBtn = findTradeSendButtonWithin(tradePanel);
+        let sendBtn = findTradeSendButtonWithin(tradePanel);
+        const waitUntil = now() + SEND_BTN_WAIT_MS;
+        while (sendBtn && sendBtn.disabled && now() < waitUntil) {
+            await sleep(SEND_BTN_WAIT_STEP_MS);
+            sendBtn = findTradeSendButtonWithin(tradePanel);
+        }
 
         if (sendBtn && !sendBtn.disabled) {
             sendBtn.click();
