@@ -2139,19 +2139,69 @@
     }
   }
 
-  function renderPanel() {
-    if (!state.panel || isWeav3rPage()) return;
-    const active = document.activeElement?.id;
-    state.panel.innerHTML = buildPanelHtml();
+  function isPanelEditableElement(el) {
+    if (!el || !state.panel) return false;
+    if (!state.panel.contains(el)) return false;
+    return el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT";
+  }
 
-    if (active) {
-      const el = state.panel.querySelector(`#${CSS.escape(active)}`);
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) {
-        const valueLen = el.value.length;
-        el.focus();
-        try { el.setSelectionRange(valueLen, valueLen); } catch {}
+  function capturePanelDraft() {
+    if (!state.panel) return null;
+    const inputs = Array.from(state.panel.querySelectorAll("input, textarea, select"));
+    const byId = {};
+    for (const el of inputs) {
+      if (!el.id) continue;
+      byId[el.id] = el.type === "checkbox"
+        ? { checked: !!el.checked }
+        : { value: String(el.value ?? "") };
+    }
+
+    const activeEl = document.activeElement;
+    const focus = isPanelEditableElement(activeEl)
+      ? {
+          id: activeEl.id || "",
+          start: Number(activeEl.selectionStart),
+          end: Number(activeEl.selectionEnd),
+        }
+      : null;
+
+    return { byId, focus };
+  }
+
+  function restorePanelDraft(draft) {
+    if (!state.panel || !draft?.byId) return;
+    for (const [id, data] of Object.entries(draft.byId)) {
+      const el = state.panel.querySelector(`#${CSS.escape(id)}`);
+      if (!el) continue;
+      if (Object.prototype.hasOwnProperty.call(data, "checked")) {
+        el.checked = !!data.checked;
+      } else if (Object.prototype.hasOwnProperty.call(data, "value")) {
+        el.value = String(data.value ?? "");
       }
     }
+
+    if (!draft.focus?.id) return;
+    const focusEl = state.panel.querySelector(`#${CSS.escape(draft.focus.id)}`);
+    if (!focusEl || !isPanelEditableElement(focusEl)) return;
+
+    focusEl.focus();
+    try {
+      if (Number.isFinite(draft.focus.start) && Number.isFinite(draft.focus.end) && focusEl.setSelectionRange) {
+        focusEl.setSelectionRange(draft.focus.start, draft.focus.end);
+      } else if (focusEl.value != null && focusEl.setSelectionRange) {
+        const len = String(focusEl.value).length;
+        focusEl.setSelectionRange(len, len);
+      }
+    } catch {}
+  }
+
+  function renderPanel() {
+    if (!state.panel || isWeav3rPage()) return;
+    const activeEl = document.activeElement;
+    const shouldPreserveDraft = isPanelEditableElement(activeEl);
+    const draft = shouldPreserveDraft ? capturePanelDraft() : null;
+    state.panel.innerHTML = buildPanelHtml();
+    if (draft) restorePanelDraft(draft);
 
     wirePanelEvents();
   }
