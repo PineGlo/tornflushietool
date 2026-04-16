@@ -9,6 +9,7 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      btrmmuuoofbonmuwrkzg.supabase.co
+// @connect      weav3r.dev
 // @license      MIT
 // ==/UserScript==
 
@@ -354,6 +355,83 @@
             return JSON.stringify(fingerprint);
         },
 
+        buildWeav3rQuery(filters = {}) {
+            const bonus1Name = filters.bonus1Id ? Stats.bonusName(Number(filters.bonus1Id)) : '';
+            const bonus2Name = filters.bonus2Id ? Stats.bonusName(Number(filters.bonus2Id)) : '';
+            const bonusCount = [filters.bonus1Id, filters.bonus2Id].filter(Boolean).length;
+            const weaponType = String(filters.weaponClass || '').toLowerCase();
+            return {
+                tab: filters.itemCategory === 'armor' ? 'armor' : 'weapons',
+                weaponType: weaponType || undefined,
+                weaponName: filters.itemName || undefined,
+                bonus1: bonus1Name || undefined,
+                bonus2: bonus2Name || undefined,
+                bonusCount: bonusCount || undefined,
+                armorPiece: filters.armorPiece || undefined,
+                armorSet: filters.armorSet || undefined,
+                minPrice: filters.priceMin || undefined,
+                maxPrice: filters.priceMax || undefined,
+                minDamage: filters.damageMin || undefined,
+                maxDamage: filters.damageMax || undefined,
+                minAccuracy: filters.accuracyMin || undefined,
+                maxAccuracy: filters.accuracyMax || undefined,
+                minQuality: filters.qualityMin || undefined,
+                maxQuality: filters.qualityMax || undefined,
+                minBonus1Value: filters.bonus1Min || undefined,
+                maxBonus1Value: filters.bonus1Max || undefined,
+                minBonus2Value: filters.bonus2Min || undefined,
+                maxBonus2Value: filters.bonus2Max || undefined,
+                sortField: 'price',
+                sortDirection: 'asc',
+            };
+        },
+
+        normalizeWeav3rRows(rows = []) {
+            return (rows || []).map((row) => {
+                const b1 = row?.bonuses?.additionalProp1 || row?.bonus1 || null;
+                const b2 = row?.bonuses?.additionalProp2 || row?.bonus2 || null;
+                return {
+                    item_name: row?.itemName || row?.weaponName || row?.name || 'Unknown item',
+                    price: Number(row?.price || row?.cost || 0),
+                    stat_damage: row?.damage ?? null,
+                    stat_accuracy: row?.accuracy ?? null,
+                    stat_quality: row?.quality ?? null,
+                    bonus1_name: b1?.bonus || b1?.name || null,
+                    bonus1_value: b1?.value ?? null,
+                    bonus2_name: b2?.bonus || b2?.name || null,
+                    bonus2_value: b2?.value ?? null,
+                    listing_source: row?.source || row?.listingSource || 'market',
+                    seller_id: row?.userId || row?.sellerId || null,
+                    timestamp: row?.createdAt || row?.listedAt || null,
+                    _isLive: true,
+                };
+            });
+        },
+
+        async searchWeav3rLive(filters) {
+            const payload = this.buildWeav3rQuery(filters);
+
+            if (window.TornCore?.request) {
+                const result = await window.TornCore.request('weav3r.ranked.search', payload);
+                if (!result?.ok) throw new Error(result?.error || 'Weav3r API failed via Torn Core');
+                return {
+                    rows: this.normalizeWeav3rRows(result?.rows || result?.data?.rows || []),
+                    total: Number(result?.total || result?.data?.total || 0),
+                };
+            }
+
+            const params = new URLSearchParams();
+            Object.entries(payload).forEach(([key, value]) => {
+                if (value === null || value === undefined || value === '') return;
+                params.set(key, String(value));
+            });
+            const data = await Transport.request('GET', `https://weav3r.dev/api/ranked-weapons?${params.toString()}`);
+            return {
+                rows: this.normalizeWeav3rRows(data?.weapons || []),
+                total: Number(data?.total_count || 0),
+            };
+        },
+
         async searchAuctionHistory(filters) {
             const body = {
                 limit: CFG.MAX_HISTORY_ROWS,
@@ -371,6 +449,10 @@
             if (filters.bonus2Max !== '') body.bonus2_value_max = Number(filters.bonus2Max);
             if (filters.qualityMin !== '') body.quality_min = Number(filters.qualityMin);
             if (filters.qualityMax !== '') body.quality_max = Number(filters.qualityMax);
+            if (filters.itemCategory) body.item_category = filters.itemCategory;
+            if (filters.weaponClass) body.weapon_class = filters.weaponClass;
+            if (filters.armorSet) body.armor_set = filters.armorSet;
+            if (filters.armorPiece) body.armor_piece = filters.armorPiece;
 
             const data = await Transport.request(
                 'POST',
@@ -438,6 +520,13 @@
     const Stats = {
         bonusName(id) {
             return BONUS_BY_ID[id] || `Bonus #${id}`;
+        },
+
+        bonusIdByName(name) {
+            const n = Util.lower(name);
+            if (!n) return null;
+            const found = BONUS_DATA.find((b) => Util.lower(b.title) === n);
+            return found?.id ?? null;
         },
 
         summarizeBonuses(bonuses = []) {
@@ -856,6 +945,31 @@
             activeTab: 'details',
         },
 
+        search: {
+            filters: {
+                itemName: '',
+                bonus1Id: '',
+                bonus1Min: '',
+                bonus1Max: '',
+                bonus2Id: '',
+                bonus2Min: '',
+                bonus2Max: '',
+                qualityMin: '',
+                qualityMax: '',
+                itemCategory: 'weapon',
+                weaponClass: '',
+                armorSet: '',
+                armorPiece: '',
+                includeBazaar: true,
+                includeMarket: true,
+            },
+            rows: [],
+            total: 0,
+            loading: false,
+            error: null,
+            lastRunAt: 0,
+        },
+
         batch: {
             running: false,
             done: 0,
@@ -1252,12 +1366,37 @@
 
         .twx-input {
             width: 100%;
+            box-sizing: border-box;
             background: rgba(0,0,0,0.2);
             color: var(--twx-text);
             border: 1px solid var(--twx-border);
             border-radius: 10px;
             padding: 8px 10px;
             font-size: 12px;
+        }
+
+        .twx-input option {
+            color: #e5e7eb;
+            background: #0b1220;
+        }
+
+        .twx-checkbox-row {
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+
+        .twx-checkbox {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--twx-text);
+            user-select: none;
+        }
+
+        .twx-checkbox input {
+            accent-color: var(--twx-accent);
         }
 
         @media (max-width: 760px) {
@@ -1390,6 +1529,7 @@ ensurePill(item, index) {
 
                 <div class="twx-tabs">
                     <button class="twx-tab active" data-twx-tab="details">Details</button>
+                    <button class="twx-tab" data-twx-tab="search">Search</button>
                     <button class="twx-tab" data-twx-tab="settings">Settings</button>
                 </div>
 
@@ -1431,6 +1571,13 @@ ensurePill(item, index) {
             if (!body || !subtitle) return;
 
             this.renderTabs();
+
+            if (AppState.ui.activeTab === 'search') {
+                subtitle.textContent = 'Search';
+                body.innerHTML = this.renderSearchTab();
+                this.bindSearchTab();
+                return;
+            }
 
             if (AppState.ui.activeTab === 'settings') {
                 subtitle.textContent = 'Settings';
@@ -1549,6 +1696,7 @@ ensurePill(item, index) {
                     <div class="twx-btn-row">
                         <button class="twx-btn" id="twx-refresh-active">Refresh This Item</button>
                         <button class="twx-btn" id="twx-price-page-from-modal">Price Entire Page</button>
+                        <button class="twx-btn" id="twx-open-search">Search</button>
                         <button class="twx-btn" id="twx-open-settings">Settings</button>
                         <button class="twx-btn" id="twx-clear-caches">Clear Cache</button>
                     </div>
@@ -1569,9 +1717,335 @@ ensurePill(item, index) {
                 this.renderActiveItem(AppState.activeItem);
             });
 
+            body.querySelector('#twx-open-search')?.addEventListener('click', () => {
+                AppState.ui.activeTab = 'search';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
             body.querySelector('#twx-clear-caches')?.addEventListener('click', () => {
                 Actions.clearCaches();
                 this.renderActiveItem(item);
+            });
+        },
+
+        renderSearchTab() {
+            const f = AppState.search.filters;
+            const rows = AppState.search.rows || [];
+            const resultRows = this.filterSearchRowsBySource(rows, f);
+            const lastRunText = AppState.search.lastRunAt
+                ? new Date(AppState.search.lastRunAt).toLocaleString()
+                : 'Never';
+            const weaponClassOptions = [
+                { value: '', label: 'All' },
+                { value: 'Primary', label: 'Primary' },
+                { value: 'Secondary', label: 'Secondary' },
+                { value: 'Melee', label: 'Melee' },
+            ];
+
+            return `
+                <div class="twx-card">
+                    <div class="twx-card-title">Search Filters</div>
+                    <div class="twx-btn-row" style="margin-bottom:10px;">
+                        <button class="twx-btn ${f.itemCategory === 'weapon' ? 'twx-tab active' : ''}" id="twx-search-cat-weapon">Weapons</button>
+                        <button class="twx-btn ${f.itemCategory === 'armor' ? 'twx-tab active' : ''}" id="twx-search-cat-armor">Armor</button>
+                    </div>
+                    <div class="twx-grid-2">
+                        <label class="twx-field">
+                            <span class="twx-label">Item Name</span>
+                            <input class="twx-input" id="twx-search-item-name" value="${Util.escapeHtml(String(f.itemName || ''))}" placeholder="e.g. ArmaLite M-15A4">
+                        </label>
+                        <div class="twx-field">
+                            <span class="twx-label">Listing Source</span>
+                            <div class="twx-checkbox-row">
+                                <label class="twx-checkbox"><input id="twx-search-include-bazaar" type="checkbox" ${f.includeBazaar ? 'checked' : ''}>Bazaar listings</label>
+                                <label class="twx-checkbox"><input id="twx-search-include-market" type="checkbox" ${f.includeMarket ? 'checked' : ''}>Market listings</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    ${f.itemCategory === 'weapon' ? `
+                        <div class="twx-grid-2" style="margin-top:10px;">
+                            <label class="twx-field">
+                                <span class="twx-label">Weapon Class</span>
+                                <select class="twx-input" id="twx-search-weapon-class">
+                                    ${weaponClassOptions.map(o => `<option value="${o.value}" ${String(f.weaponClass) === String(o.value) ? 'selected' : ''}>${o.label}</option>`).join('')}
+                                </select>
+                            </label>
+                            <div></div>
+                        </div>
+                    ` : `
+                        <div class="twx-grid-2" style="margin-top:10px;">
+                            <label class="twx-field">
+                                <span class="twx-label">Armor Set</span>
+                                <input class="twx-input" id="twx-search-armor-set" value="${Util.escapeHtml(String(f.armorSet || ''))}" placeholder="e.g. Riot">
+                            </label>
+                            <label class="twx-field">
+                                <span class="twx-label">Armor Piece</span>
+                                <input class="twx-input" id="twx-search-armor-piece" value="${Util.escapeHtml(String(f.armorPiece || ''))}" placeholder="e.g. Helmet">
+                            </label>
+                        </div>
+                    `}
+
+                    <div class="twx-grid-2" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Bonus 1</span>
+                            <select class="twx-input" id="twx-search-bonus1-id">
+                                <option value="">All</option>
+                                ${BONUS_DATA.map(b => `<option value="${b.id}" ${String(f.bonus1Id) === String(b.id) ? 'selected' : ''}>${Util.escapeHtml(b.title)}</option>`).join('')}
+                            </select>
+                        </label>
+                        <div class="twx-grid-2">
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 1 Min %</span>
+                                <input class="twx-input" id="twx-search-bonus1-min" value="${Util.escapeHtml(String(f.bonus1Min ?? ''))}" placeholder="Min">
+                            </label>
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 1 Max %</span>
+                                <input class="twx-input" id="twx-search-bonus1-max" value="${Util.escapeHtml(String(f.bonus1Max ?? ''))}" placeholder="Max">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="twx-grid-2" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Bonus 2</span>
+                            <select class="twx-input" id="twx-search-bonus2-id">
+                                <option value="">All</option>
+                                ${BONUS_DATA.map(b => `<option value="${b.id}" ${String(f.bonus2Id) === String(b.id) ? 'selected' : ''}>${Util.escapeHtml(b.title)}</option>`).join('')}
+                            </select>
+                        </label>
+                        <div class="twx-grid-2">
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 2 Min %</span>
+                                <input class="twx-input" id="twx-search-bonus2-min" value="${Util.escapeHtml(String(f.bonus2Min ?? ''))}" placeholder="Min">
+                            </label>
+                            <label class="twx-field">
+                                <span class="twx-label">Bonus 2 Max %</span>
+                                <input class="twx-input" id="twx-search-bonus2-max" value="${Util.escapeHtml(String(f.bonus2Max ?? ''))}" placeholder="Max">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="twx-grid-2" style="margin-top:10px;">
+                        <label class="twx-field">
+                            <span class="twx-label">Quality Min</span>
+                            <input class="twx-input" id="twx-search-quality-min" value="${Util.escapeHtml(String(f.qualityMin ?? ''))}" placeholder="Min">
+                        </label>
+                        <label class="twx-field">
+                            <span class="twx-label">Quality Max</span>
+                            <input class="twx-input" id="twx-search-quality-max" value="${Util.escapeHtml(String(f.qualityMax ?? ''))}" placeholder="Max">
+                        </label>
+                    </div>
+
+                    <div class="twx-btn-row" style="margin-top:12px;">
+                        <button class="twx-btn" id="twx-search-run">${AppState.search.loading ? 'Searching…' : 'Run Search'}</button>
+                        <button class="twx-btn" id="twx-search-fill-active">Use Active Item</button>
+                        <button class="twx-btn" id="twx-search-clear">Clear</button>
+                    </div>
+                    <div class="twx-meta">Last run: ${Util.escapeHtml(lastRunText)}</div>
+                </div>
+
+                <div class="twx-card">
+                    <div class="twx-card-title">Search Results</div>
+                    <div class="twx-meta">Showing ${resultRows.length} of ${AppState.search.total || 0} rows.</div>
+                    ${AppState.search.error ? `<div class="twx-error" style="margin-top:8px;">${Util.escapeHtml(AppState.search.error)}</div>` : ''}
+                    ${resultRows.length ? `
+                        <div class="twx-list" style="margin-top:10px;">
+                            ${resultRows.map((r) => `
+                                <div class="twx-row">
+                                    <div class="twx-row-left">
+                                        <div class="twx-name">${Util.escapeHtml(r.item_name || 'Unknown item')}</div>
+                                        <div class="twx-meta">${Util.escapeHtml(this.getSearchRowSourceLabel(r, f))} • ${Util.escapeHtml(this.getSearchRowBonusesLabel(r, f))}</div>
+                                        <div class="twx-meta">Q ${r.stat_quality ?? '—'} • DMG ${r.stat_damage ?? '—'} • ACC ${r.stat_accuracy ?? '—'}</div>
+                                    </div>
+                                    <div class="twx-row-right">
+                                        <div class="twx-price">${Util.money(Number(r.price || 0))}</div>
+                                        <div class="twx-meta">${Util.escapeHtml(this.formatSearchRowTimestamp(r.timestamp))}</div>
+                                        ${this.getSearchRowLink(r, f) ? `<a class="twx-meta" href="${Util.escapeHtml(this.getSearchRowLink(r, f))}" target="_blank" rel="noopener noreferrer">Open listing</a>` : ''}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : `<div class="twx-empty" style="margin-top:10px;">${AppState.search.loading ? 'Loading search results…' : 'No results yet.'}</div>`}
+                </div>
+            `;
+        },
+
+        bindSearchTab() {
+            const saveFiltersFromDom = () => {
+                AppState.search.filters.itemName = (document.getElementById('twx-search-item-name')?.value || '').trim();
+                AppState.search.filters.bonus1Id = document.getElementById('twx-search-bonus1-id')?.value || '';
+                AppState.search.filters.bonus1Min = (document.getElementById('twx-search-bonus1-min')?.value || '').trim();
+                AppState.search.filters.bonus1Max = (document.getElementById('twx-search-bonus1-max')?.value || '').trim();
+                AppState.search.filters.bonus2Id = document.getElementById('twx-search-bonus2-id')?.value || '';
+                AppState.search.filters.bonus2Min = (document.getElementById('twx-search-bonus2-min')?.value || '').trim();
+                AppState.search.filters.bonus2Max = (document.getElementById('twx-search-bonus2-max')?.value || '').trim();
+                AppState.search.filters.qualityMin = (document.getElementById('twx-search-quality-min')?.value || '').trim();
+                AppState.search.filters.qualityMax = (document.getElementById('twx-search-quality-max')?.value || '').trim();
+                AppState.search.filters.weaponClass = document.getElementById('twx-search-weapon-class')?.value || '';
+                AppState.search.filters.armorSet = (document.getElementById('twx-search-armor-set')?.value || '').trim();
+                AppState.search.filters.armorPiece = (document.getElementById('twx-search-armor-piece')?.value || '').trim();
+                AppState.search.filters.includeBazaar = !!document.getElementById('twx-search-include-bazaar')?.checked;
+                AppState.search.filters.includeMarket = !!document.getElementById('twx-search-include-market')?.checked;
+            };
+
+            document.getElementById('twx-search-cat-weapon')?.addEventListener('click', () => {
+                AppState.search.filters.itemCategory = 'weapon';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            document.getElementById('twx-search-cat-armor')?.addEventListener('click', () => {
+                AppState.search.filters.itemCategory = 'armor';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            document.getElementById('twx-search-run')?.addEventListener('click', async () => {
+                saveFiltersFromDom();
+                await Actions.runSearch();
+            });
+
+            document.getElementById('twx-search-fill-active')?.addEventListener('click', () => {
+                const item = AppState.activeItem;
+                if (!item) return;
+                AppState.search.filters.itemName = item.itemName || '';
+                AppState.search.filters.bonus1Id = item.effectTypes?.[0]?.id ? String(item.effectTypes[0].id) : '';
+                AppState.search.filters.bonus2Id = item.effectTypes?.[1]?.id ? String(item.effectTypes[1].id) : '';
+                AppState.search.filters.qualityMin = item.sourceStats?.quality != null ? String(item.sourceStats.quality) : '';
+                AppState.search.filters.qualityMax = item.sourceStats?.quality != null ? String(item.sourceStats.quality) : '';
+                this.renderActiveItem(AppState.activeItem);
+            });
+
+            document.getElementById('twx-search-clear')?.addEventListener('click', () => {
+                AppState.search.filters = {
+                    itemName: '',
+                    bonus1Id: '',
+                    bonus1Min: '',
+                    bonus1Max: '',
+                    bonus2Id: '',
+                    bonus2Min: '',
+                    bonus2Max: '',
+                    qualityMin: '',
+                    qualityMax: '',
+                    itemCategory: 'weapon',
+                    weaponClass: '',
+                    armorSet: '',
+                    armorPiece: '',
+                    includeBazaar: true,
+                    includeMarket: true,
+                };
+                AppState.search.rows = [];
+                AppState.search.total = 0;
+                AppState.search.error = null;
+                this.renderActiveItem(AppState.activeItem);
+            });
+        },
+
+        getRowSourceToken(row) {
+            const raw = String(
+                row?.listing_source ||
+                row?.source ||
+                row?.origin ||
+                row?.market_source ||
+                row?.listing_type ||
+                row?.source_type ||
+                row?.table_name ||
+                ''
+            ).toLowerCase();
+            if (raw.includes('bazaar')) return 'bazaar';
+            if (raw.includes('market') || raw.includes('itemmarket')) return 'market';
+            return '';
+        },
+
+        formatSearchRowTimestamp(timestamp) {
+            if (timestamp == null || timestamp === '') return '—';
+            if (typeof timestamp === 'number') {
+                const ms = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000;
+                return new Date(ms).toLocaleString();
+            }
+            const asNum = Number(timestamp);
+            if (Number.isFinite(asNum)) {
+                const ms = asNum > 10_000_000_000 ? asNum : asNum * 1000;
+                return new Date(ms).toLocaleString();
+            }
+            const parsed = new Date(String(timestamp));
+            if (Number.isNaN(parsed.getTime())) return '—';
+            return parsed.toLocaleString();
+        },
+
+        getSearchRowSourceLabel(row, filters = null) {
+            const src = this.getRowSourceToken(row);
+            if (src === 'bazaar') return 'Bazaar';
+            if (src === 'market') return 'Market';
+            if (filters?.includeBazaar && !filters?.includeMarket) return 'Bazaar';
+            if (!filters?.includeBazaar && filters?.includeMarket) return 'Market';
+            return 'Historical listing';
+        },
+
+        getSearchRowBonusesLabel(row, filters = null) {
+            const b1Id = row?.bonus1_id ?? row?.bonus_1_id ?? row?.b1_id ?? row?.bonus1;
+            const b2Id = row?.bonus2_id ?? row?.bonus_2_id ?? row?.b2_id ?? row?.bonus2;
+            const b1NameRaw = row?.bonus1_name ?? row?.bonus_1_name ?? row?.bonus1_title ?? null;
+            const b2NameRaw = row?.bonus2_name ?? row?.bonus_2_name ?? row?.bonus2_title ?? null;
+            const b1Name = b1NameRaw || (b1Id ? Stats.bonusName(Number(b1Id)) : (filters?.bonus1Id ? Stats.bonusName(Number(filters.bonus1Id)) : null));
+            const b2Name = b2NameRaw || (b2Id ? Stats.bonusName(Number(b2Id)) : (filters?.bonus2Id ? Stats.bonusName(Number(filters.bonus2Id)) : null));
+            const b1v = row?.bonus1_value ?? row?.bonus_1_value;
+            const b2v = row?.bonus2_value ?? row?.bonus_2_value;
+            const p1 = b1Name ? `${b1Name}${b1v != null ? ` ${b1v}%` : ''}` : null;
+            const p2 = b2Name ? `${b2Name}${b2v != null ? ` ${b2v}%` : ''}` : null;
+            return [p1, p2].filter(Boolean).join(' • ') || 'No bonuses';
+        },
+
+        getSearchRowLink(row, filters) {
+            let source = this.getRowSourceToken(row);
+            if (!source && filters?.includeBazaar && !filters?.includeMarket) source = 'bazaar';
+            if (!source && !filters?.includeBazaar && filters?.includeMarket) source = 'market';
+            if (source === 'bazaar') {
+                const userIdRaw =
+                    row?.seller_id ?? row?.sellerId ??
+                    row?.user_id ?? row?.userId ??
+                    row?.owner_id ?? row?.ownerId ??
+                    row?.uid ?? row?.userid ?? row?.bazaar_user_id;
+                const userId = Number(userIdRaw);
+                if (!Number.isFinite(userId) || userId <= 0) return '';
+                return `https://www.torn.com/bazaar.php?userId=${userId}`;
+            }
+
+            if (source === 'market') {
+                const wc = String(filters?.weaponClass || '').toLowerCase();
+                const categoryName = filters?.itemCategory === 'armor'
+                    ? 'Armor'
+                    : (wc === 'secondary' ? 'Secondary' : wc === 'melee' ? 'Melee' : 'Primary');
+                const params = [
+                    `categoryName=${categoryName}`,
+                    'sortField=price',
+                    'sortOrder=ASC',
+                ];
+
+                const bonus1Name = row?.bonus1_name ?? row?.bonus_1_name ?? null;
+                const bonus1Id = row?.bonus1_id || row?.bonus_1_id || filters?.bonus1Id || Stats.bonusIdByName(bonus1Name);
+                if (bonus1Id) params.push(`bonuses[0]=${Number(bonus1Id)}`);
+
+                const damageTo = row?.stat_damage ?? filters?.damageMax;
+                const accuracyTo = row?.stat_accuracy ?? filters?.accuracyMax;
+                if (damageTo != null && damageTo !== '') params.push(`damageTo=${Math.round(Number(damageTo))}`);
+                if (accuracyTo != null && accuracyTo !== '') params.push(`accuracyTo=${Math.round(Number(accuracyTo))}`);
+
+                return `https://www.torn.com/page.php?sid=ItemMarket#/market/view=category&${params.join('&')}`;
+            }
+
+            return '';
+        },
+
+        filterSearchRowsBySource(rows, filters) {
+            const includeBazaar = !!filters.includeBazaar;
+            const includeMarket = !!filters.includeMarket;
+            if (includeBazaar && includeMarket) return rows;
+            if (!includeBazaar && !includeMarket) return [];
+            return rows.filter((row) => {
+                const src = this.getRowSourceToken(row);
+                if (src === 'bazaar') return includeBazaar;
+                if (src === 'market') return includeMarket;
+                return includeBazaar || includeMarket;
             });
         },
 
@@ -1767,6 +2241,7 @@ ensurePill(item, index) {
 
             const modal = document.getElementById('twx-modal');
             if (modal?.classList.contains('open')) {
+                if (AppState.ui.activeTab === 'search') return;
                 UI.renderActiveItem(AppState.activeItem);
             }
         },
@@ -1783,6 +2258,33 @@ ensurePill(item, index) {
 
             ItemDecorators.refresh(AppState.items);
             UI.ensurePageBatchButton();
+        },
+
+        async runSearch() {
+            AppState.search.loading = true;
+            AppState.search.error = null;
+            UI.renderActiveItem(AppState.activeItem);
+
+            try {
+                const [historyResult, liveResult] = await Promise.all([
+                    DataAPI.searchAuctionHistory(AppState.search.filters).catch((err) => ({ rows: [], total: 0, _error: err })),
+                    DataAPI.searchWeav3rLive(AppState.search.filters).catch((err) => ({ rows: [], total: 0, _error: err })),
+                ]);
+
+                AppState.search.rows = [...(liveResult.rows || []), ...(historyResult.rows || [])];
+                AppState.search.total = Number((historyResult.total || 0) + (liveResult.total || 0));
+                AppState.search.lastRunAt = Date.now();
+                if (historyResult._error && liveResult._error) {
+                    throw new Error(`History: ${historyResult._error?.message || 'failed'} | Live: ${liveResult._error?.message || 'failed'}`);
+                }
+            } catch (err) {
+                AppState.search.rows = [];
+                AppState.search.total = 0;
+                AppState.search.error = err?.message || 'Search failed';
+            } finally {
+                AppState.search.loading = false;
+                UI.renderActiveItem(AppState.activeItem);
+            }
         },
 
         async selectAndPriceItem(index, forceRefresh = false) {

@@ -11,6 +11,7 @@
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
 // @connect      ffscouter.com
+// @connect      weav3r.dev
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -1245,6 +1246,60 @@
     });
   }
 
+  function requestWeav3rRankedApi(payload = {}) {
+    return new Promise((resolve) => {
+      const params = new URLSearchParams();
+      const allowed = [
+        "tab", "weaponType", "weaponName", "rarity",
+        "bonus1", "bonus2", "bonusCount",
+        "armorPiece", "armorSet",
+        "minPrice", "maxPrice",
+        "minDamage", "maxDamage",
+        "minAccuracy", "maxAccuracy",
+        "minQuality", "maxQuality",
+        "minBonus1Value", "maxBonus1Value",
+        "minBonus2Value", "maxBonus2Value",
+        "sortField", "sortDirection",
+      ];
+
+      allowed.forEach((key) => {
+        const value = payload?.[key];
+        if (value === null || value === undefined || value === "") return;
+        params.set(key, String(value));
+      });
+
+      if (![...params.keys()].length) {
+        resolve({ ok: true, source: "weav3r_api", rows: [], total: 0 });
+        return;
+      }
+
+      const url = `https://weav3r.dev/api/ranked-weapons?${params.toString()}`;
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (response) => {
+          try {
+            if (!response || response.status !== 200) {
+              resolve({ ok: false, source: "weav3r_api", error: `Weav3r API status ${response?.status || "unknown"}` });
+              return;
+            }
+            const data = JSON.parse(response.responseText || "{}");
+            resolve({
+              ok: true,
+              source: "weav3r_api",
+              rows: Array.isArray(data?.weapons) ? data.weapons : [],
+              total: Number(data?.total_count || 0),
+            });
+          } catch {
+            resolve({ ok: false, source: "weav3r_api", error: "Weav3r parse error" });
+          }
+        },
+        onerror: () => resolve({ ok: false, source: "weav3r_api", error: "Weav3r network error" }),
+        ontimeout: () => resolve({ ok: false, source: "weav3r_api", error: "Weav3r timeout" }),
+      });
+    });
+  }
+
   function openIndexedDb(dbName) {
     return new Promise((resolve, reject) => {
       try {
@@ -1740,6 +1795,9 @@
 
       case "faction.hospital.refresh":
         return refreshFactionHospitalMembers(!!payload.force);
+
+      case "weav3r.ranked.search":
+        return requestWeav3rRankedApi(payload || {});
 
       case "user.refresh.attackLoader": {
         const userId = Number(payload.userId);
