@@ -543,6 +543,20 @@
         }
     }
 
+    function forceResetAllLeaderState(claimAfter = true) {
+        localStorage.removeItem(KEYS.leaderState);
+        localStorage.removeItem(KEYS.leaderLockedTab);
+        if (bc) {
+            try {
+                bc.postMessage({ type: 'leader-released', tabId: TAB_ID, forced: true });
+            } catch {}
+        }
+        if (claimAfter) {
+            maybeClaimLeadership(true);
+        }
+        updateUIStatus();
+    }
+
     function buildDepositRequest(source = 'manual') {
         return {
             requestId: `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1295,12 +1309,13 @@
         const pauseToggle = document.createElement('button');
         const testBtn = document.createElement('button');
         const testFactionBtn = document.createElement('button');
+        const fixLeaderBtn = document.createElement('button');
         const settingsToggle = document.createElement('button');
         const leaderWrap = document.createElement('label');
         const leaderCheckbox = document.createElement('input');
         const leaderText = document.createElement('span');
 
-        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, settingsToggle].forEach(btn => {
+        [autoToggle, cashToggle, pauseToggle, testBtn, testFactionBtn, fixLeaderBtn, settingsToggle].forEach(btn => {
             Object.assign(btn.style, {
                 padding: '8px 10px',
                 color: '#fff',
@@ -1405,6 +1420,12 @@
             setDepositRequest(payload);
             await sleep(rand());
             processDepositFlow();
+        };
+
+        fixLeaderBtn.textContent = 'Fix Leader (Reset)';
+        fixLeaderBtn.style.background = '#5C1F2A';
+        fixLeaderBtn.onclick = () => {
+            forceResetAllLeaderState(true);
         };
 
         settingsToggle.onclick = () => {
@@ -1517,6 +1538,7 @@
         body.appendChild(pauseToggle);
         body.appendChild(testBtn);
         body.appendChild(testFactionBtn);
+        body.appendChild(fixLeaderBtn);
         body.appendChild(leaderWrap);
         body.appendChild(uiStatusEl);
         body.appendChild(uiCashEl);
