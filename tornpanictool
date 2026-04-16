@@ -559,26 +559,42 @@
         }
     }
 
+    function findActionControl(root, matcher) {
+        if (!root) return null;
+        const controls = Array.from(root.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]'));
+        return controls.find(ctrl => {
+            const txt = ((ctrl.textContent || '') + ' ' + (ctrl.value || '')).replace(/\s+/g, ' ').trim();
+            return matcher.test(txt);
+        }) || null;
+    }
+
     function getDepositForm() {
-        return document.querySelector('form.vault-cont.right.deposit-box');
+        return document.querySelector('form.vault-cont.right.deposit-box')
+            || document.querySelector('form[class*="deposit"]')
+            || document.querySelector('.vault-cont.right.deposit-box')
+            || document.querySelector('[class*="deposit-box"]');
     }
 
     function getMaxBtn() {
         const form = getDepositForm();
-        return form?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+        return findActionControl(form, /^(max|all)$/i)
+            || form?.querySelector('span.input-money-symbol input.wai-btn[type="button"]')
+            || null;
     }
 
     function getDepositBtn() {
         const form = getDepositForm();
-        return Array.from(form?.querySelectorAll('input.torn-btn[type="submit"]') || [])
-            .find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT') || null;
+        return findActionControl(form, /^deposit$/i)
+            || Array.from(form?.querySelectorAll('input.torn-btn[type="submit"]') || [])
+                .find(btn => (btn.value || '').trim().toUpperCase() === 'DEPOSIT')
+            || null;
     }
 
     function getDepositAmountInput() {
         const form = getDepositForm();
         if (!form) return null;
 
-        return form.querySelector('input[name="money"], input[name="amount"], input[type="text"], input[type="number"]') || null;
+        return form.querySelector('input[name="money"], input[name="amount"], input[class*="input-money"], input[type="text"], input[type="number"]') || null;
     }
 
     function getFactionMoneyGroup() {
@@ -587,7 +603,9 @@
 
     function getFactionMaxBtn() {
         const group = getFactionMoneyGroup();
-        return group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]') || null;
+        return findActionControl(group, /^(max|all)$/i)
+            || group?.querySelector('span.input-money-symbol input.wai-btn[type="button"]')
+            || null;
     }
 
     function getFactionAmountInput() {
@@ -597,8 +615,10 @@
     }
 
     function getFactionDepositBtn() {
-        return Array.from(document.querySelectorAll('button.torn-btn'))
-            .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY') || null;
+        return findActionControl(document, /deposit money|deposit/i)
+            || Array.from(document.querySelectorAll('button.torn-btn'))
+                .find(btn => (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'DEPOSIT MONEY')
+            || null;
     }
 
     function getFactionConfirmYesBtn() {
@@ -1351,7 +1371,7 @@
             if (!amLeader()) {
                 maybeClaimLeadership(true);
             }
-            await maybeAutoDeposit('test', 999);
+            await requestDeposit('manual:test-trigger');
         };
 
         testFactionBtn.textContent = 'Test Faction Fallback';
