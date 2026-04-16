@@ -9,6 +9,7 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      btrmmuuoofbonmuwrkzg.supabase.co
+// @connect      weav3r.dev
 // @license      MIT
 // ==/UserScript==
 
@@ -352,6 +353,83 @@
     const DataAPI = {
         historyKeyFromFingerprint(fingerprint) {
             return JSON.stringify(fingerprint);
+        },
+
+        buildWeav3rQuery(filters = {}) {
+            const bonus1Name = filters.bonus1Id ? Stats.bonusName(Number(filters.bonus1Id)) : '';
+            const bonus2Name = filters.bonus2Id ? Stats.bonusName(Number(filters.bonus2Id)) : '';
+            const bonusCount = [filters.bonus1Id, filters.bonus2Id].filter(Boolean).length;
+            const weaponType = String(filters.weaponClass || '').toLowerCase();
+            return {
+                tab: filters.itemCategory === 'armor' ? 'armor' : 'weapons',
+                weaponType: weaponType || undefined,
+                weaponName: filters.itemName || undefined,
+                bonus1: bonus1Name || undefined,
+                bonus2: bonus2Name || undefined,
+                bonusCount: bonusCount || undefined,
+                armorPiece: filters.armorPiece || undefined,
+                armorSet: filters.armorSet || undefined,
+                minPrice: filters.priceMin || undefined,
+                maxPrice: filters.priceMax || undefined,
+                minDamage: filters.damageMin || undefined,
+                maxDamage: filters.damageMax || undefined,
+                minAccuracy: filters.accuracyMin || undefined,
+                maxAccuracy: filters.accuracyMax || undefined,
+                minQuality: filters.qualityMin || undefined,
+                maxQuality: filters.qualityMax || undefined,
+                minBonus1Value: filters.bonus1Min || undefined,
+                maxBonus1Value: filters.bonus1Max || undefined,
+                minBonus2Value: filters.bonus2Min || undefined,
+                maxBonus2Value: filters.bonus2Max || undefined,
+                sortField: 'price',
+                sortDirection: 'asc',
+            };
+        },
+
+        normalizeWeav3rRows(rows = []) {
+            return (rows || []).map((row) => {
+                const b1 = row?.bonuses?.additionalProp1 || row?.bonus1 || null;
+                const b2 = row?.bonuses?.additionalProp2 || row?.bonus2 || null;
+                return {
+                    item_name: row?.itemName || row?.weaponName || row?.name || 'Unknown item',
+                    price: Number(row?.price || row?.cost || 0),
+                    stat_damage: row?.damage ?? null,
+                    stat_accuracy: row?.accuracy ?? null,
+                    stat_quality: row?.quality ?? null,
+                    bonus1_name: b1?.bonus || b1?.name || null,
+                    bonus1_value: b1?.value ?? null,
+                    bonus2_name: b2?.bonus || b2?.name || null,
+                    bonus2_value: b2?.value ?? null,
+                    listing_source: row?.source || row?.listingSource || 'market',
+                    seller_id: row?.userId || row?.sellerId || null,
+                    timestamp: row?.createdAt || row?.listedAt || null,
+                    _isLive: true,
+                };
+            });
+        },
+
+        async searchWeav3rLive(filters) {
+            const payload = this.buildWeav3rQuery(filters);
+
+            if (window.TornCore?.request) {
+                const result = await window.TornCore.request('weav3r.ranked.search', payload);
+                if (!result?.ok) throw new Error(result?.error || 'Weav3r API failed via Torn Core');
+                return {
+                    rows: this.normalizeWeav3rRows(result?.rows || result?.data?.rows || []),
+                    total: Number(result?.total || result?.data?.total || 0),
+                };
+            }
+
+            const params = new URLSearchParams();
+            Object.entries(payload).forEach(([key, value]) => {
+                if (value === null || value === undefined || value === '') return;
+                params.set(key, String(value));
+            });
+            const data = await Transport.request('GET', `https://weav3r.dev/api/ranked-weapons?${params.toString()}`);
+            return {
+                rows: this.normalizeWeav3rRows(data?.weapons || []),
+                total: Number(data?.total_count || 0),
+            };
         },
 
         async searchAuctionHistory(filters) {
@@ -1775,7 +1853,7 @@ ensurePill(item, index) {
                                     </div>
                                     <div class="twx-row-right">
                                         <div class="twx-price">${Util.money(Number(r.price || 0))}</div>
-                                        <div class="twx-meta">${r.timestamp ? new Date(r.timestamp * 1000).toLocaleString() : '—'}</div>
+                                        <div class="twx-meta">${Util.escapeHtml(this.formatSearchRowTimestamp(r.timestamp))}</div>
                                         ${this.getSearchRowLink(r, f) ? `<a class="twx-meta" href="${Util.escapeHtml(this.getSearchRowLink(r, f))}" target="_blank" rel="noopener noreferrer">Open listing</a>` : ''}
                                     </div>
                                 </div>
@@ -1869,6 +1947,22 @@ ensurePill(item, index) {
             if (raw.includes('bazaar')) return 'bazaar';
             if (raw.includes('market') || raw.includes('itemmarket')) return 'market';
             return '';
+        },
+
+        formatSearchRowTimestamp(timestamp) {
+            if (timestamp == null || timestamp === '') return '—';
+            if (typeof timestamp === 'number') {
+                const ms = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000;
+                return new Date(ms).toLocaleString();
+            }
+            const asNum = Number(timestamp);
+            if (Number.isFinite(asNum)) {
+                const ms = asNum > 10_000_000_000 ? asNum : asNum * 1000;
+                return new Date(ms).toLocaleString();
+            }
+            const parsed = new Date(String(timestamp));
+            if (Number.isNaN(parsed.getTime())) return '—';
+            return parsed.toLocaleString();
         },
 
         getSearchRowSourceLabel(row, filters = null) {
@@ -2158,10 +2252,17 @@ ensurePill(item, index) {
             UI.renderActiveItem(AppState.activeItem);
 
             try {
-                const result = await DataAPI.searchAuctionHistory(AppState.search.filters);
-                AppState.search.rows = result.rows || [];
-                AppState.search.total = Number(result.total || 0);
+                const [historyResult, liveResult] = await Promise.all([
+                    DataAPI.searchAuctionHistory(AppState.search.filters).catch((err) => ({ rows: [], total: 0, _error: err })),
+                    DataAPI.searchWeav3rLive(AppState.search.filters).catch((err) => ({ rows: [], total: 0, _error: err })),
+                ]);
+
+                AppState.search.rows = [...(liveResult.rows || []), ...(historyResult.rows || [])];
+                AppState.search.total = Number((historyResult.total || 0) + (liveResult.total || 0));
                 AppState.search.lastRunAt = Date.now();
+                if (historyResult._error && liveResult._error) {
+                    throw new Error(`History: ${historyResult._error?.message || 'failed'} | Live: ${liveResult._error?.message || 'failed'}`);
+                }
             } catch (err) {
                 AppState.search.rows = [];
                 AppState.search.total = 0;
