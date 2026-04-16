@@ -53,6 +53,7 @@
     sellers: new Map(),
     coreClient: null,
     coreMode: "offline",
+    lastFactionHospitalRequestAt: 0,
     bridgeSnapshotTs: 0,
     domBridgeSnapshot: null,
     domBridgeTimer: null,
@@ -1078,6 +1079,7 @@
         subscribe: (cb) => window.TornCore.subscribe ? window.TornCore.subscribe(cb) : (() => {}),
         requestUsersFFRefresh: (userIds) => window.TornCore.request("user.refresh.ff.batch", { userIds }),
         requestUsersTornRefresh: (userIds, opts = {}) => window.TornCore.request("user.refresh.torn.batch", { userIds, ...opts }),
+        requestFactionHospitalRefresh: (force = false) => window.TornCore.request("faction.hospital.refresh", { force }),
       };
     }
 
@@ -1088,6 +1090,7 @@
         subscribe: () => (() => {}),
         requestUsersFFRefresh: (userIds) => requestDomBridge("user.refresh.ff.batch", { userIds }),
         requestUsersTornRefresh: (userIds, opts = {}) => requestDomBridge("user.refresh.torn.batch", { userIds, ...opts }),
+        requestFactionHospitalRefresh: (force = false) => requestDomBridge("faction.hospital.refresh", { force }),
       };
     }
 
@@ -1118,6 +1121,7 @@
         },
         requestUsersFFRefresh: (userIds) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "user.refresh.ff.batch", { userIds }),
         requestUsersTornRefresh: (userIds, opts = {}) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "user.refresh.torn.batch", { userIds, ...opts }),
+        requestFactionHospitalRefresh: (force = false) => requestBridgeBroker(bridgeRequestKey, bridgeResponseKey, "faction.hospital.refresh", { force }),
       };
     }
 
@@ -1127,6 +1131,7 @@
       subscribe: () => (() => {}),
       requestUsersFFRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
       requestUsersTornRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
+      requestFactionHospitalRefresh: async () => ({ ok: false, error: "No Torn Core client available." }),
     };
   }
 
@@ -1217,6 +1222,12 @@
 
     state.coreClient = createCoreClient();
     state.coreMode = state.coreClient.mode;
+
+    const factionBatchDue = (now() - Number(state.lastFactionHospitalRequestAt || 0)) > 20000;
+    if (factionBatchDue) {
+      state.lastFactionHospitalRequestAt = now();
+      state.coreClient.requestFactionHospitalRefresh(false).catch((err) => log("Faction hospital refresh failed", err));
+    }
 
     scanPage();
 

@@ -77,6 +77,9 @@
     allianceSkipPollingProtected: true,
     allianceRefreshMs: 3 * 24 * 60 * 60 * 1000,
     protectedFactionsText: DEFAULT_PROTECTED_FACTIONS.map((f) => `${f.id}|${f.name}`).join("\n"),
+    factionHospitalEnabled: true,
+    factionHospitalRefreshMs: 30 * 1000,
+    factionHospitalFactionId: 0,
   };
 
   const SOURCE_PRIORITY = {
@@ -101,6 +104,7 @@
       leader: null,
       bridge: null,
       protection: null,
+      factionHospital: null,
     },
 
     brokerSeq: 0,
@@ -215,6 +219,13 @@
       protectedMembers: {
         byUserId: {},
         factionIds: [],
+        lastRefreshAt: 0,
+        lastError: "",
+      },
+      factionHospital: {
+        factionId: null,
+        factionName: "",
+        members: 0,
         lastRefreshAt: 0,
         lastError: "",
       },
@@ -385,6 +396,24 @@
     return out;
   }
 
+  function detectFactionIdFromDom() {
+    const selectors = [
+      'a[href*="factions.php?step=profile&ID="]',
+      'a[href*="factions.php?step=your"]',
+    ];
+    for (const selector of selectors) {
+      const anchors = Array.from(document.querySelectorAll(selector));
+      for (const anchor of anchors) {
+        const href = String(anchor?.href || "");
+        const match = href.match(/factions\.php\?step=profile&ID=(\d+)/i);
+        if (!match) continue;
+        const factionId = Number(match[1]);
+        if (Number.isFinite(factionId) && factionId > 0) return factionId;
+      }
+    }
+    return null;
+  }
+
   function ensureCoreShape() {
     if (!state.core.api) state.core.api = {};
     if (!state.core.api.cache) state.core.api.cache = { torn: {}, ff: {} };
@@ -425,6 +454,15 @@
       state.core.protectedMembers = {
         byUserId: {},
         factionIds: [],
+        lastRefreshAt: 0,
+        lastError: "",
+      };
+    }
+    if (!state.core.factionHospital) {
+      state.core.factionHospital = {
+        factionId: null,
+        factionName: "",
+        members: 0,
         lastRefreshAt: 0,
         lastError: "",
       };
@@ -1526,6 +1564,96 @@
     };
   }
 
+  async function refreshFactionHospitalMembers(force = false) {
+    ensureCoreShape();
+    if (!state.cfg.factionHospitalEnabled) {
+      state.core.factionHospital = {
+        factionId: null,
+        factionName: "",
+        members: 0,
+        lastRefreshAt: 0,
+        lastError: "",
+      };
+      publishCore(true);
+      return { ok: true, source: "policy", data: { enabled: false, members: 0 } };
+    }
+
+    const refreshMs = Math.max(5000, Number(state.cfg.factionHospitalRefreshMs) || 30000);
+    const detectedFactionId = detectFactionIdFromDom();
+    const factionId = Number(state.cfg.factionHospitalFactionId) || detectedFactionId || Number(state.core.factionHospital.factionId) || 0;
+    if (!Number.isFinite(factionId) || factionId <= 0) {
+      state.core.factionHospital.lastError = "No faction ID set/detected for faction hospital batching.";
+      publishCore(true);
+      return { ok: false, source: "policy", error: state.core.factionHospital.lastError };
+    }
+
+    if (!force && state.core.factionHospital.lastRefreshAt && (now() - Number(state.core.factionHospital.lastRefreshAt)) < refreshMs) {
+      return {
+        ok: true,
+        source: "cache",
+        data: {
+          factionId,
+          members: Number(state.core.factionHospital.members || 0),
+          lastRefreshAt: Number(state.core.factionHospital.lastRefreshAt || 0),
+        },
+      };
+    }
+
+    const result = await requestFactionMembersApi(factionId);
+    if (!result.ok) {
+      state.core.factionHospital.factionId = factionId;
+      state.core.factionHospital.lastError = result.error || "Faction hospital refresh failed";
+      state.core.factionHospital.lastRefreshAt = now();
+      publishCore(true);
+      return { ok: false, source: "faction_members_api", error: state.core.factionHospital.lastError };
+    }
+
+    const membersObj = result.members || {};
+    let memberCount = 0;
+    let factionName = "";
+    for (const [userIdRaw, member] of Object.entries(membersObj)) {
+      const userId = Number(userIdRaw);
+      if (!Number.isFinite(userId)) continue;
+      memberCount++;
+      const memberName = normalizeText(member?.name || "");
+      const status = normalizeStatusText(member?.status?.state || member?.status?.description || "");
+      const hospitalUntil = toEpochMs(member?.status?.until);
+      factionName = factionName || normalizeText(member?.faction?.faction_name || member?.faction_name || "");
+
+      ensureUserRecord(userId, {
+        name: memberName,
+        torn: status ? {
+          status,
+          hospitalUntil,
+          lastRefreshAt: now(),
+          source: "faction_members_api",
+        } : undefined,
+        group: {
+          factionId,
+          factionName,
+          source: "faction_members_api",
+        },
+        seen: { lastSeenAt: now() },
+      });
+    }
+
+    state.core.factionHospital.factionId = factionId;
+    if (detectedFactionId && !Number(state.cfg.factionHospitalFactionId)) {
+      state.cfg.factionHospitalFactionId = detectedFactionId;
+    }
+    if (factionName) state.core.factionHospital.factionName = factionName;
+    state.core.factionHospital.members = memberCount;
+    state.core.factionHospital.lastRefreshAt = now();
+    state.core.factionHospital.lastError = "";
+    publishCore(true);
+
+    return {
+      ok: true,
+      source: "faction_members_api",
+      data: { factionId, factionName, members: memberCount },
+    };
+  }
+
   function handleBrokerRequest(req) {
     const { type, payload } = req;
     const cacheKey = makeCacheKey(type, payload);
@@ -1552,6 +1680,9 @@
 
       case "protection.refresh":
         return refreshProtectedMembers(true);
+
+      case "faction.hospital.refresh":
+        return refreshFactionHospitalMembers(!!payload.force);
 
       case "user.refresh.attackLoader": {
         const userId = Number(payload.userId);
@@ -1897,6 +2028,7 @@
     const status = state.core.api.status || {};
     const apiStats = state.core.api.stats || {};
     const protectedCount = Object.keys(state.core.protectedMembers.byUserId || {}).length;
+    const factionHospital = state.core.factionHospital || {};
     const tornLimitEnabled = !!state.cfg.tornApiHardLimitEnabled;
     const tornLimit = clamp(Number(state.cfg.tornApiCallLimit) || 90, 1, 10000);
     const tornWindowMs = Math.max(1000, Number(state.cfg.tornApiLimitWindowMs) || (60 * 1000));
@@ -1924,7 +2056,12 @@
         <div class="tc-row"><strong>Protection enabled:</strong> ${state.cfg.allianceProtectionEnabled ? "yes" : "no"}</div>
         <div class="tc-row"><strong>Protected members:</strong> ${protectedCount}</div>
         <div class="tc-row"><strong>Protection refresh:</strong> ${fmtAgo(state.core.protectedMembers.lastRefreshAt)}</div>
+        <div class="tc-row"><strong>Faction hospital batch:</strong> ${state.cfg.factionHospitalEnabled ? "yes" : "no"}</div>
+        <div class="tc-row"><strong>Faction ID:</strong> ${Number(state.cfg.factionHospitalFactionId) || "-"}</div>
+        <div class="tc-row"><strong>Faction members cached:</strong> ${Number(factionHospital.members || 0)}</div>
+        <div class="tc-row"><strong>Faction refresh:</strong> ${fmtAgo(factionHospital.lastRefreshAt)}</div>
         ${state.core.protectedMembers.lastError ? `<div class="tc-error">Protection: ${escapeHtml(state.core.protectedMembers.lastError)}</div>` : ""}
+        ${factionHospital.lastError ? `<div class="tc-error">Faction hospital: ${escapeHtml(factionHospital.lastError)}</div>` : ""}
         ${status.tornLastError ? `<div class="tc-error">Torn: ${escapeHtml(status.tornLastError)}</div>` : ""}
         ${status.ffLastError ? `<div class="tc-error">FF: ${escapeHtml(status.ffLastError)}</div>` : ""}
 
@@ -1971,6 +2108,19 @@
           <label for="tc-protection-blue">Highlight protected targets blue</label>
         </div>
 
+        <div class="tc-check">
+          <input id="tc-faction-hospital-enabled" type="checkbox" ${state.cfg.factionHospitalEnabled ? "checked" : ""}>
+          <label for="tc-faction-hospital-enabled">Enable faction hospital batching</label>
+        </div>
+        <div class="tc-row">
+          <label class="tc-label" for="tc-faction-hospital-id">Your faction ID (optional override)</label>
+          <input id="tc-faction-hospital-id" class="tc-input" type="number" min="0" step="1" value="${escapeHtml(String(Number(state.cfg.factionHospitalFactionId) || 0))}">
+        </div>
+        <div class="tc-row">
+          <label class="tc-label" for="tc-faction-hospital-seconds">Faction refresh seconds</label>
+          <input id="tc-faction-hospital-seconds" class="tc-input" type="number" min="5" step="1" value="${escapeHtml(String(Math.max(5, Math.round((Number(state.cfg.factionHospitalRefreshMs) || 30000) / 1000))))}">
+        </div>
+
         <label class="tc-label" for="tc-protection-factions">Protected factions</label>
         <textarea id="tc-protection-factions" class="tc-textarea" placeholder="48635|Combat Ready Rockstars">${escapeHtml(state.cfg.protectedFactionsText || "")}</textarea>
 
@@ -1980,6 +2130,9 @@
         </div>
         <div class="tc-buttons">
           <button id="tc-refresh-protection">Refresh protection now</button>
+        </div>
+        <div class="tc-buttons">
+          <button id="tc-refresh-faction-hospital">Refresh faction hospital now</button>
         </div>
       </div>
     `;
@@ -2121,6 +2274,7 @@
     const saveBtn = state.panel.querySelector("#tc-save");
     const publishBtn = state.panel.querySelector("#tc-force-publish");
     const protectionBtn = state.panel.querySelector("#tc-refresh-protection");
+    const factionHospitalBtn = state.panel.querySelector("#tc-refresh-faction-hospital");
 
     if (saveBtn) {
       saveBtn.onclick = async () => {
@@ -2133,6 +2287,9 @@
         state.cfg.allianceProtectionEnabled = !!state.panel.querySelector("#tc-protection-enabled")?.checked;
         state.cfg.allianceSkipPollingProtected = !!state.panel.querySelector("#tc-protection-skip")?.checked;
         state.cfg.allianceHighlightBlue = !!state.panel.querySelector("#tc-protection-blue")?.checked;
+        state.cfg.factionHospitalEnabled = !!state.panel.querySelector("#tc-faction-hospital-enabled")?.checked;
+        state.cfg.factionHospitalFactionId = Math.max(0, Number(state.panel.querySelector("#tc-faction-hospital-id")?.value || 0));
+        state.cfg.factionHospitalRefreshMs = Math.max(5000, Number(state.panel.querySelector("#tc-faction-hospital-seconds")?.value || 30) * 1000);
         state.cfg.protectedFactionsText = String(state.panel.querySelector("#tc-protection-factions")?.value || "").trim();
 
         saveSettings();
@@ -2141,6 +2298,7 @@
 
         if (state.isLeader) {
           await refreshProtectedMembers(true);
+          await refreshFactionHospitalMembers(true);
         }
         renderPanel();
       };
@@ -2157,6 +2315,14 @@
       protectionBtn.onclick = async () => {
         if (!state.isLeader) return;
         await refreshProtectedMembers(true);
+        renderPanel();
+      };
+    }
+
+    if (factionHospitalBtn) {
+      factionHospitalBtn.onclick = async () => {
+        if (!state.isLeader) return;
+        await refreshFactionHospitalMembers(true);
         renderPanel();
       };
     }
@@ -2354,6 +2520,19 @@
     }, Math.max(60 * 1000, Number(state.cfg.allianceRefreshMs) || (3 * 24 * 60 * 60 * 1000)));
   }
 
+  function startFactionHospitalLoop() {
+    if (state.loops.factionHospital) clearInterval(state.loops.factionHospital);
+
+    state.loops.factionHospital = setInterval(() => {
+      if (!state.isLeader) return;
+      refreshFactionHospitalMembers(false).catch((err) => {
+        state.core.factionHospital.lastError = String(err?.message || err || "Faction hospital refresh failed");
+        state.core.factionHospital.lastRefreshAt = now();
+        publishCore(true);
+      });
+    }, Math.max(5000, Number(state.cfg.factionHospitalRefreshMs) || 30000));
+  }
+
   function init() {
     if (isWeav3rPage()) {
       initBridgeClientMode();
@@ -2383,10 +2562,16 @@
     }, 800);
 
     startProtectionLoop();
+    startFactionHospitalLoop();
 
     if (state.isLeader) {
       refreshProtectedMembers(false).catch((err) => {
         state.core.protectedMembers.lastError = String(err?.message || err || "Initial protection refresh failed");
+        publishCore(true);
+      });
+      refreshFactionHospitalMembers(false).catch((err) => {
+        state.core.factionHospital.lastError = String(err?.message || err || "Initial faction hospital refresh failed");
+        state.core.factionHospital.lastRefreshAt = now();
         publishCore(true);
       });
     }
