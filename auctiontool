@@ -1770,7 +1770,7 @@ ensurePill(item, index) {
                                 <div class="twx-row">
                                     <div class="twx-row-left">
                                         <div class="twx-name">${Util.escapeHtml(r.item_name || 'Unknown item')}</div>
-                                        <div class="twx-meta">${Util.escapeHtml(this.getSearchRowSourceLabel(r))} • ${Util.escapeHtml(this.getSearchRowBonusesLabel(r))}</div>
+                                        <div class="twx-meta">${Util.escapeHtml(this.getSearchRowSourceLabel(r, f))} • ${Util.escapeHtml(this.getSearchRowBonusesLabel(r, f))}</div>
                                         <div class="twx-meta">Q ${r.stat_quality ?? '—'} • DMG ${r.stat_damage ?? '—'} • ACC ${r.stat_accuracy ?? '—'}</div>
                                     </div>
                                     <div class="twx-row-right">
@@ -1855,34 +1855,56 @@ ensurePill(item, index) {
             });
         },
 
-        getSearchRowSourceLabel(row) {
-            const src = String(row?.listing_source || row?.source || row?.origin || '').toLowerCase();
-            if (src.includes('bazaar')) return 'Bazaar';
-            if (src.includes('market')) return 'Market';
+        getRowSourceToken(row) {
+            const raw = String(
+                row?.listing_source ||
+                row?.source ||
+                row?.origin ||
+                row?.market_source ||
+                row?.listing_type ||
+                row?.source_type ||
+                row?.table_name ||
+                ''
+            ).toLowerCase();
+            if (raw.includes('bazaar')) return 'bazaar';
+            if (raw.includes('market') || raw.includes('itemmarket')) return 'market';
+            return '';
+        },
+
+        getSearchRowSourceLabel(row, filters = null) {
+            const src = this.getRowSourceToken(row);
+            if (src === 'bazaar') return 'Bazaar';
+            if (src === 'market') return 'Market';
+            if (filters?.includeBazaar && !filters?.includeMarket) return 'Bazaar';
+            if (!filters?.includeBazaar && filters?.includeMarket) return 'Market';
             return 'Unknown source';
         },
 
-        getSearchRowBonusesLabel(row) {
-            const b1Id = row?.bonus1_id;
-            const b2Id = row?.bonus2_id;
-            const b1Name = b1Id ? Stats.bonusName(Number(b1Id)) : null;
-            const b2Name = b2Id ? Stats.bonusName(Number(b2Id)) : null;
-            const b1v = row?.bonus1_value;
-            const b2v = row?.bonus2_value;
+        getSearchRowBonusesLabel(row, filters = null) {
+            const b1Id = row?.bonus1_id ?? row?.bonus_1_id ?? row?.b1_id ?? row?.bonus1;
+            const b2Id = row?.bonus2_id ?? row?.bonus_2_id ?? row?.b2_id ?? row?.bonus2;
+            const b1NameRaw = row?.bonus1_name ?? row?.bonus_1_name ?? row?.bonus1_title ?? null;
+            const b2NameRaw = row?.bonus2_name ?? row?.bonus_2_name ?? row?.bonus2_title ?? null;
+            const b1Name = b1NameRaw || (b1Id ? Stats.bonusName(Number(b1Id)) : (filters?.bonus1Id ? Stats.bonusName(Number(filters.bonus1Id)) : null));
+            const b2Name = b2NameRaw || (b2Id ? Stats.bonusName(Number(b2Id)) : (filters?.bonus2Id ? Stats.bonusName(Number(filters.bonus2Id)) : null));
+            const b1v = row?.bonus1_value ?? row?.bonus_1_value;
+            const b2v = row?.bonus2_value ?? row?.bonus_2_value;
             const p1 = b1Name ? `${b1Name}${b1v != null ? ` ${b1v}%` : ''}` : null;
             const p2 = b2Name ? `${b2Name}${b2v != null ? ` ${b2v}%` : ''}` : null;
             return [p1, p2].filter(Boolean).join(' • ') || 'No bonuses';
         },
 
         getSearchRowLink(row, filters) {
-            const source = String(row?.listing_source || row?.source || row?.origin || '').toLowerCase();
-            if (source.includes('bazaar')) {
+            let source = this.getRowSourceToken(row);
+            if (!source && filters?.includeBazaar && !filters?.includeMarket) source = 'bazaar';
+            if (!source && !filters?.includeBazaar && filters?.includeMarket) source = 'market';
+            if (source === 'bazaar') {
                 const userId = row?.seller_id || row?.user_id || row?.owner_id;
                 if (!userId) return '';
                 return `https://www.torn.com/bazaar.php?userId=${Number(userId)}`;
             }
 
-            if (source.includes('market')) {
+            if (source === 'market') {
                 const categoryName = filters?.itemCategory === 'armor'
                     ? 'Armor'
                     : (filters?.weaponClass || 'Primary');
@@ -1912,9 +1934,9 @@ ensurePill(item, index) {
             if (includeBazaar && includeMarket) return rows;
             if (!includeBazaar && !includeMarket) return [];
             return rows.filter((row) => {
-                const src = String(row?.listing_source || row?.source || row?.origin || '').toLowerCase();
-                if (src.includes('bazaar')) return includeBazaar;
-                if (src.includes('market')) return includeMarket;
+                const src = this.getRowSourceToken(row);
+                if (src === 'bazaar') return includeBazaar;
+                if (src === 'market') return includeMarket;
                 return includeBazaar || includeMarket;
             });
         },
